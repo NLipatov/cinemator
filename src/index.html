@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Cinemator – Universal HLS Player</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {
+      --radius: 1.15rem;
+      --shadow: 0 0.3rem 2.2rem rgba(0,0,0,.12);
+      --font-main: 'Segoe UI', 'Inter', system-ui, sans-serif;
+      --color-bg: #181c23;
+      --color-fg: #f7f7fa;
+      --color-border: #272933;
+      --color-accent: #4785ff;
+      --color-accent-hover: #1c5fd7;
+      --color-card: rgba(36,40,55,0.96);
+      --color-input-bg: #262a36;
+      --color-input-fg: #e5e8ef;
+      --color-input-focus: #22242b;
+      --color-muted: #b8bbc7;
+      --color-error: #ff8383;
+      --glass-blur: blur(15px);
+      --card-bg: linear-gradient(120deg, rgba(39,45,60,0.97) 80%, rgba(60,70,100,0.14));
+      --input-shadow: 0 2px 8px 0 rgba(24,28,40,.09);
+      --input-shadow-focus: 0 2px 18px 0 rgba(72,133,255,0.10);
+      --transition: .19s cubic-bezier(.5,.15,.1,1);
+      --fadein: fadein .5s cubic-bezier(.4,.14,.24,1) 1;
+    }
+    [data-theme="light"] {
+      --color-bg: #f6f8fa;
+      --color-fg: #22242b;
+      --color-border: #dde3ef;
+      --color-card: rgba(255,255,255,0.98);
+      --color-input-bg: #fff;
+      --color-input-fg: #2d3039;
+      --color-input-focus: #e5e8ee;
+      --color-muted: #6d7386;
+      --card-bg: linear-gradient(120deg, #fff 80%, rgba(80,150,255,0.09));
+    }
+    html, body {
+      margin: 0; padding: 0; min-height: 100vh; width: 100vw; height: 100vh;
+      background: var(--color-bg);
+      color: var(--color-fg);
+      font-family: var(--font-main);
+      transition: background var(--transition), color var(--transition);
+      overflow: hidden;
+    }
+    body {
+      display: flex; align-items: center; justify-content: center;
+      min-height: 100vh; width: 100vw;
+      background: var(--color-bg);
+    }
+    .theme-toggle {
+      position: fixed; top: 1.35rem; right: 2.3rem; z-index: 10;
+      background: var(--color-card);
+      border-radius: 999em;
+      border: 1.5px solid var(--color-border);
+      box-shadow: 0 2px 10px 0 rgba(24,28,40,0.04);
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.25em;
+      cursor: pointer;
+      user-select: none;
+      width: 2.55em; height: 2.55em;
+      transition: background var(--transition), border-color var(--transition), color var(--transition);
+      color: var(--color-accent);
+      opacity: .96;
+      padding: 0;
+      overflow: hidden;
+    }
+    .theme-toggle .icon {
+      width: 1.2em; height: 1.2em; font-size: 1.13em;
+      display: flex; align-items: center; justify-content: center;
+      pointer-events: none;
+    }
+    .theme-toggle:active { filter: brightness(1.11); }
+    .card {
+      background: var(--card-bg);
+      backdrop-filter: var(--glass-blur);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      border: 1.3px solid var(--color-border);
+      display: flex; flex-direction: column; align-items: stretch;
+      gap: 1.7rem;
+      padding: 2.35rem 2vw 1.65rem 2vw;
+      width: 92vw; max-width: 38rem; min-width: 15rem;
+      max-height: 94vh; overflow-y: auto; box-sizing: border-box;
+      justify-content: center;
+      animation: fadein .5s cubic-bezier(.4,.14,.24,1) 1;
+      position: relative;
+    }
+    @keyframes fadein {
+      from { opacity: 0; transform: scale(.99) translateY(16px);}
+      to { opacity: 1; transform: none;}
+    }
+    h2 {
+      margin: 0 0 0.44em 0; text-align: center;
+      font-size: 2rem; font-weight: 700;
+      letter-spacing: -.01em;
+      opacity: 0.98;
+      transition: opacity .2s;
+      animation: fadein .55s cubic-bezier(.4,.14,.24,1) 1;
+    }
+    .step {
+      display: flex; flex-direction: column; gap: 1.05em;
+      animation: fadein .7s cubic-bezier(.3,.24,.13,1) 1;
+    }
+    .step[style*="display: none"] {
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .2s;
+    }
+    .input-row {
+      display: flex;
+      gap: 1em; width: 100%; align-items: stretch;
+      position: relative;
+    }
+    .input-style,
+    input, select, button {
+      font-family: inherit;
+      font-size: 1.08em;
+      border-radius: 0.72em;
+      border: 1.5px solid var(--color-border);
+      padding: 0.68em 1.07em;
+      box-sizing: border-box; outline: none;
+      background: var(--color-input-bg);
+      color: var(--color-input-fg);
+      transition: border .18s, background .18s, color .17s, box-shadow .19s;
+      box-shadow: var(--input-shadow);
+    }
+    .input-style:focus,
+    input:focus, select:focus {
+      border-color: var(--color-accent);
+      box-shadow: var(--input-shadow-focus);
+      background: var(--color-input-focus);
+      color: var(--color-input-fg);
+    }
+    select.input-style {
+      padding-right: 2.1em;
+    }
+    select {
+      min-width: 0; max-width: 100%; text-overflow: ellipsis;
+      overflow-x: auto; white-space: nowrap;
+      background: var(--color-input-bg);
+      color: var(--color-input-fg);
+      padding-right: 2em;
+    }
+    button.input-style, button {
+      cursor: pointer;
+      background: var(--color-accent);
+      color: #fff;
+      border: none;
+      min-width: 7em; font-weight: 600;
+      letter-spacing: .01em;
+      transition: background .18s, box-shadow .16s, transform .10s;
+      box-shadow: 0 2px 8px 0 rgba(72,133,255,0.11);
+    }
+    button:hover, button:focus-visible {
+      background: var(--color-accent-hover);
+      transform: scale(1.04);
+      box-shadow: 0 4px 18px 0 rgba(72,133,255,0.14);
+    }
+    #video {
+      background: #232733;
+      border-radius: 0.8em;
+      width: 100%; max-width: 100%;
+      aspect-ratio: 16/9;
+      margin-top: 0.7em; object-fit: contain;
+      max-height: 48vh; min-height: 13vw;
+      box-shadow: 0 0.1em 0.7em rgba(24,36,52,0.16);
+      outline: none; border: none;
+      transition: box-shadow .2s, opacity .22s;
+      opacity: 0;
+      animation: fadein .7s cubic-bezier(.4,.14,.24,1) 1 forwards;
+      animation-delay: .05s;
+    }
+    #video[autoplay] { opacity: 1; }
+    .msg {
+      color: var(--color-muted);
+      font-size: 1em;
+      min-height: 1.22em;
+      margin-top: 0.18em;
+      transition: color .18s, opacity .18s;
+      letter-spacing: .01em;
+      opacity: 0.96;
+    }
+    .msg.error {
+      color: var(--color-error);
+      font-weight: 500;
+      animation: shake .18s 1;
+      opacity: 1;
+    }
+    .loader {
+      display: inline-block;
+      width: 1.3em; height: 1.3em;
+      border: 2.2px solid var(--color-accent);
+      border-radius: 50%;
+      border-top: 2.2px solid transparent;
+      animation: spin .88s linear infinite;
+      vertical-align: middle;
+      margin-right: 0.52em;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes shake {
+      0% { transform: translateX(0px);}
+      30% { transform: translateX(-4px);}
+      60% { transform: translateX(4px);}
+      100% { transform: translateX(0);}
+    }
+    @media (max-width: 900px) {
+      .card { max-width: 99vw; width: 99vw; min-width: 0; padding: 1.25rem 1vw 1rem 1vw; gap: 0.7rem;}
+      h2 { font-size: 1.1rem; }
+      input, select, button, .input-style { font-size: 1rem; }
+      .input-row { flex-direction: column; gap: 0.6em; }
+      #video { max-height: 34vw; }
+    }
+    @media (max-width: 500px) {
+      .card { max-width: 100vw; width: 100vw; border-radius: 0.6em; padding: 0.5rem 0.13rem 0.13rem 0.13rem; }
+      #video { max-height: 33vw; min-height: 14vw; }
+      .theme-toggle { right: 0.7em; top: 0.7em; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Theme toggle (icon, fixed right/top) -->
+  <div class="theme-toggle" id="themeToggle" title="Switch theme">
+    <span class="icon" id="icon-moon" style="display:none;">🌙</span>
+    <span class="icon" id="icon-sun"  style="display:none;">☀️</span>
+  </div>
+  <div class="card">
+    <h2>Cinemator – Universal HLS Player</h2>
+    <form id="form" class="step" autocomplete="off">
+      <div class="input-row">
+        <input id="magnet" type="text" class="input-style" placeholder="Magnet link" spellcheck="false" required>
+        <button type="submit" id="nextBtn" class="input-style">Next</button>
+      </div>
+      <div class="msg" id="magnetMsg"></div>
+    </form>
+    <div class="step" id="step-files" style="display:none">
+      <select id="filelist" class="input-style"></select>
+      <button id="play" type="button" class="input-style">Play</button>
+      <div class="msg" id="fileMsg"></div>
+    </div>
+    <div id="player-block" class="step" style="display:none">
+      <video id="video" controls autoplay playsinline></video>
+      <div class="msg" id="playerMsg"></div>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.5"></script>
+  <script>
+    // --- Theme toggler ---
+    const themeKey = 'theme-mode';
+    const themes = ['dark', 'light'];
+    const $toggle = document.getElementById('themeToggle');
+    const $moon = document.getElementById('icon-moon');
+    const $sun  = document.getElementById('icon-sun');
+    let themeIdx = 0;
+    function setTheme(idx, save=true) {
+      document.documentElement.setAttribute('data-theme', themes[idx]);
+      $moon.style.display = (idx === 0) ? '' : 'none';
+      $sun.style.display  = (idx === 1) ? '' : 'none';
+      themeIdx = idx;
+      if (save) localStorage.setItem(themeKey, themes[idx]);
+    }
+    $toggle.onclick = function() { setTheme(1-themeIdx); };
+    (function() {
+      // On first load: detect system, else use saved
+      let mode = localStorage.getItem(themeKey);
+      if (!mode) {
+        mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+      setTheme(themes.indexOf(mode), false);
+    })();
+
+    // --- Main logic ---
+    const $ = id => document.getElementById(id);
+    let hls = null, files = [];
+    let msgTimeout = null;
+    function destroyVideoAndHls() {
+      if (hls) { hls.destroy(); hls = null; }
+      const oldVideo = $('video');
+      const newVideo = oldVideo.cloneNode(false);
+      oldVideo.parentNode.replaceChild(newVideo, oldVideo);
+      newVideo.id = 'video';
+    }
+    function showMsg(id, msg, isErr=false, loader=false) {
+      clearTimeout(msgTimeout);
+      const el = $(id);
+      el.textContent = '';
+      if (loader) el.innerHTML = '<span class="loader"></span>';
+      if (msg) el.innerHTML += msg;
+      el.className = 'msg' + (isErr ? ' error' : '');
+      if (msg && !isErr) {
+        msgTimeout = setTimeout(() => { el.textContent = ''; }, 2200);
+      }
+    }
+    $('form').onsubmit = async e => {
+      e.preventDefault();
+      destroyVideoAndHls();
+      showMsg('magnetMsg', 'Loading file list…', false, true);
+      $('filelist').innerHTML = '';
+      $('step-files').style.display = 'none';
+      $('player-block').style.display = 'none';
+      const magnet = $('magnet').value.trim();
+      if (!magnet) return;
+      try {
+        const res = await fetch('/files?magnet=' + encodeURIComponent(magnet));
+        if (!res.ok) throw new Error('Server error');
+        files = await res.json();
+        if (!files.length) throw new Error('No playable files found in torrent');
+        $('filelist').innerHTML = files.map(f =>
+          `<option value="${f.index}">${f.name} (${(f.size/1048576).toFixed(2)} MB)</option>`
+        ).join('');
+        $('step-files').style.display = '';
+        showMsg('magnetMsg', '');
+      } catch (e) {
+        showMsg('magnetMsg', e.message || 'Error loading files', true);
+        return;
+      }
+    };
+    $('play').onclick = async () => {
+      destroyVideoAndHls();
+      $('player-block').style.display = 'none';
+      showMsg('fileMsg', 'Preparing video…', false, true);
+      const magnet = $('magnet').value.trim();
+      const idx = $('filelist').value;
+      if (!magnet || idx === undefined) return;
+      try {
+        const resp = await fetch(`/stream?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { redirect: 'follow' });
+        if (!resp.ok) throw new Error('Stream error');
+        const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
+        showMsg('fileMsg', '');
+        $('player-block').style.display = '';
+        playHls(m3u8);
+      } catch (e) {
+        showMsg('fileMsg', e.message || 'Could not start stream', true);
+        return;
+      }
+    };
+    function playHls(src) {
+      const video = $('video');
+      video.style.opacity = 0;
+      setTimeout(() => { video.style.opacity = 1; }, 120);
+      if (Hls.isSupported()) {
+        hls = new Hls();
+        hls.loadSource(src);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.ERROR, (evt, data) => {
+          if (data.fatal) {
+            showMsg('playerMsg', 'Playback error: ' + (data.details || 'Fatal error'), true);
+          }
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = src;
+      } else {
+        showMsg('playerMsg', 'Your browser does not support HLS.', true);
+      }
+    }
+  </script>
+</body>
+</html>
