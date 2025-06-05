@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,9 +18,9 @@ import (
 )
 
 const (
-	HLSPath           = "/tmp/cinemator/hls"
-	DownloadPath      = "/tmp/cinemator/downloads"
-	InactivityTimeout = 1 * time.Hour
+	HLSPath       = "/tmp/cinemator/hls"
+	DownloadPath  = "/tmp/cinemator/downloads"
+	ViewerTimeout = 5 * time.Minute
 )
 
 type streamKey struct {
@@ -28,15 +29,19 @@ type streamKey struct {
 }
 
 type streamInfo struct {
-	ready  chan struct{}
-	cancel context.CancelFunc
+	ready    chan struct{}
+	cancel   context.CancelFunc
+	torrent  *torrent.Torrent
+	file     *torrent.File
+	viewers  int
+	lastView time.Time
+	mtx      sync.Mutex
 }
 
 var (
-	client     *torrent.Client
-	active     = make(map[streamKey]*streamInfo)
-	lastAccess = make(map[streamKey]time.Time)
-	mu         sync.Mutex
+	client *torrent.Client
+	active = make(map[streamKey]*streamInfo)
+	mu     sync.Mutex
 )
 
 func main() {
@@ -53,7 +58,7 @@ func main() {
 	http.HandleFunc("/files", handleFiles)
 	http.HandleFunc("/stream", handleStream)
 	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(handleHLS)))
-	go inactivityWatcher()
+	go viewersWatcher()
 
 	fmt.Println("Server listening on :8000")
 	log.Fatal(http.ListenAndServe(":8000", nil))
@@ -89,7 +94,7 @@ func handleFiles(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 func handleStream(w http.ResponseWriter, r *http.Request) {
@@ -99,8 +104,8 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "magnet and file required", 400)
 		return
 	}
-	var fileIndex int
-	if _, err := fmt.Sscanf(idx, "%d", &fileIndex); err != nil {
+	fileIndex, err := strconv.Atoi(idx)
+	if err != nil {
 		http.Error(w, "bad file index", 400)
 		return
 	}
@@ -122,14 +127,37 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 	outDir := filepath.Join(HLSPath, fmt.Sprintf("%s_%d", hash, fileIndex))
 	playlist := filepath.Join(outDir, "index.m3u8")
 
-	// Каждый новый запрос гарантированно запускает новый ffmpeg.
-	// Если старый процесс всё ещё обслуживает клиентов — не мешаем, его добьёт inactivityWatcher.
+	mu.Lock()
+	s, exists := active[key]
+	if exists {
+		s.mtx.Lock()
+		s.viewers++
+		s.lastView = time.Now()
+		s.mtx.Unlock()
+		mu.Unlock()
+		<-s.ready
+		http.Redirect(w, r, "/hls/"+fmt.Sprintf("%s_%d", hash, fileIndex)+"/index.m3u8", 302)
+		return
+	}
+	mu.Unlock()
 
 	must(os.MkdirAll(outDir, 0755))
 	f.Download()
 
 	ready := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
+
+	s = &streamInfo{
+		ready:    ready,
+		cancel:   cancel,
+		torrent:  t,
+		file:     f,
+		viewers:  1,
+		lastView: time.Now(),
+	}
+	mu.Lock()
+	active[key] = s
+	mu.Unlock()
 
 	go func() {
 		defer close(ready)
@@ -140,18 +168,55 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	mu.Lock()
-	active[key] = &streamInfo{ready: ready, cancel: cancel}
-	lastAccess[key] = time.Now()
-	mu.Unlock()
-
 	waitForPlaylist(playlist)
-	http.Redirect(w, r, "/hls/"+fmt.Sprintf("%s_%d", hash, fileIndex)+"/index.m3u8?t="+fmt.Sprint(time.Now().UnixNano()), 302)
+	http.Redirect(w, r, "/hls/"+fmt.Sprintf("%s_%d", hash, fileIndex)+"/index.m3u8", 302)
+}
+
+func handleHLS(w http.ResponseWriter, r *http.Request) {
+	fullPath := filepath.Join(HLSPath, r.URL.Path)
+	if strings.HasSuffix(r.URL.Path, ".m3u8") || strings.HasSuffix(r.URL.Path, ".ts") {
+		parts := strings.SplitN(r.URL.Path, "/", 2)
+		if len(parts) > 0 {
+			keyParts := strings.SplitN(parts[0], "_", 2)
+			if len(keyParts) == 2 {
+				hash := keyParts[0]
+				idx, err := strconv.Atoi(keyParts[1])
+				if err == nil {
+					key := streamKey{InfoHash: hash, Index: idx}
+					mu.Lock()
+					s := active[key]
+					mu.Unlock()
+					if s != nil {
+						s.mtx.Lock()
+						s.lastView = time.Now()
+						if s.viewers == 0 {
+							s.viewers = 1
+						}
+						s.mtx.Unlock()
+					}
+				}
+			}
+		}
+	}
+
+	if strings.HasSuffix(r.URL.Path, ".m3u8") {
+		data, err := os.ReadFile(fullPath)
+		if err != nil {
+			http.Error(w, "playlist not found", 404)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		_, _ = w.Write(data)
+	} else {
+		http.ServeFile(w, r, fullPath)
+	}
 }
 
 func runFFmpeg(ctx context.Context, file *torrent.File, playlist, outDir string) error {
 	r := file.NewReader()
-	defer r.Close()
+	defer func(r torrent.Reader) {
+		_ = r.Close()
+	}(r)
 	cmd := exec.CommandContext(ctx, "ffmpeg",
 		"-fflags", "+genpts",
 		"-i", "pipe:0",
@@ -182,62 +247,48 @@ func waitForPlaylist(path string) {
 	}
 }
 
-func handleHLS(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
-	w.Header().Set("Pragma", "no-cache")
-	w.Header().Set("Expires", "0")
-	fullPath := filepath.Join(HLSPath, r.URL.Path)
-	if strings.HasSuffix(r.URL.Path, ".m3u8") {
-		data, err := os.ReadFile(fullPath)
-		if err != nil {
-			http.Error(w, "playlist not found", 404)
-			return
-		}
-		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-		w.Write(data)
-	} else {
-		http.ServeFile(w, r, fullPath)
-	}
-	parts := strings.SplitN(r.URL.Path, "/", 2)
-	if len(parts) > 0 {
-		keyParts := strings.SplitN(parts[0], "_", 2)
-		if len(keyParts) == 2 {
-			hash := keyParts[0]
-			var idx int
-			if _, err := fmt.Sscanf(keyParts[1], "%d", &idx); err == nil {
-				key := streamKey{InfoHash: hash, Index: idx}
-				mu.Lock()
-				if active[key] != nil {
-					lastAccess[key] = time.Now()
-				}
-				mu.Unlock()
-			}
-		}
-	}
-}
-
 func cleanup(key streamKey) {
 	mu.Lock()
 	defer mu.Unlock()
-	if s, ok := active[key]; ok {
-		s.cancel()
-		outDir := filepath.Join(HLSPath, fmt.Sprintf("%s_%d", key.InfoHash, key.Index))
-		os.RemoveAll(outDir)
-		delete(active, key)
-		delete(lastAccess, key)
+	s, ok := active[key]
+	if !ok {
+		return
 	}
+
+	s.cancel()
+	outDir := filepath.Join(HLSPath, fmt.Sprintf("%s_%d", key.InfoHash, key.Index))
+	_ = os.RemoveAll(outDir)
+
+	if s.file != nil {
+		s.file.SetPriority(0)
+	}
+	stillUsed := false
+	for k, v := range active {
+		if k != key && v.torrent == s.torrent {
+			stillUsed = true
+			break
+		}
+	}
+	if !stillUsed && s.torrent != nil {
+		s.torrent.Drop()
+	}
+	delete(active, key)
 }
 
-func inactivityWatcher() {
-	ticker := time.NewTicker(InactivityTimeout / 2)
+func viewersWatcher() {
+	ticker := time.NewTicker(ViewerTimeout / 3)
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
 		mu.Lock()
-		for key, t0 := range lastAccess {
-			if now.Sub(t0) > InactivityTimeout {
-				log.Println("Timeout for", key, "– cleaning up")
-				cleanup(key)
+		for key, s := range active {
+			s.mtx.Lock()
+			timeout := ViewerTimeout
+			noViewers := s.viewers <= 0 || now.Sub(s.lastView) > timeout
+			s.mtx.Unlock()
+			if noViewers {
+				log.Printf("No viewers for %v, cleaning up\n", key)
+				go cleanup(key)
 			}
 		}
 		mu.Unlock()
