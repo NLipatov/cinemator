@@ -20,7 +20,7 @@ import (
 const (
 	HLSPath       = "/tmp/cinemator/hls"
 	DownloadPath  = "/tmp/cinemator/downloads"
-	ViewerTimeout = 5 * time.Minute
+	ViewerTimeout = 5 * time.Hour
 )
 
 type streamKey struct {
