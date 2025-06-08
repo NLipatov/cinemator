@@ -200,6 +200,42 @@
       vertical-align: middle;
       margin-right: 0.52em;
     }
+    /* WARNING BLOCK */
+    .warning {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      border: 2px solid #ffd25f;
+      border-radius: 12px;
+      background: rgba(255,215,50,0.06);
+      color: #eab308;
+      margin-top: 1.7rem;
+      padding: 1.2em 1.4em 1.2em 1.3em;
+      box-sizing: border-box;
+      font-size: 1.04em;
+      animation: fadein .38s cubic-bezier(.35,.7,.13,1) 1;
+    }
+    .warning-inner {
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      gap: 1.18em;
+    }
+    .warning-icon {
+      font-size: 1.8em;
+      margin-top: 0.10em;
+      flex-shrink: 0;
+      line-height: 1.2;
+    }
+    .warning-text {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35em;
+    }
+    .warning-text strong {
+      color: #be9110;
+      font-weight: 600;
+    }
     @keyframes spin { to { transform: rotate(360deg); } }
     @keyframes shake {
       0% { transform: translateX(0px);}
@@ -222,7 +258,6 @@
   </style>
 </head>
 <body>
-  <!-- Theme toggle (icon, fixed right/top) -->
   <div class="theme-toggle" id="themeToggle" title="Switch theme">
     <span class="icon" id="icon-moon" style="display:none;">🌙</span>
     <span class="icon" id="icon-sun"  style="display:none;">☀️</span>
@@ -241,6 +276,7 @@
       <button id="play" type="button" class="input-style">Play</button>
       <div class="msg" id="fileMsg"></div>
     </div>
+    <div id="warn-container"></div>
     <div id="player-block" class="step" style="display:none">
       <video id="video" controls autoplay playsinline></video>
       <div class="msg" id="playerMsg"></div>
@@ -248,7 +284,7 @@
   </div>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.5"></script>
   <script>
-    // --- Theme toggler ---
+    // Theme toggler
     const themeKey = 'theme-mode';
     const themes = ['dark', 'light'];
     const $toggle = document.getElementById('themeToggle');
@@ -264,7 +300,6 @@
     }
     $toggle.onclick = function() { setTheme(1-themeIdx); };
     (function() {
-      // On first load: detect system, else use saved
       let mode = localStorage.getItem(themeKey);
       if (!mode) {
         mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
@@ -272,7 +307,7 @@
       setTheme(themes.indexOf(mode), false);
     })();
 
-    // --- Main logic ---
+    // Main logic
     const $ = id => document.getElementById(id);
     let hls = null, files = [];
     let msgTimeout = null;
@@ -294,6 +329,27 @@
         msgTimeout = setTimeout(() => { el.textContent = ''; }, 2200);
       }
     }
+    function showWarning() {
+      const warn = document.createElement('div');
+      warn.className = 'warning';
+      warn.id = 'warnMsg';
+      warn.innerHTML = `
+        <div class="warning-inner">
+          <span class="warning-icon">⚠️</span>
+          <div class="warning-text">
+            <span>Server is downloading and preparing the video.</span>
+            <span>This may take several minutes for large torrents.</span>
+            <strong>Please stay on this page until playback begins.</strong>
+          </div>
+        </div>
+      `;
+      removeWarning();
+      $('warn-container').appendChild(warn);
+    }
+    function removeWarning() {
+      const existing = document.getElementById('warnMsg');
+      if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+    }
     $('form').onsubmit = async e => {
       e.preventDefault();
       destroyVideoAndHls();
@@ -301,6 +357,7 @@
       $('filelist').innerHTML = '';
       $('step-files').style.display = 'none';
       $('player-block').style.display = 'none';
+      removeWarning();
       const magnet = $('magnet').value.trim();
       if (!magnet) return;
       try {
@@ -321,7 +378,10 @@
     $('play').onclick = async () => {
       destroyVideoAndHls();
       $('player-block').style.display = 'none';
-      showMsg('fileMsg', 'Preparing video…', false, true);
+      removeWarning();
+      showWarning();
+      showMsg('fileMsg', '');
+
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
       if (!magnet || idx === undefined) return;
@@ -329,30 +389,45 @@
         const resp = await fetch(`/stream?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { redirect: 'follow' });
         if (!resp.ok) throw new Error('Stream error');
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
-        showMsg('fileMsg', '');
         $('player-block').style.display = '';
         playHls(m3u8);
       } catch (e) {
+        removeWarning();
         showMsg('fileMsg', e.message || 'Could not start stream', true);
         return;
       }
     };
+
     function playHls(src) {
       const video = $('video');
       video.style.opacity = 0;
       setTimeout(() => { video.style.opacity = 1; }, 120);
+
+      let fragLoaded = false;
+      function hideWarningOnce() {
+        if (!fragLoaded) {
+          fragLoaded = true;
+          removeWarning();
+        }
+      }
+
       if (Hls.isSupported()) {
         hls = new Hls();
         hls.loadSource(src);
         hls.attachMedia(video);
+
+        hls.on(Hls.Events.FRAG_LOADED, hideWarningOnce);
         hls.on(Hls.Events.ERROR, (evt, data) => {
           if (data.fatal) {
+            removeWarning();
             showMsg('playerMsg', 'Playback error: ' + (data.details || 'Fatal error'), true);
           }
         });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
+        video.addEventListener('canplay', hideWarningOnce, { once: true });
       } else {
+        removeWarning();
         showMsg('playerMsg', 'Your browser does not support HLS.', true);
       }
     }
