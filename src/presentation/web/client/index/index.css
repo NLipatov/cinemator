@@ -211,14 +211,15 @@ button:hover, button:focus-visible {
 .warning-inner {
   display: flex;
   flex-direction: row;
-  align-items: flex-start;
+  align-items: center;
   gap: 1.18em;
 }
 .warning-icon {
   font-size: 1.8em;
-  margin-top: 0.10em;
   flex-shrink: 0;
   line-height: 1.2;
+  display: flex;
+  align-items: center;
 }
 .warning-text {
   display: flex;
