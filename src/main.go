@@ -1,6 +1,8 @@
 package main
 
 import (
+	"cinemator/presentation/web/dto"
+	"cinemator/presentation/web/mapping/mappers"
 	"context"
 	"encoding/json"
 	"log"
@@ -12,8 +14,6 @@ import (
 	"cinemator/application"
 	"cinemator/domain"
 	"cinemator/infrastructure/torrent"
-	"cinemator/presentation/dto"
-	"cinemator/presentation/mapping/mappers"
 )
 
 var fileInfoMapper application.Mapper[domain.FileInfo, dto.FileInfo]
@@ -27,17 +27,14 @@ func main() {
 	}
 
 	fileInfoMapper = mappers.NewFileInfoMapper()
-	http.HandleFunc("/", serveIndex)
+	http.Handle("/", http.FileServer(http.Dir("presentation/web/client/index")))
+	http.Handle("/favicon.ico", http.FileServer(http.Dir("presentation/web/client/static")))
 	http.HandleFunc("/files", handleFiles)
 	http.HandleFunc("/stream", handleStream)
 	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(handleHLS)))
 
 	log.Println("Server listening on :8000")
 	log.Fatal(http.ListenAndServe(":8000", nil))
-}
-
-func serveIndex(w http.ResponseWriter, r *http.Request) {
-	http.ServeFile(w, r, "index.html")
 }
 
 func handleFiles(w http.ResponseWriter, r *http.Request) {

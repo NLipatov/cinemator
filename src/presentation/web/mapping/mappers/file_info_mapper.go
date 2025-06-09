@@ -3,7 +3,7 @@ package mappers
 import (
 	"cinemator/application"
 	"cinemator/domain"
-	"cinemator/presentation/dto"
+	"cinemator/presentation/web/dto"
 )
 
 type FileInfoMapper struct {
