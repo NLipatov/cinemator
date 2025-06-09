@@ -1,12 +1,12 @@
 package torrent
 
 import (
+	"cinemator/infrastructure/ffmpeg"
 	"context"
 	"errors"
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"time"
@@ -126,7 +126,8 @@ func (m *anacrolixManager) StartStream(ctx context.Context, magnet string, fileI
 
 	go func() {
 		defer close(ready)
-		err := runFFmpeg(ctx, f, playlist, outDir)
+		ffmpegHandler := ffmpeg.NewFfmpeg(ctx, f.NewReader(), playlist, outDir)
+		err := ffmpegHandler.ConvertToHLS()
 		if err != nil {
 			m.cleanup(key)
 		}
@@ -208,31 +209,6 @@ func (m *anacrolixManager) viewerWatcher() {
 }
 
 // helpers
-
-func runFFmpeg(ctx context.Context, file *torrent.File, playlist, outDir string) error {
-	r := file.NewReader()
-	defer r.Close()
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-fflags", "+genpts",
-		"-i", "pipe:0",
-		"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-		"-vf", "format=yuv420p",
-		"-c:a", "aac", "-b:a", "128k",
-		"-ac", "2",
-		"-movflags", "+faststart",
-		"-f", "hls",
-		"-hls_time", "10",
-		"-hls_list_size", "0",
-		"-hls_flags", "independent_segments",
-		"-hls_segment_filename", filepath.Join(outDir, "chunk_%05d.ts"),
-		playlist,
-	)
-	cmd.Stdin = r
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
 func waitForPlaylist(ctx context.Context, path string) error {
 	const (
 		timeout = 5 * time.Minute
