@@ -1,20 +1,17 @@
 # syntax=docker/dockerfile:1
 
-FROM golang:latest
+# Build stage
+FROM golang:1.24.3-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go build -o cinemator ./main.go
 
-# Set destination for COPY
-WORKDIR /src
-
-# Copy files
-COPY . ./
-
-# Download dependencies
-RUN go mod download
-RUN apt-get update && apt-get ffmpeg
-
-# Build
-RUN CGO_ENABLED=0 GOOS=linux go build -o server-binary main.go
-RUN chmod +x server-binary
-
-# Run
-CMD ["./server-binary", "s"]
+# Final stage: minimal image with ffmpeg
+FROM alpine:latest
+RUN apk add --no-cache ffmpeg
+WORKDIR /app
+COPY --from=builder /app/cinemator /app/cinemator
+COPY presentation/web/client/index /app/presentation/web/client/index
+COPY presentation/web/client/static /app/presentation/web/client/static
+EXPOSE 8000
+ENTRYPOINT ["./cinemator"]
