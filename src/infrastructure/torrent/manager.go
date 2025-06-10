@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -139,7 +140,9 @@ func (m *manager) StartStream(ctx context.Context, magnet string, fileIndex int)
 	m.mu.Unlock()
 
 	go func() {
-		ffmpegHandler := ffmpeg.NewConverter(ctx, f.NewReader(), outDir, playlist)
+		ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
+			return f.NewReader()
+		}, outDir, playlist)
 
 		// running ffmpeg in separated goroutine
 		go func() {

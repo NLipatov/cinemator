@@ -5,17 +5,14 @@ import (
 	"strings"
 )
 
-// HWAccel describes a hardware acceleration option.
 type HWAccel struct {
-	Name    string // e.g. "cuda"
-	Decoder string // e.g. "h264_cuvid"
-	Encoder string // e.g. "h264_nvenc"
+	Name    string
+	Decoder string
+	Encoder string
 }
 
-// HWDetector inspects ffmpeg for available hw encoders.
 type HWDetector struct{}
 
-// Detect returns the first matching hardware encoder.
 func (d HWDetector) Detect() HWAccel {
 	out, _ := exec.Command("ffmpeg", "-hide_banner", "-encoders").Output()
 	s := string(out)
@@ -27,6 +24,6 @@ func (d HWDetector) Detect() HWAccel {
 	case strings.Contains(s, "h264_vaapi"):
 		return HWAccel{"vaapi", "", "h264_vaapi"}
 	default:
-		return HWAccel{"", "", ""}
+		return HWAccel{}
 	}
 }

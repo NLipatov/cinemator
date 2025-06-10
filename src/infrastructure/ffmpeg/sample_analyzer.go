@@ -9,18 +9,15 @@ import (
 
 const peekSize = 2 << 20 // 2 MiB
 
-// SampleInfo holds metadata from a stream sample.
 type SampleInfo struct {
 	VideoCodec string
 	AudioCodec string
 	NeedFilter bool
 }
 
-// SampleAnalyzer analyzes the first bytes of a stream.
 type SampleAnalyzer struct{}
 
-// Analyze reads peekSize bytes and returns the sample plus its metadata.
-func (a SampleAnalyzer) Analyze(rc io.ReadCloser) ([]byte, SampleInfo, error) {
+func (a SampleAnalyzer) Analyze(rc io.Reader) ([]byte, SampleInfo, error) {
 	buf := make([]byte, peekSize)
 	n, _ := io.ReadFull(rc, buf)
 	sample := buf[:n]
@@ -34,7 +31,6 @@ func (a SampleAnalyzer) Analyze(rc io.ReadCloser) ([]byte, SampleInfo, error) {
 	cmd.Stdin = bytes.NewReader(sample)
 	out, err := cmd.Output()
 	if err != nil {
-		// on error, assume we must transcode
 		return sample, SampleInfo{}, nil
 	}
 
