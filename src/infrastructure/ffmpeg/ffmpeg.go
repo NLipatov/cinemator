@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +25,12 @@ func NewFfmpeg(ctx context.Context, rc io.ReadCloser, playlist, outDir string) F
 }
 
 func (f *Ffmpeg) ConvertToHLS() error {
-	defer f.readCloser.Close()
+	defer func(readCloser io.ReadCloser) {
+		err := readCloser.Close()
+		if err != nil {
+			log.Println(err)
+		}
+	}(f.readCloser)
 
 	buf := make([]byte, peekSize)
 	n, _ := io.ReadFull(f.readCloser, buf)
