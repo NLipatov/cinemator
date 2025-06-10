@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"cinemator/infrastructure/ffmpeg"
+	"cinemator/presentation/settings"
 	"context"
 	"errors"
 	"fmt"
@@ -17,69 +18,62 @@ import (
 	"github.com/anacrolix/torrent"
 )
 
-const (
-	hlsPath       = "/tmp/cinemator/hls"
-	downloadPath  = "/tmp/cinemator/downloads"
-	viewerTimeout = 5 * time.Hour
-)
-
-type streamKey struct {
-	InfoHash string
-	Index    int
+type manager struct {
+	client   *torrent.Client
+	active   map[streamKey]*streamInfo
+	mu       sync.Mutex
+	settings settings.Settings
 }
 
-type streamInfo struct {
-	ready    chan struct{}
-	cancel   context.CancelFunc
-	torrent  *torrent.Torrent
-	file     *torrent.File
-	viewers  int
-	lastView time.Time
-	mtx      sync.Mutex
-}
-
-type anacrolixManager struct {
-	client *torrent.Client
-	active map[streamKey]*streamInfo
-	mu     sync.Mutex
-}
-
-func NewManager() (application.TorrentManager, error) {
+func NewManager(settings settings.Settings) (application.TorrentManager, error) {
 	cfg := torrent.NewDefaultClientConfig()
-	cfg.DataDir = downloadPath
+	cfg.DataDir = settings.DownloadPath()
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
 		return nil, err
 	}
-	_ = os.MkdirAll(hlsPath, 0755)
-	_ = os.MkdirAll(downloadPath, 0755)
-	m := &anacrolixManager{
-		client: client,
-		active: make(map[streamKey]*streamInfo),
+	_ = os.MkdirAll(settings.HlsPath(), 0755)
+	_ = os.MkdirAll(settings.DownloadPath(), 0755)
+	m := &manager{
+		client:   client,
+		active:   make(map[streamKey]*streamInfo),
+		settings: settings,
 	}
 	go m.viewerWatcher()
 	return m, nil
 }
 
-func (m *anacrolixManager) Files(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
+func (m *manager) Files(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
 	t, err := m.client.AddMagnet(magnet)
 	if err != nil {
 		return nil, err
 	}
-	<-t.GotInfo()
-	files := t.Files()
-	result := make([]domain.FileInfo, len(files))
-	for i, f := range files {
-		result[i] = domain.FileInfo{
-			Index: i,
-			Name:  f.DisplayPath(),
-			Size:  f.Length(),
+
+	done := make(chan []domain.FileInfo, 1)
+	go func() {
+		<-t.GotInfo()
+		files := t.Files()
+		out := make([]domain.FileInfo, len(files))
+		for i, f := range files {
+			out[i] = domain.FileInfo{Index: i, Name: f.DisplayPath(), Size: f.Length()}
 		}
+
+		// prevents the goroutine from hanging if ctx is cancelled
+		select {
+		case done <- out:
+		case <-ctx.Done():
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-done:
+		return res, nil
 	}
-	return result, nil
 }
 
-func (m *anacrolixManager) StartStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
+func (m *manager) StartStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
 	t, err := m.client.AddMagnet(magnet)
 	if err != nil {
 		return "", "", nil, err
@@ -92,7 +86,7 @@ func (m *anacrolixManager) StartStream(ctx context.Context, magnet string, fileI
 	f := files[fileIndex]
 	hash := t.InfoHash().HexString()
 	key := streamKey{InfoHash: hash, Index: fileIndex}
-	outDir := filepath.Join(hlsPath, fmt.Sprintf("%s_%d", hash, fileIndex))
+	outDir := filepath.Join(m.settings.HlsPath(), fmt.Sprintf("%s_%d", hash, fileIndex))
 	playlist := filepath.Join(outDir, "index.m3u8")
 
 	m.mu.Lock()
@@ -140,7 +134,7 @@ func (m *anacrolixManager) StartStream(ctx context.Context, magnet string, fileI
 	return playlist, outDir, cancel, nil
 }
 
-func (m *anacrolixManager) TouchStream(magnet string, fileIndex int) {
+func (m *manager) TouchStream(magnet string, fileIndex int) {
 	t, _ := m.client.AddMagnet(magnet)
 	hash := t.InfoHash().HexString()
 	key := streamKey{InfoHash: hash, Index: fileIndex}
@@ -157,12 +151,12 @@ func (m *anacrolixManager) TouchStream(magnet string, fileIndex int) {
 	}
 }
 
-func (m *anacrolixManager) CleanupStreams() {
+func (m *manager) CleanupStreams() {
 	now := time.Now()
 	m.mu.Lock()
 	for key, s := range m.active {
 		s.mtx.Lock()
-		noViewers := s.viewers <= 0 || now.Sub(s.lastView) > viewerTimeout
+		noViewers := s.viewers <= 0 || now.Sub(s.lastView) > m.settings.ViewerTimeout()
 		s.mtx.Unlock()
 		if noViewers {
 			go m.cleanup(key)
@@ -173,7 +167,7 @@ func (m *anacrolixManager) CleanupStreams() {
 
 // private methods
 
-func (m *anacrolixManager) cleanup(key streamKey) {
+func (m *manager) cleanup(key streamKey) {
 	m.mu.Lock()
 	s, ok := m.active[key]
 	if !ok {
@@ -181,7 +175,7 @@ func (m *anacrolixManager) cleanup(key streamKey) {
 		return
 	}
 	s.cancel()
-	outDir := filepath.Join(hlsPath, fmt.Sprintf("%s_%d", key.InfoHash, key.Index))
+	outDir := filepath.Join(m.settings.HlsPath(), fmt.Sprintf("%s_%d", key.InfoHash, key.Index))
 	_ = os.RemoveAll(outDir)
 	if s.file != nil {
 		s.file.SetPriority(0)
@@ -200,8 +194,8 @@ func (m *anacrolixManager) cleanup(key streamKey) {
 	m.mu.Unlock()
 }
 
-func (m *anacrolixManager) viewerWatcher() {
-	ticker := time.NewTicker(viewerTimeout / 3)
+func (m *manager) viewerWatcher() {
+	ticker := time.NewTicker(m.settings.ViewerTimeout() / 3)
 	defer ticker.Stop()
 	for range ticker.C {
 		m.CleanupStreams()
