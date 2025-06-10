@@ -73,14 +73,32 @@ func (m *manager) Files(ctx context.Context, magnet string) ([]domain.FileInfo, 
 	}
 }
 
+func (m *manager) TouchStream(magnet string, fileIndex int) {
+	t, _ := m.client.AddMagnet(magnet)
+	hash := t.InfoHash().HexString()
+	key := streamKey{InfoHash: hash, Index: fileIndex}
+	m.mu.Lock()
+	s := m.active[key]
+	m.mu.Unlock()
+	if s != nil {
+		s.mtx.Lock()
+		s.lastView = time.Now()
+		if s.viewers == 0 {
+			s.viewers = 1
+		}
+		s.mtx.Unlock()
+	}
+}
 func (m *manager) StartStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
 	t, err := m.client.AddMagnet(magnet)
 	if err != nil {
+		log.Printf("StartStream: AddMagnet failed: %v", err)
 		return "", "", nil, err
 	}
 	<-t.GotInfo()
 	files := t.Files()
 	if fileIndex < 0 || fileIndex >= len(files) {
+		log.Printf("StartStream: bad file index: %d", fileIndex)
 		return "", "", nil, fmt.Errorf("bad file index")
 	}
 	f := files[fileIndex]
@@ -94,12 +112,14 @@ func (m *manager) StartStream(ctx context.Context, magnet string, fileIndex int)
 	if exists {
 		s.mtx.Lock()
 		s.viewers++
+		log.Printf("Client joined existing stream: key=%v, viewers=%d", key, s.viewers)
 		s.lastView = time.Now()
 		s.mtx.Unlock()
 		m.mu.Unlock()
 		<-s.ready
 		return playlist, outDir, s.cancel, nil
 	}
+	log.Printf("Starting new stream: key=%v", key)
 	m.mu.Unlock()
 
 	_ = os.MkdirAll(outDir, 0755)
@@ -119,38 +139,34 @@ func (m *manager) StartStream(ctx context.Context, magnet string, fileIndex int)
 	m.mu.Unlock()
 
 	go func() {
-		defer close(ready)
 		ffmpegHandler := ffmpeg.NewFfmpeg(ctx, f.NewReader(), playlist, outDir)
-		err := ffmpegHandler.ConvertToHLS()
+
+		// running ffmpeg in separated goroutine
+		go func() {
+			err := ffmpegHandler.ConvertToHLS()
+			if err != nil {
+				log.Printf("FFmpeg error: %v", err)
+				m.cleanup(key)
+			}
+		}()
+
+		err := waitForPlaylist(ctx, playlist)
 		if err != nil {
+			log.Printf("waitForPlaylist failed: %v", err)
 			m.cleanup(key)
 		}
+
+		close(ready)
 	}()
 
 	err = waitForPlaylist(ctx, playlist)
 	if err != nil {
+		log.Printf("waitForPlaylist failed: key=%v, err=%v", key, err)
 		return "", "", nil, fmt.Errorf("playlist not ready: %w", err)
 	}
+	log.Printf("Stream ready: key=%v, playlist=%s", key, playlist)
 	return playlist, outDir, cancel, nil
 }
-
-func (m *manager) TouchStream(magnet string, fileIndex int) {
-	t, _ := m.client.AddMagnet(magnet)
-	hash := t.InfoHash().HexString()
-	key := streamKey{InfoHash: hash, Index: fileIndex}
-	m.mu.Lock()
-	s := m.active[key]
-	m.mu.Unlock()
-	if s != nil {
-		s.mtx.Lock()
-		s.lastView = time.Now()
-		if s.viewers == 0 {
-			s.viewers = 1
-		}
-		s.mtx.Unlock()
-	}
-}
-
 func (m *manager) CleanupStreams() {
 	now := time.Now()
 	m.mu.Lock()
@@ -164,41 +180,45 @@ func (m *manager) CleanupStreams() {
 	}
 	m.mu.Unlock()
 }
-
-// private methods
-
 func (m *manager) cleanup(key streamKey) {
 	m.mu.Lock()
 	s, ok := m.active[key]
 	if !ok {
+		log.Printf("cleanup called, but no active stream found: key=%v", key)
 		m.mu.Unlock()
 		return
 	}
 	s.cancel()
 	outDir := filepath.Join(m.settings.HlsPath(), fmt.Sprintf("%s_%d", key.InfoHash, key.Index))
-	_ = os.RemoveAll(outDir)
+	log.Printf("Cleaning up stream: key=%v, dir=%s", key, outDir)
+	err := os.RemoveAll(outDir)
+	if err != nil {
+		log.Printf("Failed to cleanup directory: %s, err=%v", outDir, err)
+	}
 	if s.file != nil {
 		s.file.SetPriority(0)
 	}
-	stillUsed := false
-	for k, v := range m.active {
-		if k != key && v.torrent == s.torrent {
-			stillUsed = true
-			break
-		}
-	}
-	if !stillUsed && s.torrent != nil {
-		s.torrent.Drop()
-	}
 	delete(m.active, key)
 	m.mu.Unlock()
+	log.Printf("Stream cleaned up: key=%v", key)
 }
 
 func (m *manager) viewerWatcher() {
 	ticker := time.NewTicker(m.settings.ViewerTimeout() / 3)
 	defer ticker.Stop()
 	for range ticker.C {
-		m.CleanupStreams()
+		now := time.Now()
+		m.mu.Lock()
+		for key, s := range m.active {
+			s.mtx.Lock()
+			noViewers := s.viewers <= 0 || now.Sub(s.lastView) > m.settings.ViewerTimeout()
+			s.mtx.Unlock()
+			if noViewers {
+				log.Printf("Viewer timeout detected, cleaning up stream: key=%v", key)
+				go m.cleanup(key)
+			}
+		}
+		m.mu.Unlock()
 	}
 }
 
