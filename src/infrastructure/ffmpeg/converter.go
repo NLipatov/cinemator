@@ -30,21 +30,34 @@ func NewConverter(ctx context.Context, newReader func() io.ReadCloser, outDir, p
 func (c *Converter) ConvertToHLS() error {
 	rc1 := c.newReader()
 	sample, info, _ := c.analyzer.Analyze(rc1)
-	rc1.Close()
+	err := rc1.Close()
+	if err != nil {
+		return err
+	}
 
 	hw := c.detector.Detect()
 	c.builder.HW = hw
 	primary, fallback := c.builder.Build(info)
 
 	rc := c.newReader()
-	defer rc.Close()
+	defer func(rc io.ReadCloser) {
+		closeErr := rc.Close()
+		if closeErr != nil {
+			log.Println(closeErr)
+		}
+	}(rc)
 	stream := io.MultiReader(bytes.NewReader(sample), rc)
 
 	if err := runFFmpeg(c.ctx, stream, primary); err != nil {
 		log.Printf("Primary encoding failed (%v). Trying software fallback.", err)
 
 		rcFallback := c.newReader()
-		defer rcFallback.Close()
+		defer func(rcFallback io.ReadCloser) {
+			closeErr := rcFallback.Close()
+			if closeErr != nil {
+				log.Println(closeErr)
+			}
+		}(rcFallback)
 		streamFallback := io.MultiReader(bytes.NewReader(sample), rcFallback)
 
 		return runFFmpeg(c.ctx, streamFallback, fallback)
