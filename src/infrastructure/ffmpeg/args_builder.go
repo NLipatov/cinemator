@@ -19,17 +19,27 @@ func (b ArgsBuilder) Build(info SampleInfo) []string {
 
 	args := []string{"-fflags", "+genpts"}
 	if !copyOK && b.HW.Name != "" {
-		args = append(args, "-hwaccel", b.HW.Name, "-c:v", b.HW.Encoder)
+		args = append(args, "-hwaccel", b.HW.Name)
+		if b.HW.Decoder != "" {
+			args = append(args, "-c:v", b.HW.Decoder)
+		}
 	}
 	args = append(args, "-i", "pipe:0")
 
 	if copyOK {
 		args = append(args, "-c:v", "copy", "-c:a", "copy")
 	} else {
-		args = append(args,
-			"-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-			"-threads", "0", "-slice-max-size", "1500",
-		)
+		if b.HW.Encoder != "" {
+			args = append(args, "-c:v", b.HW.Encoder)
+		} else {
+			args = append(args,
+				"-c:v", "libx264",
+				"-preset", "ultrafast",
+				"-tune", "zerolatency",
+				"-threads", "0",
+				"-slice-max-size", "1500",
+			)
+		}
 		if info.NeedFilter {
 			args = append(args, "-vf", "format=yuv420p")
 		}
