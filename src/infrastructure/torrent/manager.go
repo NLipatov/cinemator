@@ -139,7 +139,7 @@ func (m *manager) StartStream(ctx context.Context, magnet string, fileIndex int)
 	m.mu.Unlock()
 
 	go func() {
-		ffmpegHandler := ffmpeg.NewFfmpeg(ctx, f.NewReader(), playlist, outDir)
+		ffmpegHandler := ffmpeg.NewConverter(ctx, f.NewReader(), outDir, playlist)
 
 		// running ffmpeg in separated goroutine
 		go func() {
