@@ -31,7 +31,7 @@ cd src
 go run main.go
 ```
 
-Open [http://localhost:8000](http://localhost:8000).
+Open [http://localhost:8000](http://localhost:8000) in your browser.
 
 ---
 
