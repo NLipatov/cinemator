@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 )
@@ -30,7 +31,12 @@ func NewConverter(ctx context.Context, rc io.ReadCloser, outDir, playlist string
 
 // ConvertToHLS performs the full conversion.
 func (c *Converter) ConvertToHLS() error {
-	defer c.rc.Close()
+	defer func(rc io.ReadCloser) {
+		err := rc.Close()
+		if err != nil {
+			log.Println(err)
+		}
+	}(c.rc)
 
 	// 1. Analyze sample
 	sample, info, _ := c.analyzer.Analyze(c.rc)
