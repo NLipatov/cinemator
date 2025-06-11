@@ -32,7 +32,10 @@ func (c *Converter) ConvertToHLS() error {
 	// ---------- анализ ----------------------------------------------------------------
 	rcProbe := c.newReader()
 	_, info, _ := c.analyzer.Analyze(rcProbe)
-	rcProbe.Close()
+	err := rcProbe.Close()
+	if err != nil {
+		return err
+	}
 
 	hw := c.detector.Detect()
 	if !c.smokeTest(hw) {
@@ -45,13 +48,23 @@ func (c *Converter) ConvertToHLS() error {
 	primary, fallback := c.builder.Build(info)
 
 	rc := c.newReader()
-	defer rc.Close()
+	defer func(rc io.ReadCloser) {
+		closeErr := rc.Close()
+		if closeErr != nil {
+			log.Println(closeErr)
+		}
+	}(rc)
 	log.Println("Trying primary ffmpeg:", strings.Join(primary, " "))
 	if err := runFFmpeg(c.ctx, rc, primary); err != nil {
 		log.Printf("Primary failed (%v). Falling back to software.", err)
 
 		rcFB := c.newReader()
-		defer rcFB.Close()
+		defer func(rcFB io.ReadCloser) {
+			closeErr := rcFB.Close()
+			if closeErr != nil {
+				log.Println(closeErr)
+			}
+		}(rcFB)
 		return runFFmpeg(c.ctx, rcFB, fallback)
 	}
 	return nil
