@@ -1,12 +1,13 @@
 package ffmpeg
 
 import (
-	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 type Converter struct {
@@ -28,46 +29,59 @@ func NewConverter(ctx context.Context, newReader func() io.ReadCloser, outDir, p
 }
 
 func (c *Converter) ConvertToHLS() error {
-	rc1 := c.newReader()
-	sample, info, _ := c.analyzer.Analyze(rc1)
-	err := rc1.Close()
-	if err != nil {
-		return err
-	}
+	// ---------- анализ ----------------------------------------------------------------
+	rcProbe := c.newReader()
+	_, info, _ := c.analyzer.Analyze(rcProbe)
+	rcProbe.Close()
 
 	hw := c.detector.Detect()
+	if !c.smokeTest(hw) {
+		hw = HWAccel{}
+	}
+	fmt.Println("HW accel selected:", hw.Name, hw.Decoder, hw.Encoder)
+
 	c.builder.HW = hw
+
 	primary, fallback := c.builder.Build(info)
 
 	rc := c.newReader()
-	defer func(rc io.ReadCloser) {
-		closeErr := rc.Close()
-		if closeErr != nil {
-			log.Println(closeErr)
-		}
-	}(rc)
-	stream := io.MultiReader(bytes.NewReader(sample), rc)
+	defer rc.Close()
+	log.Println("Trying primary ffmpeg:", strings.Join(primary, " "))
+	if err := runFFmpeg(c.ctx, rc, primary); err != nil {
+		log.Printf("Primary failed (%v). Falling back to software.", err)
 
-	if err := runFFmpeg(c.ctx, stream, primary); err != nil {
-		log.Printf("Primary encoding failed (%v). Trying software fallback.", err)
-
-		rcFallback := c.newReader()
-		defer func(rcFallback io.ReadCloser) {
-			closeErr := rcFallback.Close()
-			if closeErr != nil {
-				log.Println(closeErr)
-			}
-		}(rcFallback)
-		streamFallback := io.MultiReader(bytes.NewReader(sample), rcFallback)
-
-		return runFFmpeg(c.ctx, streamFallback, fallback)
+		rcFB := c.newReader()
+		defer rcFB.Close()
+		return runFFmpeg(c.ctx, rcFB, fallback)
 	}
-
 	return nil
 }
 
-func runFFmpeg(ctx context.Context, stream io.Reader, args []string) error {
+func runFFmpeg(ctx context.Context, in io.Reader, args []string) error {
 	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = stream, os.Stdout, os.Stderr
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = in, os.Stdout, os.Stderr
 	return cmd.Run()
+}
+
+func (c *Converter) smokeTest(hw HWAccel) bool {
+	if hw.Name == "" {
+		return false
+	}
+	args := []string{"-v", "error", "-f", "lavfi", "-i", "nullsrc", "-t", "0.1"}
+	switch hw.Name {
+	case "vaapi":
+		args = append(args,
+			"-init_hw_device", "vaapi=va:/dev/dri/renderD128",
+			"-hwaccel", "vaapi", "-c:v", hw.Encoder)
+	case "qsv":
+		args = append(args,
+			"-init_hw_device", "qsv=hw:/dev/dri/renderD128",
+			"-hwaccel", "qsv", "-c:v", hw.Encoder)
+	case "v4l2":
+		args = append(args, "-c:v", hw.Encoder)
+	default:
+		args = append(args, "-hwaccel", hw.Name, "-c:v", hw.Encoder)
+	}
+	args = append(args, "-f", "null", "-")
+	return exec.Command("ffmpeg", args...).Run() == nil
 }

@@ -1,8 +1,9 @@
 package ffmpeg
 
 import (
+	"bytes"
+	"os"
 	"os/exec"
-	"strings"
 )
 
 type HWAccel struct {
@@ -13,17 +14,27 @@ type HWAccel struct {
 
 type HWDetector struct{}
 
-func (d HWDetector) Detect() HWAccel {
-	out, _ := exec.Command("ffmpeg", "-hide_banner", "-encoders").Output()
-	s := string(out)
-	switch {
-	case strings.Contains(s, "h264_cuvid") && strings.Contains(s, "h264_nvenc"):
+func (HWDetector) Detect() HWAccel {
+	// NVIDIA NVENC ------------------------------------------------------
+	if _, err := os.Stat("/dev/nvidia0"); err == nil {
 		return HWAccel{"cuda", "h264_cuvid", "h264_nvenc"}
-	case strings.Contains(s, "h264_qsv"):
-		return HWAccel{"qsv", "h264_qsv", "h264_qsv"}
-	case strings.Contains(s, "h264_vaapi"):
-		return HWAccel{"vaapi", "", "h264_vaapi"}
-	default:
-		return HWAccel{}
 	}
+
+	// /dev/dri/renderD128 → Intel / AMD / Broadcom
+	if _, err := os.Stat("/dev/dri/renderD128"); err == nil {
+		out, _ := exec.Command("sh", "-c",
+			`lspci -nn | grep -m1 '\[03..:.*\]'`).Output()
+
+		switch {
+		case bytes.Contains(out, []byte("Intel")):
+			return HWAccel{"qsv", "h264_qsv", "h264_qsv"}
+		case bytes.Contains(out, []byte("AMD")), bytes.Contains(out, []byte("ATI")):
+			return HWAccel{"vaapi", "", "h264_vaapi"} // AMD VCN
+		case bytes.Contains(out, []byte("Broadcom")):
+			return HWAccel{"v4l2", "h264_v4l2m2m", "h264_v4l2m2m"} // RPi or others.
+		}
+	}
+
+	// soft
+	return HWAccel{}
 }
