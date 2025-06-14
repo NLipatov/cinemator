@@ -5,7 +5,7 @@ import "time"
 const (
 	hlsPath       = "/tmp/cinemator/hls"
 	downloadPath  = "/tmp/cinemator/download"
-	viewerTimeout = 5 * time.Hour
+	viewerTimeout = 7 * 24 * time.Hour
 	httpPort      = 8000
 )
 
