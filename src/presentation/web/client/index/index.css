@@ -154,7 +154,7 @@ button:hover, button:focus-visible {
   box-shadow: 0 4px 18px 0 rgba(72,133,255,0.14);
 }
 #video {
-  background: #232733;
+  background: #000000;
   border-radius: 0.8em;
   width: 100%; max-width: 100%;
   aspect-ratio: 16/9;
