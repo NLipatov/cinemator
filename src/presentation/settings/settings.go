@@ -3,8 +3,8 @@ package settings
 import "time"
 
 const (
-	hlsPath       = "/var/cinemator/hls"
-	downloadPath  = "/var/cinemator/download"
+	hlsPath       = "/var/tmp/cinemator/hls"
+	downloadPath  = "/var/tmp/cinemator/download"
 	viewerTimeout = 7 * 24 * time.Hour
 	httpPort      = 8000
 )
