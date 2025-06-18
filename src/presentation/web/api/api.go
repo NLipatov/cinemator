@@ -48,8 +48,8 @@ func (s *HttpServer) Run() error {
 
 	// http-api endpoints
 	http.HandleFunc("/api/get-torrent-files", s.handleGetTorrentFiles)
-	http.HandleFunc("/api/hls-stream", s.handleHlsStream)
-	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(s.handleHLS)))
+	http.HandleFunc("/api/hls-stream", s.handlePrepareHlsStream)
+	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
 	listenPort := fmt.Sprintf(":%d", port)
 	log.Printf("Server listening on %s", listenPort)
@@ -72,7 +72,7 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 	_ = json.NewEncoder(w).Encode(s.fileInfoMapper.MapArray(files))
 }
 
-func (s *HttpServer) handleHlsStream(w http.ResponseWriter, r *http.Request) {
+func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
 	magnet := r.URL.Query().Get("magnet")
 	idx := r.URL.Query().Get("file")
 	if magnet == "" || idx == "" {
@@ -84,7 +84,7 @@ func (s *HttpServer) handleHlsStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad file index", 400)
 		return
 	}
-	playlist, _, _, err := s.mgr.HandleHlsStream(context.Background(), magnet, fileIndex)
+	playlist, _, _, err := s.mgr.PrepareHlsStream(context.Background(), magnet, fileIndex)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -92,7 +92,7 @@ func (s *HttpServer) handleHlsStream(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/hls/"+filepath.Base(filepath.Dir(playlist))+"/index.m3u8", http.StatusFound)
 }
 
-func (s *HttpServer) handleHLS(w http.ResponseWriter, r *http.Request) {
+func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 	fullPath := filepath.Join(s.settings.HlsPath(), r.URL.Path)
 	if len(r.URL.Path) > 5 && r.URL.Path[len(r.URL.Path)-5:] == ".m3u8" {
 		data, err := os.ReadFile(fullPath)

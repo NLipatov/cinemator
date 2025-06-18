@@ -7,7 +7,6 @@ import (
 
 type TorrentManager interface {
 	GetTorrentFiles(ctx context.Context, magnet string) ([]domain.FileInfo, error)
-	HandleHlsStream(ctx context.Context, magnet string, fileIndex int) (playlistPath, hlsDir string, cancel context.CancelFunc, err error)
-	TouchStream(magnet string, fileIndex int)
+	PrepareHlsStream(ctx context.Context, magnet string, fileIndex int) (playlistPath, hlsDir string, cancel context.CancelFunc, err error)
 	CleanupStreams()
 }

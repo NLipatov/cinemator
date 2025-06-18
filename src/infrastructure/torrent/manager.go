@@ -74,32 +74,16 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 	}
 }
 
-func (m *manager) TouchStream(magnet string, fileIndex int) {
-	t, _ := m.client.AddMagnet(magnet)
-	hash := t.InfoHash().HexString()
-	key := streamKey{InfoHash: hash, Index: fileIndex}
-	m.mu.Lock()
-	s := m.active[key]
-	m.mu.Unlock()
-	if s != nil {
-		s.mtx.Lock()
-		s.lastView = time.Now()
-		if s.viewers == 0 {
-			s.viewers = 1
-		}
-		s.mtx.Unlock()
-	}
-}
-func (m *manager) HandleHlsStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
+func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
 	t, err := m.client.AddMagnet(magnet)
 	if err != nil {
-		log.Printf("HandleHlsStream: AddMagnet failed: %v", err)
+		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
 		return "", "", nil, err
 	}
 	<-t.GotInfo()
 	files := t.Files()
 	if fileIndex < 0 || fileIndex >= len(files) {
-		log.Printf("HandleHlsStream: bad file index: %d", fileIndex)
+		log.Printf("PrepareHlsStream: bad file index: %d", fileIndex)
 		return "", "", nil, fmt.Errorf("bad file index")
 	}
 	f := files[fileIndex]
