@@ -48,7 +48,7 @@ func (s *HttpServer) Run() error {
 
 	// http-api endpoints
 	http.HandleFunc("/api/get-torrent-files", s.handleGetTorrentFiles)
-	http.HandleFunc("/api/hls-stream", s.handlePrepareHlsStream)
+	http.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
 	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
 	listenPort := fmt.Sprintf(":%d", port)
