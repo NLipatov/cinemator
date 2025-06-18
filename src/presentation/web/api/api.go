@@ -47,7 +47,7 @@ func (s *HttpServer) Run() error {
 	http.Handle("/favicon.ico", http.FileServer(http.Dir("presentation/web/client/static")))
 
 	// http-api endpoints
-	http.HandleFunc("/api/get-torrent-files", s.handleGetTorrentFiles)
+	http.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
 	http.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
 	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
