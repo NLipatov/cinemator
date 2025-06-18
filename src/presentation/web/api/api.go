@@ -49,7 +49,7 @@ func (s *HttpServer) Run() error {
 	// http-api endpoints
 	http.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
 	http.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
-	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
+	http.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
 	listenPort := fmt.Sprintf(":%d", port)
 	log.Printf("Server listening on %s", listenPort)
