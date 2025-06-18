@@ -48,7 +48,7 @@ func (s *HttpServer) Run() error {
 
 	// http-api endpoints
 	http.HandleFunc("/api/get-torrent-files", s.handleGetTorrentFiles)
-	http.HandleFunc("/stream", s.handleStream)
+	http.HandleFunc("/api/hls-stream", s.handleHlsStream)
 	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(s.handleHLS)))
 
 	listenPort := fmt.Sprintf(":%d", port)
@@ -72,7 +72,7 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 	_ = json.NewEncoder(w).Encode(s.fileInfoMapper.MapArray(files))
 }
 
-func (s *HttpServer) handleStream(w http.ResponseWriter, r *http.Request) {
+func (s *HttpServer) handleHlsStream(w http.ResponseWriter, r *http.Request) {
 	magnet := r.URL.Query().Get("magnet")
 	idx := r.URL.Query().Get("file")
 	if magnet == "" || idx == "" {
@@ -84,7 +84,7 @@ func (s *HttpServer) handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad file index", 400)
 		return
 	}
-	playlist, _, _, err := s.mgr.StartStream(context.Background(), magnet, fileIndex)
+	playlist, _, _, err := s.mgr.HandleHlsStream(context.Background(), magnet, fileIndex)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return

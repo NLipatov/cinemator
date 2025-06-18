@@ -136,7 +136,7 @@
       const idx = $('filelist').value;
       if (!magnet || idx === undefined) return;
       try {
-        const resp = await fetch(`/stream?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { redirect: 'follow' });
+        const resp = await fetch(`/api/hls-stream?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { redirect: 'follow' });
         if (!resp.ok) throw new Error('Stream error');
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
         $('player-block').style.display = '';

@@ -90,16 +90,16 @@ func (m *manager) TouchStream(magnet string, fileIndex int) {
 		s.mtx.Unlock()
 	}
 }
-func (m *manager) StartStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
+func (m *manager) HandleHlsStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
 	t, err := m.client.AddMagnet(magnet)
 	if err != nil {
-		log.Printf("StartStream: AddMagnet failed: %v", err)
+		log.Printf("HandleHlsStream: AddMagnet failed: %v", err)
 		return "", "", nil, err
 	}
 	<-t.GotInfo()
 	files := t.Files()
 	if fileIndex < 0 || fileIndex >= len(files) {
-		log.Printf("StartStream: bad file index: %d", fileIndex)
+		log.Printf("HandleHlsStream: bad file index: %d", fileIndex)
 		return "", "", nil, fmt.Errorf("bad file index")
 	}
 	f := files[fileIndex]
