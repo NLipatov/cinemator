@@ -89,7 +89,10 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	http.Redirect(w, r, "/hls/"+filepath.Base(filepath.Dir(playlist))+"/index.m3u8", http.StatusFound)
+	http.Redirect(
+		w, r,
+		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/index.m3u8",
+		http.StatusFound)
 }
 
 func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
