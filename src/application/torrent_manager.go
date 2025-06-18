@@ -10,4 +10,6 @@ type TorrentManager interface {
 	StartStream(ctx context.Context, magnet string, fileIndex int) (playlistPath, hlsDir string, cancel context.CancelFunc, err error)
 	TouchStream(magnet string, fileIndex int)
 	CleanupStreams()
+	ListDownloads() ([]domain.DirInfo, error)
+	RemoveDirectory(name string) error
 }

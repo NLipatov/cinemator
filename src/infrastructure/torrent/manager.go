@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -247,4 +249,75 @@ func waitForPlaylist(ctx context.Context, path string) error {
 			time.Sleep(step)
 		}
 	}
+}
+
+func (m *manager) ListDownloads() ([]domain.DirInfo, error) {
+	downloadsDirectoryPath := m.settings.DownloadPath()
+	entries, err := os.ReadDir(downloadsDirectoryPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var result []domain.DirInfo
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		dirPath := filepath.Join(downloadsDirectoryPath, e.Name())
+		var total int64
+		walkDirErr := filepath.WalkDir(dirPath, func(_ string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() {
+				info, statErr := d.Info()
+				if statErr != nil {
+					return statErr
+				}
+				total += info.Size()
+			}
+			return nil
+		})
+		if walkDirErr != nil {
+			return nil, walkDirErr
+		}
+		result = append(result, domain.DirInfo{
+			Name:   e.Name(),
+			SizeGB: float64(total) / (1 << 30),
+		})
+	}
+	return result, nil
+}
+
+func (m *manager) RemoveDirectory(name string) error {
+	base := m.settings.DownloadPath()
+	// clean and join
+	dir := filepath.Join(base, filepath.Clean(name))
+
+	// ensure dir is inside base
+	rel, err := filepath.Rel(base, dir)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+	if strings.HasPrefix(rel, "..") {
+		return fmt.Errorf("refusing to delete outside download directory")
+	}
+
+	// check it exists and is a directory
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("directory %q not found", name)
+		}
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%q is not a directory", name)
+	}
+
+	// remove it
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("failed to remove %q: %w", name, err)
+	}
+	return nil
 }
