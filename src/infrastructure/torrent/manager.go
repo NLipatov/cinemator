@@ -44,7 +44,7 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	return m, nil
 }
 
-func (m *manager) Files(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
+func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
 	t, err := m.client.AddMagnet(magnet)
 	if err != nil {
 		return nil, err

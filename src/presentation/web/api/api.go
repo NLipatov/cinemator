@@ -42,9 +42,12 @@ func (s *HttpServer) Run() error {
 		return errors.New("invalid port")
 	}
 
+	// http-web client endpoints
 	http.Handle("/", http.FileServer(http.Dir("presentation/web/client/index")))
 	http.Handle("/favicon.ico", http.FileServer(http.Dir("presentation/web/client/static")))
-	http.HandleFunc("/files", s.handleFiles)
+
+	// http-api endpoints
+	http.HandleFunc("/api/get-torrent-files", s.handleGetTorrentFiles)
 	http.HandleFunc("/stream", s.handleStream)
 	http.Handle("/hls/", http.StripPrefix("/hls/", http.HandlerFunc(s.handleHLS)))
 
@@ -53,13 +56,13 @@ func (s *HttpServer) Run() error {
 	return http.ListenAndServe(listenPort, nil)
 }
 
-func (s *HttpServer) handleFiles(w http.ResponseWriter, r *http.Request) {
+func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Request) {
 	magnet := r.URL.Query().Get("magnet")
 	if magnet == "" {
 		http.Error(w, "magnet required", 400)
 		return
 	}
-	files, err := s.mgr.Files(context.Background(), magnet)
+	files, err := s.mgr.GetTorrentFiles(context.Background(), magnet)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return

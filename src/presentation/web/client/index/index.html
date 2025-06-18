@@ -111,7 +111,7 @@
       const magnet = $('magnet').value.trim();
       if (!magnet) return;
       try {
-        const res = await fetch('/files?magnet=' + encodeURIComponent(magnet));
+        const res = await fetch('/api/get-torrent-files?magnet=' + encodeURIComponent(magnet));
         if (!res.ok) throw new Error('Server error');
         files = await res.json();
         if (!files.length) throw new Error('No playable files found in torrent');
