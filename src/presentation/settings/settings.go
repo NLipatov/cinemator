@@ -3,7 +3,7 @@ package settings
 import "time"
 
 const (
-	TorrentInfoLookupDeadline = time.Second + 10
+	TorrentInfoLookupDeadline = time.Second * 10
 	hlsPath                   = "/var/tmp/cinemator/hls"
 	downloadPath              = "/var/tmp/cinemator/download"
 	viewerTimeout             = 7 * 24 * time.Hour

@@ -22,7 +22,7 @@ import (
 )
 
 type HttpServer struct {
-	mgr            application.TorrentManager
+	mgr            application.Downloader
 	fileInfoMapper application.Mapper[domain.FileInfo, dto.FileInfo]
 	settings       settings.Settings
 }
@@ -50,8 +50,8 @@ func (s *HttpServer) Run() error {
 	http.Handle("/favicon.ico", http.FileServer(http.Dir("presentation/web/client/static")))
 
 	// http-api endpoints
-	http.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
-	http.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
+	http.HandleFunc("/api/torrent/files", s.handleListFiles)
+	http.HandleFunc("/api/hls/prepare", s.handleStartHlsStream)
 	http.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
 	listenPort := fmt.Sprintf(":%d", port)
@@ -59,7 +59,7 @@ func (s *HttpServer) Run() error {
 	return http.ListenAndServe(listenPort, nil)
 }
 
-func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Request) {
+func (s *HttpServer) handleListFiles(w http.ResponseWriter, r *http.Request) {
 	magnet := r.URL.Query().Get("magnet")
 	if magnet == "" {
 		http.Error(w, "magnet required", 400)
@@ -75,7 +75,7 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 	_ = json.NewEncoder(w).Encode(s.fileInfoMapper.MapArray(files))
 }
 
-func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
+func (s *HttpServer) handleStartHlsStream(w http.ResponseWriter, r *http.Request) {
 	magnet := r.URL.Query().Get("magnet")
 	idx := r.URL.Query().Get("file")
 	if magnet == "" || idx == "" {
@@ -105,7 +105,7 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 	_ = os.MkdirAll(outDir, 0755)
 	go func() {
 		ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
-			return file.NewReader()
+			return file.ReadSeekCloser()
 		}, outDir, playlist)
 
 		// running ffmpeg in separated goroutine

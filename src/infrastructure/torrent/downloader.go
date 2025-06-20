@@ -21,7 +21,7 @@ type Downloader struct {
 	magnetTorrentMap *primitives.TypedSyncMap[string, *torrent.Torrent]
 }
 
-func NewDownloader(settings settings.Settings) (application.TorrentManager, error) {
+func NewDownloader(settings settings.Settings) (application.Downloader, error) {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = settings.DownloadPath()
 	client, err := torrent.NewClient(cfg)
@@ -88,8 +88,7 @@ func (m *Downloader) InfoHash(ctx context.Context, magnet string) (string, error
 	}
 }
 
-// ToDo: do not return concrete *torrent.File. Return some domain-type instead.
-func (m *Downloader) DownloadFile(ctx context.Context, magnet string, fileIndex int) (*torrent.File, error) {
+func (m *Downloader) DownloadFile(ctx context.Context, magnet string, fileIndex int) (domain.ReadableFile, error) {
 	t, err := m.getOrCreateTorrentFromMagnet(magnet)
 	if err != nil {
 		log.Printf("could not add magnet link: %v", err)
@@ -111,7 +110,8 @@ func (m *Downloader) DownloadFile(ctx context.Context, magnet string, fileIndex 
 
 		fileToDownload := files[fileIndex]
 		fileToDownload.Download()
-		return fileToDownload, nil
+		readableFile := NewReadableFile(fileToDownload)
+		return readableFile, nil
 	}
 }
 
