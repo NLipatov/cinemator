@@ -5,7 +5,7 @@ go 1.24.4
 require github.com/anacrolix/torrent v1.58.1
 
 require (
-	github.com/NLipatov/goutils v1.0.0
+	github.com/NLipatov/goutils v0.0.0-20250620170808-14d5526b0045 // indirect
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect
 	github.com/ajwerner/btree v0.0.0-20211221152037-f427b3e689c0 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
