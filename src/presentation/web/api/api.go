@@ -3,6 +3,7 @@ package api
 import (
 	"cinemator/application"
 	"cinemator/domain"
+	"cinemator/infrastructure/ffmpeg"
 	"cinemator/infrastructure/torrent"
 	"cinemator/presentation/settings"
 	"cinemator/presentation/web/dto"
@@ -11,11 +12,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 )
 
 type HttpServer struct {
@@ -84,7 +87,33 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "bad file index", 400)
 		return
 	}
-	playlist, _, _, err := s.mgr.PrepareHlsStream(context.Background(), magnet, fileIndex)
+	ctx := context.Background()
+	f, playlist, outDir, _, err := s.mgr.PrepareHlsStream(ctx, magnet, fileIndex)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	go func() {
+		ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
+			return f.NewReader()
+		}, outDir, playlist)
+
+		// running ffmpeg in separated goroutine
+		go func() {
+			err := ffmpegHandler.ConvertToHLS()
+			if err != nil {
+				log.Printf("FFmpeg error: %v", err)
+			}
+		}()
+
+		err := waitForPlaylist(ctx, playlist)
+		if err != nil {
+			log.Printf("waitForPlaylist failed: %v", err)
+		}
+	}()
+
+	err = waitForPlaylist(ctx, playlist)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -111,4 +140,28 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.ServeFile(w, r, fullPath)
+}
+
+// helpers
+func waitForPlaylist(ctx context.Context, path string) error {
+	const (
+		timeout = 5 * time.Minute
+		step    = 120 * time.Millisecond
+	)
+	deadline := time.Now().Add(timeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			if _, err := os.Stat(path); err == nil {
+				return nil
+			}
+			if time.Now().After(deadline) {
+				log.Printf("waitForPlaylist: %s not found after %v", path, timeout)
+				return errors.New("playlist not ready (timeout)")
+			}
+			time.Sleep(step)
+		}
+	}
 }

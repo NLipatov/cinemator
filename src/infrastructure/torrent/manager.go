@@ -1,12 +1,9 @@
 package torrent
 
 import (
-	"cinemator/infrastructure/ffmpeg"
 	"cinemator/presentation/settings"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -74,17 +71,17 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 	}
 }
 
-func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
+func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex int) (*torrent.File, string, string, context.CancelFunc, error) {
 	t, err := m.client.AddMagnet(magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
-		return "", "", nil, err
+		return nil, "", "", nil, err
 	}
 	<-t.GotInfo()
 	files := t.Files()
 	if fileIndex < 0 || fileIndex >= len(files) {
 		log.Printf("PrepareHlsStream: bad file index: %d", fileIndex)
-		return "", "", nil, fmt.Errorf("bad file index")
+		return nil, "", "", nil, fmt.Errorf("bad file index")
 	}
 	f := files[fileIndex]
 	hash := t.InfoHash().HexString()
@@ -102,7 +99,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		s.mtx.Unlock()
 		m.mu.Unlock()
 		<-s.ready
-		return playlist, outDir, s.cancel, nil
+		return nil, playlist, outDir, s.cancel, nil
 	}
 	log.Printf("Starting new stream: key=%v", key)
 	m.mu.Unlock()
@@ -122,37 +119,8 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	m.mu.Lock()
 	m.active[key] = s
 	m.mu.Unlock()
-
-	go func() {
-		ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
-			return f.NewReader()
-		}, outDir, playlist)
-
-		// running ffmpeg in separated goroutine
-		go func() {
-			err := ffmpegHandler.ConvertToHLS()
-			if err != nil {
-				log.Printf("FFmpeg error: %v", err)
-				m.cleanup(key)
-			}
-		}()
-
-		err := waitForPlaylist(ctx, playlist)
-		if err != nil {
-			log.Printf("waitForPlaylist failed: %v", err)
-			m.cleanup(key)
-		}
-
-		close(ready)
-	}()
-
-	err = waitForPlaylist(ctx, playlist)
-	if err != nil {
-		log.Printf("waitForPlaylist failed: key=%v, err=%v", key, err)
-		return "", "", nil, fmt.Errorf("playlist not ready: %w", err)
-	}
 	log.Printf("Stream ready: key=%v, playlist=%s", key, playlist)
-	return playlist, outDir, cancel, nil
+	return f, playlist, outDir, cancel, nil
 }
 func (m *manager) CleanupStreams() {
 	now := time.Now()
@@ -206,29 +174,5 @@ func (m *manager) viewerWatcher() {
 			}
 		}
 		m.mu.Unlock()
-	}
-}
-
-// helpers
-func waitForPlaylist(ctx context.Context, path string) error {
-	const (
-		timeout = 5 * time.Minute
-		step    = 120 * time.Millisecond
-	)
-	deadline := time.Now().Add(timeout)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			if _, err := os.Stat(path); err == nil {
-				return nil
-			}
-			if time.Now().After(deadline) {
-				log.Printf("waitForPlaylist: %s not found after %v", path, timeout)
-				return errors.New("playlist not ready (timeout)")
-			}
-			time.Sleep(step)
-		}
 	}
 }
