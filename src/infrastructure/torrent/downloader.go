@@ -3,7 +3,6 @@ package torrent
 import (
 	"cinemator/application"
 	"cinemator/domain"
-	"cinemator/domain/primitives"
 	"cinemator/presentation/settings"
 	"context"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/NLipatov/goutils/maps"
 	"github.com/anacrolix/torrent"
 	"golang.org/x/sync/errgroup"
 )
@@ -18,7 +18,7 @@ import (
 type Downloader struct {
 	client           *torrent.Client
 	settings         settings.Settings
-	magnetTorrentMap *primitives.TypedSyncMap[string, *torrent.Torrent]
+	magnetTorrentMap *maps.TypedSyncMap[string, *torrent.Torrent]
 }
 
 func NewDownloader(settings settings.Settings) (application.Downloader, error) {
@@ -43,7 +43,7 @@ func NewDownloader(settings settings.Settings) (application.Downloader, error) {
 	m := &Downloader{
 		client:           client,
 		settings:         settings,
-		magnetTorrentMap: primitives.NewTypedSyncMap[string, *torrent.Torrent](),
+		magnetTorrentMap: maps.NewTypedSyncMap[string, *torrent.Torrent](),
 	}
 	return m, nil
 }
