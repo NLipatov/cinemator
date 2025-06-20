@@ -28,7 +28,7 @@ type HttpServer struct {
 }
 
 func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
-	mgr, err := torrent.NewManager(settings)
+	mgr, err := torrent.NewDownloader(settings)
 	if err != nil {
 		return nil, err
 	}
@@ -65,7 +65,7 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "magnet required", 400)
 		return
 	}
-	files, err := s.mgr.GetTorrentFiles(context.Background(), magnet)
+	files, err := s.mgr.ListFiles(context.Background(), magnet)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -88,15 +88,24 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	ctx := context.Background()
-	f, playlist, outDir, _, err := s.mgr.PrepareHlsStream(ctx, magnet, fileIndex)
+	file, err := s.mgr.DownloadFile(ctx, magnet, fileIndex)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 
+	hash, hashErr := s.mgr.InfoHash(ctx, magnet)
+	if hashErr != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	outDir := filepath.Join(s.settings.HlsPath(), fmt.Sprintf("%s_%d", hash, fileIndex))
+	playlist := filepath.Join(outDir, "index.m3u8")
+	_ = os.MkdirAll(outDir, 0755)
 	go func() {
 		ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
-			return f.NewReader()
+			return file.NewReader()
 		}, outDir, playlist)
 
 		// running ffmpeg in separated goroutine
