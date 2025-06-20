@@ -96,7 +96,7 @@ func (s *HttpServer) handleStartHlsStream(w http.ResponseWriter, r *http.Request
 
 	hash, hashErr := s.mgr.InfoHash(ctx, magnet)
 	if hashErr != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, "server failed to get torrent info hash", 500)
 		return
 	}
 
