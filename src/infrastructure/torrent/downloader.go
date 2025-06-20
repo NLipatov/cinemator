@@ -3,18 +3,22 @@ package torrent
 import (
 	"cinemator/application"
 	"cinemator/domain"
+	"cinemator/domain/primitives"
 	"cinemator/presentation/settings"
 	"context"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/anacrolix/torrent"
+	"golang.org/x/sync/errgroup"
 )
 
-type TorrentDownloader struct {
-	client   *torrent.Client
-	settings settings.Settings
+type Downloader struct {
+	client           *torrent.Client
+	settings         settings.Settings
+	magnetTorrentMap *primitives.TypedSyncMap[string, *torrent.Torrent]
 }
 
 func NewDownloader(settings settings.Settings) (application.TorrentManager, error) {
@@ -24,24 +28,38 @@ func NewDownloader(settings settings.Settings) (application.TorrentManager, erro
 	if err != nil {
 		return nil, err
 	}
-	_ = os.MkdirAll(settings.HlsPath(), 0755)
-	_ = os.MkdirAll(settings.DownloadPath(), 0755)
-	m := &TorrentDownloader{
-		client:   client,
-		settings: settings,
+
+	var mkdirErrGroup errgroup.Group
+	mkdirErrGroup.Go(func() error {
+		return os.MkdirAll(settings.HlsPath(), 0755)
+	})
+	mkdirErrGroup.Go(func() error {
+		return os.MkdirAll(settings.DownloadPath(), 0755)
+	})
+	if mkdirAllErrs := mkdirErrGroup.Wait(); mkdirAllErrs != nil {
+		return nil, mkdirAllErrs
+	}
+
+	m := &Downloader{
+		client:           client,
+		settings:         settings,
+		magnetTorrentMap: primitives.NewTypedSyncMap[string, *torrent.Torrent](),
 	}
 	return m, nil
 }
 
-func (m *TorrentDownloader) ListFiles(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
-	t, err := m.client.AddMagnet(magnet)
+func (m *Downloader) ListFiles(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
+	t, err := m.getOrCreateTorrentFromMagnet(magnet)
 	if err != nil {
 		return nil, err
 	}
 
+	timer := time.NewTimer(m.settings.TorrentInfoLookupDeadline())
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, fmt.Errorf("torrent info lookup deadline exceeded")
 	case <-t.GotInfo():
 		files := t.Files()
 		out := make([]domain.FileInfo, len(files))
@@ -52,31 +70,38 @@ func (m *TorrentDownloader) ListFiles(ctx context.Context, magnet string) ([]dom
 	}
 }
 
-func (m *TorrentDownloader) InfoHash(ctx context.Context, magnet string) (string, error) {
-	t, err := m.client.AddMagnet(magnet)
+func (m *Downloader) InfoHash(ctx context.Context, magnet string) (string, error) {
+	t, err := m.getOrCreateTorrentFromMagnet(magnet)
 	if err != nil {
 		log.Printf("could not add magnet link: %v", err)
 		return "", err
 	}
 
+	timer := time.NewTimer(m.settings.TorrentInfoLookupDeadline())
 	select {
 	case <-ctx.Done():
 		return "", ctx.Err()
+	case <-timer.C:
+		return "", fmt.Errorf("torrent info lookup deadline exceeded")
 	case <-t.GotInfo():
 		return t.InfoHash().String(), nil
 	}
 }
 
-func (m *TorrentDownloader) DownloadFile(ctx context.Context, magnet string, fileIndex int) (*torrent.File, error) {
-	t, err := m.client.AddMagnet(magnet)
+// ToDo: do not return concrete *torrent.File. Return some domain-type instead.
+func (m *Downloader) DownloadFile(ctx context.Context, magnet string, fileIndex int) (*torrent.File, error) {
+	t, err := m.getOrCreateTorrentFromMagnet(magnet)
 	if err != nil {
 		log.Printf("could not add magnet link: %v", err)
 		return nil, err
 	}
 
+	timer := time.NewTimer(m.settings.TorrentInfoLookupDeadline())
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, fmt.Errorf("torrent info lookup deadline exceeded")
 	case <-t.GotInfo():
 		files := t.Files()
 		if fileIndex < 0 || fileIndex >= len(files) {
@@ -88,4 +113,20 @@ func (m *TorrentDownloader) DownloadFile(ctx context.Context, magnet string, fil
 		fileToDownload.Download()
 		return fileToDownload, nil
 	}
+}
+
+func (m *Downloader) getOrCreateTorrentFromMagnet(magnet string) (*torrent.Torrent, error) {
+	storedTorrent, found := m.magnetTorrentMap.Load(magnet)
+	if found {
+		return storedTorrent, nil
+	}
+
+	newTorrent, addMagnetErr := m.client.AddMagnet(magnet)
+	if addMagnetErr != nil {
+		log.Printf("could not add magnet link: %v", addMagnetErr)
+		return nil, addMagnetErr
+	}
+
+	m.magnetTorrentMap.Store(magnet, newTorrent)
+	return newTorrent, nil
 }

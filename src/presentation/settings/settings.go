@@ -3,10 +3,11 @@ package settings
 import "time"
 
 const (
-	hlsPath       = "/var/tmp/cinemator/hls"
-	downloadPath  = "/var/tmp/cinemator/download"
-	viewerTimeout = 7 * 24 * time.Hour
-	httpPort      = 8000
+	TorrentInfoLookupDeadline = time.Second + 10
+	hlsPath                   = "/var/tmp/cinemator/hls"
+	downloadPath              = "/var/tmp/cinemator/download"
+	viewerTimeout             = 7 * 24 * time.Hour
+	httpPort                  = 8000
 )
 
 type Settings struct {
@@ -30,4 +31,8 @@ func (s *Settings) ViewerTimeout() time.Duration {
 
 func (s *Settings) HttpPort() int {
 	return httpPort
+}
+
+func (s *Settings) TorrentInfoLookupDeadline() time.Duration {
+	return TorrentInfoLookupDeadline
 }
