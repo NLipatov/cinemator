@@ -10,23 +10,25 @@ import (
 // first 2 MiB of the stream are enough for ffprobe to parse container headers
 const peekSize = 2 << 20 // 2 MiB
 
+type AudioTrack struct {
+	Index          int
+	Codec          string
+	NeedsTranscode bool // true if not AAC
+}
+
 type SampleInfo struct {
-	VideoCodec string
-	AudioCodec string
-	NeedFilter bool // true when pixel-format ≠ yuv420p
+	VideoCodec  string
+	AudioTracks []AudioTrack
+	NeedFilter  bool // true when pixel-format ≠ yuv420p
 }
 
 type SampleAnalyzer struct{}
 
-// Analyze reads up to peekSize bytes, feeds them to ffprobe and
-// returns detected codecs + whether a yuv420p conversion is required.
 func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
-	// --- 1. grab a small probe chunk ---------------------------------
 	buf := make([]byte, peekSize)
-	n, _ := io.ReadFull(r, buf) // ignore error: short read is fine
+	n, _ := io.ReadFull(r, buf)
 	sample := buf[:n]
 
-	// --- 2. run ffprobe on the chunk ---------------------------------
 	cmd := exec.Command(
 		"ffprobe", "-v", "error",
 		"-of", "json", "-show_streams", "-i", "pipe:0",
@@ -37,9 +39,9 @@ func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
 		return SampleInfo{}, err
 	}
 
-	// --- 3. parse json ------------------------------------------------
 	var meta struct {
 		Streams []struct {
+			Index     int    `json:"index"`
 			CodecType string `json:"codec_type"`
 			CodecName string `json:"codec_name"`
 			PixFmt    string `json:"pix_fmt"`
@@ -59,7 +61,12 @@ func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
 				info.NeedFilter = true
 			}
 		case "audio":
-			info.AudioCodec = s.CodecName
+			needsTranscode := s.CodecName != "aac"
+			info.AudioTracks = append(info.AudioTracks, AudioTrack{
+				Index:          s.Index,
+				Codec:          s.CodecName,
+				NeedsTranscode: needsTranscode,
+			})
 		}
 	}
 	return info, nil
