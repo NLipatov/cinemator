@@ -66,6 +66,7 @@
     $('form').onsubmit = async e => {
       e.preventDefault();
       destroyVideoAndHls();
+      clearAudioSelector();
       showMsg('magnetMsg', 'Loading file list…', false, true);
       $('filelist').innerHTML = '';
       $('step-files').style.display = 'none';
@@ -89,7 +90,9 @@
       }
     };
     $('play').onclick = async () => {
+      disablePlayButton();
       destroyVideoAndHls();
+      clearAudioSelector();
       $('player-block').style.display = 'none';
       removeWarning();
       showWarning();
@@ -99,7 +102,33 @@
       const idx = $('filelist').value;
       if (!magnet || idx === undefined) return;
       try {
-        const resp = await fetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { redirect: 'follow' });
+        const resp = await fetch(
+            `/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}`,
+            { redirect: 'follow' }
+        );
+        
+        // Checking Content-Type to distinct json with audiotracks from hls stream start
+        const ct = resp.headers.get("content-type") || "";
+        if (ct.includes("application/json")) {
+          const tracks = await resp.json();
+          // tracks: [{Title, Language, ...}]
+          showAudioSelector(tracks, async (audioIdx) => {
+            // second play request with selected audiotrack
+            const audioTrackPickResponse = await fetch(
+                `/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audioIdx}`,
+                { redirect: 'follow' }
+            );
+            if (!audioTrackPickResponse.ok) {
+                enablePlayButton();
+                throw new Error('Stream error');
+            }
+            const m3u8 = audioTrackPickResponse.url.replace(window.location.origin, '') + '?t=' + Date.now();
+            $('player-block').style.display = '';
+            playHls(m3u8);
+          });
+          return;
+        }
+        
         if (!resp.ok) throw new Error('Stream error');
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
         $('player-block').style.display = '';
@@ -107,6 +136,7 @@
       } catch (e) {
         removeWarning();
         showMsg('fileMsg', e.message || 'Could not start stream', true);
+        disablePlayButton();
         return;
       }
     };
@@ -143,4 +173,37 @@
         removeWarning();
         showMsg('playerMsg', 'Your browser does not support HLS.', true);
       }
+    }
+    
+    function showAudioSelector(tracks, cb) {
+      $('audio-selector').innerHTML = `
+        <label style="font-weight:500;display:block;margin-bottom:5px">Select audio track:</label>
+        <select id="audioTrackSelect" class="input-style" style="margin-bottom:8px;">
+          ${tracks.map((t,i) =>
+            `<option value="${i}">${t.title || 'Track '+(i+1)}${t.language ? ' ('+t.language+')' : ''}</option>`
+          ).join('')}
+        </select>
+        <button id="audioSelectBtn" class="input-style" style="margin-left:10px;">OK</button>
+      `;
+      $('audioSelectBtn').onclick = () => {
+        const idx = $('audioTrackSelect').value;
+        cb(idx);
+        $('play').disabled = false;
+        clearAudioSelector();
+        enablePlayButton();
+      };
+    }
+    
+    function clearAudioSelector() {
+      $('audio-selector').innerHTML = '';
+    }
+    
+    function disablePlayButton() {
+      const playBtn = document.getElementById('play');
+      if (playBtn) playBtn.disabled = true;
+    }
+    
+    function enablePlayButton() {
+      const playBtn = document.getElementById('play');
+      if (playBtn) playBtn.disabled = false;
     }

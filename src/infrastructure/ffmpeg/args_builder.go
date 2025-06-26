@@ -7,16 +7,22 @@ type ArgsBuilder struct {
 	OutDir, Playlist string
 }
 
-func (b ArgsBuilder) Build(info SampleInfo) []string {
+func (b ArgsBuilder) Build(info SampleInfo, audioIdx int) []string {
 	// -- base flags common to every profile
 	args := []string{"-fflags", "+genpts", "-i", "pipe:0"}
 
 	// map video
 	args = append(args, "-map", "0:v:0")
 
-	// map every audiotrack
-	for i := range info.AudioTracks {
-		args = append(args, "-map", fmt.Sprintf("0:a:%d", i))
+	// map audio (if any audio tracks presented)
+	if len(info.AudioTracks) > 0 && audioIdx >= 0 && audioIdx < len(info.AudioTracks) {
+		args = append(args, "-map", fmt.Sprintf("0:a:%d", audioIdx))
+		track := info.AudioTracks[audioIdx]
+		if track.NeedsTranscode {
+			args = append(args, "-c:a", "aac", "-b:a", "128k", "-ac", "2")
+		} else {
+			args = append(args, "-c:a", "copy")
+		}
 	}
 
 	// Video: if h264 and filter not needed - copy, in other case — transcode
@@ -26,15 +32,6 @@ func (b ArgsBuilder) Build(info SampleInfo) []string {
 		args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency")
 		if info.NeedFilter {
 			args = append(args, "-vf", "format=yuv420p")
-		}
-	}
-
-	// Audio: if AAC - copy, in other case -transcode
-	for i, track := range info.AudioTracks {
-		if track.NeedsTranscode {
-			args = append(args, fmt.Sprintf("-c:a:%d", i), "aac", fmt.Sprintf("-b:a:%d", i), "128k", fmt.Sprintf("-ac:%d", i), "2")
-		} else {
-			args = append(args, fmt.Sprintf("-c:a:%d", i), "copy")
 		}
 	}
 

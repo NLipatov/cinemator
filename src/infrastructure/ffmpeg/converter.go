@@ -30,20 +30,24 @@ func NewConverter(ctx context.Context,
 	}
 }
 
-// ConvertToHLS probes the stream, builds arguments once and launches ffmpeg.
-func (c *Converter) ConvertToHLS() error {
-	// --- 1. probe the first 2 MiB ------------------------------------
+func (c *Converter) GetInfo() (SampleInfo, error) {
+	// --- probe the first 2 MiB ------------------------------------
 	probe := c.newReader()
 	info, err := c.analyzer.Analyze(probe)
 	_ = probe.Close()
 	if err != nil {
-		return err
+		return SampleInfo{}, err
 	}
 
-	// --- 2. build the final ffmpeg CLI --------------------------------
-	args := c.builder.Build(info)
+	return info, nil
+}
 
-	// --- 3. run ffmpeg (single pass, software only) -------------------
+// ConvertToHLS probes the stream, builds arguments once and launches ffmpeg.
+func (c *Converter) ConvertToHLS(info SampleInfo, audioIdx int) error {
+	// --- build the final ffmpeg CLI --------------------------------
+	args := c.builder.Build(info, audioIdx)
+
+	// --- run ffmpeg (single pass, software only) -------------------
 	stream := c.newReader()
 	defer func() {
 		if closeErr := stream.Close(); closeErr != nil {

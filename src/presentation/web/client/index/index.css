@@ -143,7 +143,8 @@ button.input-style, button {
   background: var(--color-accent);
   color: #fff;
   border: none;
-  min-width: 7em; font-weight: 600;
+  min-width: 7em; 
+  font-weight: 600;
   letter-spacing: .01em;
   transition: background .18s, box-shadow .16s, transform .10s;
   box-shadow: 0 2px 8px 0 rgba(72,133,255,0.11);
@@ -153,6 +154,18 @@ button:hover, button:focus-visible {
   transform: scale(1.04);
   box-shadow: 0 4px 18px 0 rgba(72,133,255,0.14);
 }
+
+button:disabled, button.input-style:disabled {
+  background: var(--color-border) !important;
+  color: #aab1bb !important;
+  cursor: not-allowed;
+  opacity: 0.62;
+  box-shadow: none;
+  filter: grayscale(0.23);
+  transform: none;
+  pointer-events: none;
+}
+
 #video {
   background: #000000;
   border-radius: 0.8em;
@@ -230,6 +243,15 @@ button:hover, button:focus-visible {
   color: #be9110;
   font-weight: 600;
 }
+
+#audio-selector {
+  display: flex;
+  align-items: center;
+  gap: 0.7em;
+  margin-top: 0.4em;
+  margin-bottom: 0.3em;
+}
+
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes shake {
   0% { transform: translateX(0px);}

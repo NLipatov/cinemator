@@ -22,9 +22,10 @@ import (
 )
 
 type HttpServer struct {
-	mgr            application.Downloader
-	fileInfoMapper application.Mapper[domain.FileInfo, dto.FileInfo]
-	settings       settings.Settings
+	mgr             application.Downloader
+	fileInfoMapper  application.Mapper[domain.FileInfo, dto.FileInfo]
+	audioInfoMapper application.Mapper[domain.AudioInfo, dto.AudioInfo]
+	settings        settings.Settings
 }
 
 func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
@@ -33,9 +34,10 @@ func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
 		return nil, err
 	}
 	return &HttpServer{
-		mgr:            mgr,
-		fileInfoMapper: mappers.NewFileInfoMapper(),
-		settings:       settings,
+		mgr:             mgr,
+		fileInfoMapper:  mappers.NewFileInfoMapper(),
+		audioInfoMapper: mappers.NewAudioInfoMapper(),
+		settings:        settings,
 	}, nil
 }
 
@@ -103,22 +105,53 @@ func (s *HttpServer) handleStartHlsStream(w http.ResponseWriter, r *http.Request
 	outDir := filepath.Join(s.settings.HlsPath(), fmt.Sprintf("%s_%d", hash, fileIndex))
 	playlist := filepath.Join(outDir, "index.m3u8")
 	_ = os.MkdirAll(outDir, 0755)
-	go func() {
-		ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
-			return file.ReadSeekCloser()
-		}, outDir, playlist)
 
-		// running ffmpeg in separated goroutine
-		go func() {
-			err := ffmpegHandler.ConvertToHLS()
-			if err != nil {
-				log.Printf("FFmpeg error: %v", err)
-			}
-		}()
+	ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
+		return file.ReadSeekCloser()
+	}, outDir, playlist)
 
-		err := waitForPlaylist(ctx, playlist)
+	info, getInfoErr := ffmpegHandler.GetInfo()
+
+	if getInfoErr != nil {
+		http.Error(w, getInfoErr.Error(), 500)
+		return
+	}
+
+	audio := r.URL.Query().Get("audio")
+	audioIndex := -1
+	if audio != "" {
+		audioIndex, err = strconv.Atoi(audio)
 		if err != nil {
-			log.Printf("waitForPlaylist failed: %v", err)
+			http.Error(w, "bad audio index", 400)
+			return
+		}
+	}
+
+	if len(info.AudioTracks) == 0 {
+		audioIndex = -1
+	}
+
+	if audioIndex >= len(info.AudioTracks) {
+		http.Error(w, "bad audio index", 400)
+		return
+	}
+
+	if len(info.AudioTracks) > 1 && audioIndex < 0 {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(s.audioInfoMapper.MapArray(info.AudioTracks))
+		return
+	}
+
+	// running ffmpeg in separated goroutine
+	go func() {
+		convertToHLSErr := ffmpegHandler.ConvertToHLS(info, audioIndex)
+		if convertToHLSErr != nil {
+			log.Printf("FFmpeg error: %v", convertToHLSErr)
+		}
+
+		waitForPlaylistErr := waitForPlaylist(ctx, playlist)
+		if waitForPlaylistErr != nil {
+			log.Printf("waitForPlaylist failed: %v", waitForPlaylistErr)
 		}
 	}()
 

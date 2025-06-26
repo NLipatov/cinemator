@@ -2,6 +2,7 @@ package ffmpeg
 
 import (
 	"bytes"
+	"cinemator/domain"
 	"encoding/json"
 	"io"
 	"os/exec"
@@ -10,15 +11,9 @@ import (
 // first 2 MiB of the stream are enough for ffprobe to parse container headers
 const peekSize = 2 << 20 // 2 MiB
 
-type AudioTrack struct {
-	Index          int
-	Codec          string
-	NeedsTranscode bool // true if not AAC
-}
-
 type SampleInfo struct {
 	VideoCodec  string
-	AudioTracks []AudioTrack
+	AudioTracks []domain.AudioInfo
 	NeedFilter  bool // true when pixel-format ≠ yuv420p
 }
 
@@ -45,6 +40,10 @@ func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
 			CodecType string `json:"codec_type"`
 			CodecName string `json:"codec_name"`
 			PixFmt    string `json:"pix_fmt"`
+			Tags      struct {
+				Title    string `json:"title"`
+				Language string `json:"language"`
+			} `json:"tags"`
 		} `json:"streams"`
 	}
 	if err := json.Unmarshal(out, &meta); err != nil {
@@ -61,11 +60,14 @@ func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
 				info.NeedFilter = true
 			}
 		case "audio":
-			needsTranscode := s.CodecName != "aac"
-			info.AudioTracks = append(info.AudioTracks, AudioTrack{
-				Index:          s.Index,
-				Codec:          s.CodecName,
-				NeedsTranscode: needsTranscode,
+			info.AudioTracks = append(info.AudioTracks, domain.AudioInfo{
+				Index: s.Index,
+				Codec: s.CodecName,
+				Tag: domain.AudioTag{
+					Title:    s.Tags.Title,
+					Language: s.Tags.Language,
+				},
+				NeedsTranscode: s.CodecName != "aac",
 			})
 		}
 	}
