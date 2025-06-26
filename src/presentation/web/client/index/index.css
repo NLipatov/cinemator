@@ -246,6 +246,7 @@ button:disabled, button.input-style:disabled {
 
 #audio-selector {
   display: flex;
+  justify-content: space-between;
   align-items: center;
   gap: 0.7em;
   margin-top: 0.4em;

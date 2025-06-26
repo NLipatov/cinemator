@@ -176,6 +176,7 @@
     }
     
     function showAudioSelector(tracks, cb) {
+      enablePlayButton();
       $('audio-selector').innerHTML = `
         <label style="font-weight:500;display:block;margin-bottom:5px">Select audio track:</label>
         <select id="audioTrackSelect" class="input-style" style="margin-bottom:8px;">
@@ -183,19 +184,27 @@
             `<option value="${i}">${t.title || 'Track '+(i+1)}${t.language ? ' ('+t.language+')' : ''}</option>`
           ).join('')}
         </select>
-        <button id="audioSelectBtn" class="input-style" style="margin-left:10px;">OK</button>
       `;
-      $('audioSelectBtn').onclick = () => {
+    
+      // Переместим кнопку Play после выбора аудио
+      const playBtn = $('play');
+      $('audio-selector').appendChild(playBtn);
+    
+      playBtn.onclick = () => {
         const idx = $('audioTrackSelect').value;
         cb(idx);
-        $('play').disabled = false;
-        clearAudioSelector();
-        enablePlayButton();
       };
     }
     
     function clearAudioSelector() {
-      $('audio-selector').innerHTML = '';
+      const audioSelector = $('audio-selector');
+      const playBtn = $('play');
+      const stepFiles = $('step-files');
+    
+      if (!stepFiles.contains(playBtn)) {
+        stepFiles.appendChild(playBtn);
+      }
+      audioSelector.innerHTML = '';
     }
     
     function disablePlayButton() {
