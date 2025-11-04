@@ -33,8 +33,12 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	if err != nil {
 		return nil, err
 	}
-	_ = os.MkdirAll(settings.HlsPath(), 0755)
-	_ = os.MkdirAll(settings.DownloadPath(), 0755)
+	if mkdirErr := os.MkdirAll(settings.HlsPath(), 0755); mkdirErr != nil {
+		return nil, mkdirErr
+	}
+	if mkdirErr := os.MkdirAll(settings.DownloadPath(), 0755); mkdirErr != nil {
+		return nil, mkdirErr
+	}
 	m := &manager{
 		client:   client,
 		active:   make(map[streamKey]*streamInfo),
@@ -49,28 +53,28 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 	if err != nil {
 		return nil, err
 	}
-
-	done := make(chan []domain.FileInfo, 1)
+	out := make(chan []domain.FileInfo, 1)
 	go func() {
-		<-t.GotInfo()
-		files := t.Files()
-		out := make([]domain.FileInfo, len(files))
-		for i, f := range files {
-			out[i] = domain.FileInfo{Index: i, Name: f.DisplayPath(), Size: f.Length()}
-		}
-
-		// prevents the goroutine from hanging if ctx is cancelled
 		select {
-		case done <- out:
 		case <-ctx.Done():
+			return
+		case <-t.GotInfo():
+			files := t.Files()
+			result := make([]domain.FileInfo, len(files))
+			for i, f := range files {
+				result[i] = domain.FileInfo{Index: i, Name: f.DisplayPath(), Size: f.Length()}
+			}
+			select {
+			case out <- result:
+			case <-ctx.Done():
+			}
 		}
 	}()
-
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
-	case res := <-done:
-		return res, nil
+	case result := <-out:
+		return result, nil
 	}
 }
 
@@ -80,13 +84,17 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
 		return "", "", nil, err
 	}
-	<-t.GotInfo()
+	select {
+	case <-t.GotInfo():
+	case <-ctx.Done():
+		return "", "", nil, ctx.Err()
+	}
 	files := t.Files()
 	if fileIndex < 0 || fileIndex >= len(files) {
 		log.Printf("PrepareHlsStream: bad file index: %d", fileIndex)
 		return "", "", nil, fmt.Errorf("bad file index")
 	}
-	f := files[fileIndex]
+	file := files[fileIndex]
 	hash := t.InfoHash().HexString()
 	key := streamKey{InfoHash: hash, Index: fileIndex}
 	outDir := filepath.Join(m.settings.HlsPath(), fmt.Sprintf("%s_%d", hash, fileIndex))
@@ -104,92 +112,89 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		<-s.ready
 		return playlist, outDir, s.cancel, nil
 	}
-	log.Printf("Starting new stream: key=%v", key)
-	m.mu.Unlock()
-
-	_ = os.MkdirAll(outDir, 0755)
-	f.Download()
 	ready := make(chan struct{})
-	ctx, cancel := context.WithCancel(ctx)
+	streamCtx, cancel := context.WithCancel(context.Background())
 	s = &streamInfo{
 		ready:    ready,
 		cancel:   cancel,
 		torrent:  t,
-		file:     f,
+		file:     file,
 		viewers:  1,
 		lastView: time.Now(),
 	}
-	m.mu.Lock()
 	m.active[key] = s
 	m.mu.Unlock()
 
-	go func() {
-		ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
-			return f.NewReader()
-		}, outDir, playlist)
+	if mkdirErr := os.MkdirAll(outDir, 0755); mkdirErr != nil {
+		m.cleanup(key)
+		return "", "", nil, fmt.Errorf("mkdir %s: %w", outDir, mkdirErr)
+	}
+	file.Download()
 
-		// 1) Wait until we have enough bytes for FFMPEG probe
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-		minProbeSizeBytes := int64(m.settings.MinProbeSizeMb() * 1024 * 1024)
-		for {
-			if f.BytesCompleted() >= minProbeSizeBytes {
-				break
-			}
-			select {
-			case <-ctx.Done():
-				close(ready)
-				return
-			case <-ticker.C:
-				// recheck bytes completed
-			}
-		}
-
-		// 2) Start ffmpeg in background (it might block)
-		errCh := make(chan error, 1)
-		go func() {
-			errCh <- ffmpegHandler.ConvertToHLS()
-		}()
-
-		// 3) Wait until playlist appears OR we get an error OR ctx cancelled
-		playlistReady := make(chan error, 1)
-		go func() { playlistReady <- waitForPlaylist(ctx, playlist) }()
-
-		select {
-		case <-ctx.Done():
-			close(ready)
-			return
-
-		case err := <-errCh:
-			if err != nil {
-				log.Printf("FFmpeg error: %v", err)
-				m.cleanup(key)
-			}
-			// Unblock waiters anyway
-			close(ready)
-			return
-
-		case err := <-playlistReady:
-			if err != nil {
-				log.Printf("waitForPlaylist failed: %v", err)
-				m.cleanup(key)
-				// Unblock waiters anyway
-				close(ready)
-				return
-			}
-			// Success: playlist is ready
-			close(ready)
-		}
-	}()
-
-	err = waitForPlaylist(ctx, playlist)
-	if err != nil {
-		log.Printf("waitForPlaylist failed: key=%v, err=%v", key, err)
-		return "", "", nil, fmt.Errorf("playlist not ready: %w", err)
+	// convertFileToStream closes `ready` itself (success or error)
+	if probeErr := m.convertFileToStream(streamCtx, file, outDir, playlist, key, ready); probeErr != nil {
+		return "", "", nil, probeErr
 	}
 	log.Printf("Stream ready: key=%v, playlist=%s", key, playlist)
 	return playlist, outDir, cancel, nil
 }
+func (m *manager) convertFileToStream(
+	ctx context.Context,
+	f *torrent.File,
+	outDir, playlist string,
+	key streamKey,
+	ready chan struct{},
+) error {
+	// 1) Wait until we have enough bytes for FFMPEG probe
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	minProbeSizeBytes := int64(m.settings.MinProbeSizeMiB()) << 20 // MiB to bytes
+	for {
+		if f.BytesCompleted() >= minProbeSizeBytes {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			close(ready)
+			return ctx.Err()
+		case <-ticker.C:
+			// recheck bytes completed
+		}
+	}
+	// 2) Convert torrent into HLS by running ffmpeg process in background (it might block)
+	ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
+		return f.NewReader()
+	}, outDir, playlist)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ffmpegHandler.ConvertToHLS()
+	}()
+	// 3) Wait until playlist appears OR we get an error OR ctx cancelled
+	// wait for playlist OR error OR ctx cancel
+	playlistReady := make(chan error, 1)
+	go func() { playlistReady <- waitForPlaylist(ctx, playlist) }()
+	select {
+	case <-ctx.Done():
+		close(ready)
+		return ctx.Err()
+	case err := <-errCh:
+		close(ready)
+		if err != nil {
+			m.cleanup(key)
+			log.Printf("FFmpeg error: %v", err)
+		}
+		return err
+	case err := <-playlistReady:
+		close(ready)
+		if err != nil {
+			m.cleanup(key)
+			log.Printf("waitForPlaylist failed: %v", err)
+			return err
+		}
+		return nil
+	}
+}
+
 func (m *manager) CleanupStreams() {
 	now := time.Now()
 	m.mu.Lock()

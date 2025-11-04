@@ -3,11 +3,11 @@ package settings
 import "time"
 
 const (
-	hlsPath        = "/var/tmp/cinemator/hls"
-	downloadPath   = "/var/tmp/cinemator/download"
-	viewerTimeout  = 7 * 24 * time.Hour
-	httpPort       = 8000
-	minProbeSizeMb = 2
+	hlsPath         = "/var/tmp/cinemator/hls"
+	downloadPath    = "/var/tmp/cinemator/download"
+	viewerTimeout   = 7 * 24 * time.Hour
+	httpPort        = 8000
+	minProbeSizeMiB = 2
 )
 
 type Settings struct {
@@ -33,6 +33,6 @@ func (s *Settings) HttpPort() int {
 	return httpPort
 }
 
-func (s *Settings) MinProbeSizeMb() int {
-	return minProbeSizeMb
+func (s *Settings) MinProbeSizeMiB() int {
+	return minProbeSizeMiB
 }
