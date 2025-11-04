@@ -129,11 +129,11 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		}, outDir, playlist)
 
 		// 1) Wait until we have enough bytes for FFMPEG probe
-		const minProbe = 2 << 20 // 2 MiB
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
+		minProbeSizeBytes := int64(m.settings.MinProbeSizeMb() * 1024 * 1024)
 		for {
-			if f.BytesCompleted() >= minProbe {
+			if f.BytesCompleted() >= minProbeSizeBytes {
 				break
 			}
 			select {
