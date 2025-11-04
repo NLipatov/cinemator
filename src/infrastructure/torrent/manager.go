@@ -128,22 +128,58 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			return f.NewReader()
 		}, outDir, playlist)
 
-		// running ffmpeg in separated goroutine
+		// 1) Wait until we have enough bytes for FFMPEG probe
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		minProbeSizeBytes := int64(m.settings.MinProbeSizeMb() * 1024 * 1024)
+		for {
+			if f.BytesCompleted() >= minProbeSizeBytes {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				close(ready)
+				return
+			case <-ticker.C:
+				// recheck bytes completed
+			}
+		}
+
+		// 2) Start ffmpeg in background (it might block)
+		errCh := make(chan error, 1)
 		go func() {
-			err := ffmpegHandler.ConvertToHLS()
+			errCh <- ffmpegHandler.ConvertToHLS()
+		}()
+
+		// 3) Wait until playlist appears OR we get an error OR ctx cancelled
+		playlistReady := make(chan error, 1)
+		go func() { playlistReady <- waitForPlaylist(ctx, playlist) }()
+
+		select {
+		case <-ctx.Done():
+			close(ready)
+			return
+
+		case err := <-errCh:
 			if err != nil {
 				log.Printf("FFmpeg error: %v", err)
 				m.cleanup(key)
 			}
-		}()
+			// Unblock waiters anyway
+			close(ready)
+			return
 
-		err := waitForPlaylist(ctx, playlist)
-		if err != nil {
-			log.Printf("waitForPlaylist failed: %v", err)
-			m.cleanup(key)
+		case err := <-playlistReady:
+			if err != nil {
+				log.Printf("waitForPlaylist failed: %v", err)
+				m.cleanup(key)
+				// Unblock waiters anyway
+				close(ready)
+				return
+			}
+			// Success: playlist is ready
+			close(ready)
 		}
-
-		close(ready)
 	}()
 
 	err = waitForPlaylist(ctx, playlist)
