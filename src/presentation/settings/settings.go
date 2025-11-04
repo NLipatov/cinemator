@@ -32,3 +32,7 @@ func (s *Settings) ViewerTimeout() time.Duration {
 func (s *Settings) HttpPort() int {
 	return httpPort
 }
+
+func (s *Settings) MinProbeSizeMb() int {
+	return minProbeSizeMb
+}
