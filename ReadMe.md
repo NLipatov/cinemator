@@ -29,3 +29,18 @@ go build
 Open [http://localhost:8000](http://localhost:8000) in your browser.
 
 ---
+
+# Build it
+
+### 1) Docker image
+
+```bash
+docker buildx build -t cinemator ./src/
+```
+
+### 2) Native binary
+
+```bash
+cd src
+go build
+```
