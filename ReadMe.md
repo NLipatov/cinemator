@@ -1,51 +1,22 @@
 # Cinemator
-
 Cinemator (“cinema” + “torrent”) lets you instantly watch videos from any torrent magnet link.
-
 ---
-
-## 🚀 Run in Docker
-
+# Run it
+### 1) Docker image
 **Prerequisites:**
-
 * Docker
-
 ```bash
-docker buildx build -t cinemator ./src/
-docker run -p 8000:8000 cinemator
+docker run -p 8000:8000 nlipatov/cinemator:latest
 ```
-
 Open [http://localhost:8000](http://localhost:8000) in your browser.
-
 ---
-
-## ⚡ Run from Source
-
+### 2) Native binary
 **Prerequisites:**
-
-* Go
-* FFmpeg
-
-```bash
-cd src
-go run main.go
-```
-
-Open [http://localhost:8000](http://localhost:8000) in your browser.
-
----
-
-## 🛠️ Build
-
-### Docker image
-
-```bash
-docker buildx build -t cinemator ./src/
-```
-
-### Native binary
-
+* Docker
 ```bash
 cd src
 go build
+./cinemator
 ```
+Open [http://localhost:8000](http://localhost:8000) in your browser.
+---
