@@ -1,11 +1,10 @@
 package ffmpeg
 
 import (
+	"cinemator/infrastructure/cli"
 	"context"
 	"io"
 	"log"
-	"os"
-	"os/exec"
 	"strings"
 )
 
@@ -50,14 +49,10 @@ func (c *Converter) ConvertToHLS() error {
 			log.Println(closeErr)
 		}
 	}()
-
 	log.Println("ffmpeg", strings.Join(args, " "))
-	return runFFmpeg(c.ctx, stream, args)
-}
-
-// runFFmpeg executes ffmpeg with the provided stdin and arguments.
-func runFFmpeg(ctx context.Context, in io.Reader, args []string) error {
-	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = in, os.Stdout, os.Stderr
-	return cmd.Run()
+	_, err = cli.RunWithStdin(c.ctx, stream, "ffmpeg", args...)
+	if err != nil {
+		return err
+	}
+	return nil
 }

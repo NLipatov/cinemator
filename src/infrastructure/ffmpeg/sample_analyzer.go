@@ -2,9 +2,10 @@ package ffmpeg
 
 import (
 	"bytes"
+	"cinemator/infrastructure/cli"
+	"context"
 	"encoding/json"
 	"io"
-	"os/exec"
 )
 
 // first 2 MiB of the stream are enough for ffprobe to parse container headers
@@ -26,13 +27,10 @@ func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
 	n, _ := io.ReadFull(r, buf) // ignore error: short read is fine
 	sample := buf[:n]
 
-	// --- 2. run ffprobe on the chunk ---------------------------------
-	cmd := exec.Command(
+	out, err := cli.RunWithStdin(context.Background(), bytes.NewReader(sample),
 		"ffprobe", "-v", "error",
 		"-of", "json", "-show_streams", "-i", "pipe:0",
 	)
-	cmd.Stdin = bytes.NewReader(sample)
-	out, err := cmd.Output()
 	if err != nil {
 		return SampleInfo{}, err
 	}
