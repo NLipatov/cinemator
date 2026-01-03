@@ -1,8 +1,6 @@
 package torrent
 
 import (
-	"cinemator/infrastructure/ffmpeg"
-	"cinemator/presentation/settings"
 	"context"
 	"errors"
 	"fmt"
@@ -15,6 +13,8 @@ import (
 
 	"cinemator/application"
 	"cinemator/domain"
+	"cinemator/infrastructure/ffmpeg"
+	"cinemator/presentation/settings"
 
 	"github.com/anacrolix/torrent"
 )
@@ -78,7 +78,45 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 	}
 }
 
-func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex int) (string, string, context.CancelFunc, error) {
+func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int) (domain.MediaInfo, error) {
+	t, err := m.client.AddMagnet(magnet)
+	if err != nil {
+		return domain.MediaInfo{}, err
+	}
+	select {
+	case <-t.GotInfo():
+	case <-ctx.Done():
+		return domain.MediaInfo{}, ctx.Err()
+	}
+	files := t.Files()
+	if fileIndex < 0 || fileIndex >= len(files) {
+		return domain.MediaInfo{}, fmt.Errorf("bad file index")
+	}
+	file := files[fileIndex]
+	file.Download()
+
+	// Wait for enough bytes to probe
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	minProbeSizeBytes := int64(m.settings.MinProbeSizeMiB()) << 20
+	for {
+		if file.BytesCompleted() >= minProbeSizeBytes {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return domain.MediaInfo{}, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+
+	analyzer := ffmpeg.SampleAnalyzer{}
+	reader := file.NewReader()
+	defer reader.Close()
+	return analyzer.Analyze(reader)
+}
+
+func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (string, string, context.CancelFunc, error) {
 	t, err := m.client.AddMagnet(magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
@@ -98,7 +136,9 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	hash := t.InfoHash().HexString()
 	key := streamKey{InfoHash: hash, Index: fileIndex}
 	outDir := filepath.Join(m.settings.HlsPath(), fmt.Sprintf("%s_%d", hash, fileIndex))
-	playlist := filepath.Join(outDir, "index.m3u8")
+	videoPlaylist := filepath.Join(outDir, "index.m3u8")
+	subtitlePlaylist := filepath.Join(outDir, "subs.m3u8")
+	masterPlaylist := filepath.Join(outDir, "master.m3u8")
 
 	m.mu.Lock()
 	s, exists := m.active[key]
@@ -110,7 +150,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		s.mtx.Unlock()
 		m.mu.Unlock()
 		<-s.ready
-		return playlist, outDir, s.cancel, nil
+		return masterPlaylist, outDir, s.cancel, nil
 	}
 	ready := make(chan struct{})
 	streamCtx, cancel := context.WithCancel(context.Background())
@@ -131,19 +171,26 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	}
 	file.Download()
 
+	selection := ffmpeg.StreamSelection{
+		AudioTrackIndex:    audioTrack,
+		SubtitleTrackIndex: subtitleTrack,
+	}
 	// convertFileToStream closes `ready` itself (success or error)
-	if probeErr := m.convertFileToStream(streamCtx, file, outDir, playlist, key, ready); probeErr != nil {
+	if probeErr := m.convertFileToStream(streamCtx, file, outDir, videoPlaylist, subtitlePlaylist, masterPlaylist, key, ready, selection); probeErr != nil {
 		return "", "", nil, probeErr
 	}
-	log.Printf("Stream ready: key=%v, playlist=%s", key, playlist)
-	return playlist, outDir, cancel, nil
+	log.Printf("Stream ready: key=%v, playlist=%s", key, masterPlaylist)
+	return masterPlaylist, outDir, cancel, nil
 }
 func (m *manager) convertFileToStream(
 	ctx context.Context,
 	f *torrent.File,
 	outDir, playlist string,
+	subtitlePlaylist string,
+	masterPlaylist string,
 	key streamKey,
 	ready chan struct{},
+	selection ffmpeg.StreamSelection,
 ) error {
 	// 1) Wait until we have enough bytes for FFMPEG probe
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -164,7 +211,7 @@ func (m *manager) convertFileToStream(
 	// 2) Convert torrent into HLS by running ffmpeg process in background (it might block)
 	ffmpegHandler := ffmpeg.NewConverter(ctx, func() io.ReadCloser {
 		return f.NewReader()
-	}, outDir, playlist)
+	}, outDir, playlist, subtitlePlaylist, masterPlaylist, selection)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- ffmpegHandler.ConvertToHLS()
@@ -172,7 +219,7 @@ func (m *manager) convertFileToStream(
 	// 3) Wait until playlist appears OR we get an error OR ctx cancelled
 	// wait for playlist OR error OR ctx cancel
 	playlistReady := make(chan error, 1)
-	go func() { playlistReady <- waitForPlaylist(ctx, playlist) }()
+	go func() { playlistReady <- waitForPlaylist(ctx, masterPlaylist) }()
 	select {
 	case <-ctx.Done():
 		close(ready)
@@ -253,7 +300,7 @@ func (m *manager) viewerWatcher() {
 // helpers
 func waitForPlaylist(ctx context.Context, path string) error {
 	const (
-		timeout = 5 * time.Minute
+		timeout = 20 * time.Minute
 		step    = 120 * time.Millisecond
 	)
 	deadline := time.Now().Add(timeout)

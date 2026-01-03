@@ -24,6 +24,7 @@
     const $ = id => document.getElementById(id);
     let hls = null, files = [];
     let msgTimeout = null;
+    let subtitleWaitTimer = null;
     function destroyVideoAndHls() {
       if (hls) { hls.destroy(); hls = null; }
       const oldVideo = $('video');
@@ -53,13 +54,33 @@
             <span>Server is downloading and preparing the video.</span>
             <span>This may take several minutes for large torrents.</span>
             <strong>Please stay on this page until playback begins.</strong>
+            <span id="warn-extra" style="display:none;"></span>
           </div>
         </div>
       `;
       removeWarning();
       $('warn-container').appendChild(warn);
     }
+    function setWarningExtra(msg) {
+      const extra = document.getElementById('warn-extra');
+      if (!extra) return;
+      if (msg) {
+        extra.textContent = msg;
+        extra.style.display = '';
+      } else {
+        extra.textContent = '';
+        extra.style.display = 'none';
+      }
+    }
+    function clearSubtitleWait() {
+      if (subtitleWaitTimer) {
+        clearTimeout(subtitleWaitTimer);
+        subtitleWaitTimer = null;
+      }
+      setWarningExtra('');
+    }
     function removeWarning() {
+      clearSubtitleWait();
       const existing = document.getElementById('warnMsg');
       if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
     }
@@ -69,6 +90,7 @@
       showMsg('magnetMsg', 'Loading file list…', false, true);
       $('filelist').innerHTML = '';
       $('step-files').style.display = 'none';
+      $('step-tracks').style.display = 'none';
       $('player-block').style.display = 'none';
       removeWarning();
       const magnet = $('magnet').value.trim();
@@ -88,30 +110,106 @@
         return;
       }
     };
+
+    function formatTrackLabel(track, type) {
+      let label = type === 'audio' ? `Track ${track.index + 1}` : `Subtitle ${track.index + 1}`;
+      if (track.language) label += ` [${track.language}]`;
+      if (track.title) label += ` - ${track.title}`;
+      if (track.codec) label += ` (${track.codec})`;
+      return label;
+    }
+
+    $('selectTracks').onclick = async () => {
+      showMsg('fileMsg', 'Loading track info…', false, true);
+      $('step-tracks').style.display = 'none';
+      const magnet = $('magnet').value.trim();
+      const idx = $('filelist').value;
+      if (!magnet || idx === undefined) return;
+      try {
+        const res = await fetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`);
+        if (!res.ok) throw new Error('Could not load media info');
+        const info = await res.json();
+
+        const audioCount = info.audioTracks ? info.audioTracks.length : 0;
+        const subCount = info.subtitles ? info.subtitles.length : 0;
+        const audioSelect = $('audioSelect');
+        const subSelect = $('subtitleSelect');
+        const audioRow = audioSelect.closest('.track-row');
+        const subRow = subSelect.closest('.track-row');
+
+        // If nothing to choose, play immediately
+        if (audioCount <= 1 && subCount === 0) {
+          showMsg('fileMsg', '');
+          audioSelect.innerHTML = '<option value="0">Default</option>';
+          subSelect.innerHTML = '<option value="-1">None</option>';
+          if (audioRow) audioRow.style.display = 'none';
+          if (subRow) subRow.style.display = 'none';
+          $('play').click();
+          return;
+        }
+
+        // Audio tracks
+        if (audioCount > 1) {
+          audioSelect.innerHTML = info.audioTracks.map(t =>
+            `<option value="${t.index}">${formatTrackLabel(t, 'audio')}</option>`
+          ).join('');
+          if (audioRow) audioRow.style.display = '';
+        } else {
+          audioSelect.innerHTML = '<option value="0">Default</option>';
+          if (audioRow) audioRow.style.display = 'none';
+        }
+
+        // Subtitles
+        subSelect.innerHTML = '<option value="-1">None</option>';
+        if (subCount > 0) {
+          subSelect.innerHTML += info.subtitles.map(t =>
+            `<option value="${t.index}">${formatTrackLabel(t, 'subtitle')}</option>`
+          ).join('');
+          if (subRow) subRow.style.display = '';
+        } else {
+          if (subRow) subRow.style.display = 'none';
+        }
+
+        $('step-tracks').style.display = '';
+        showMsg('fileMsg', '');
+      } catch (e) {
+        showMsg('fileMsg', e.message || 'Error loading tracks', true);
+      }
+    };
+
     $('play').onclick = async () => {
       destroyVideoAndHls();
       $('player-block').style.display = 'none';
       removeWarning();
       showWarning();
-      showMsg('fileMsg', '');
+      showMsg('trackMsg', '');
 
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
+      const audio = $('audioSelect').value || '0';
+      const subtitle = $('subtitleSelect').value || '-1';
+      const subtitleSelected = parseInt(subtitle, 10) >= 0;
       if (!magnet || idx === undefined) return;
+      if (subtitleSelected) {
+        clearSubtitleWait();
+        subtitleWaitTimer = setTimeout(() => {
+          setWarningExtra('Waiting for subtitles...');
+        }, 8000);
+      }
       try {
-        const resp = await fetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { redirect: 'follow' });
+        const resp = await fetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}`, { redirect: 'follow' });
         if (!resp.ok) throw new Error('Stream error');
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
         $('player-block').style.display = '';
-        playHls(m3u8);
+        playHls(m3u8, subtitleSelected);
       } catch (e) {
         removeWarning();
-        showMsg('fileMsg', e.message || 'Could not start stream', true);
+        showMsg('trackMsg', e.message || 'Could not start stream', true);
         return;
       }
     };
 
-    function playHls(src) {
+    function playHls(src, enableSubtitles) {
       const video = $('video');
       video.style.opacity = 0;
       setTimeout(() => { video.style.opacity = 1; }, 120);
@@ -129,6 +227,12 @@
         hls.loadSource(src);
         hls.attachMedia(video);
 
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (enableSubtitles && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
+            hls.subtitleTrack = 0;
+            hls.subtitleDisplay = true;
+          }
+        });
         hls.on(Hls.Events.FRAG_LOADED, hideWarningOnce);
         hls.on(Hls.Events.ERROR, (evt, data) => {
           if (data.fatal) {

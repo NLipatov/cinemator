@@ -23,8 +23,20 @@
     </form>
     <div class="step" id="step-files" style="display:none">
       <select id="filelist" class="input-style"></select>
-      <button id="play" type="button" class="input-style">Play</button>
+      <button id="selectTracks" type="button" class="input-style">Select tracks</button>
       <div class="msg" id="fileMsg"></div>
+    </div>
+    <div class="step" id="step-tracks" style="display:none">
+      <div class="track-row">
+        <label for="audioSelect">Audio:</label>
+        <select id="audioSelect" class="input-style"></select>
+      </div>
+      <div class="track-row">
+        <label for="subtitleSelect">Subtitles:</label>
+        <select id="subtitleSelect" class="input-style"></select>
+      </div>
+      <button id="play" type="button" class="input-style">Play</button>
+      <div class="msg" id="trackMsg"></div>
     </div>
     <div id="warn-container"></div>
     <div id="player-block" class="step" style="display:none">

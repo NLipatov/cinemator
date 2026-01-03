@@ -2,6 +2,7 @@ package ffmpeg
 
 import (
 	"bytes"
+	"cinemator/domain"
 	"cinemator/infrastructure/cli"
 	"context"
 	"encoding/json"
@@ -11,17 +12,11 @@ import (
 // first 2 MiB of the stream are enough for ffprobe to parse container headers
 const peekSize = 2 << 20 // 2 MiB
 
-type SampleInfo struct {
-	VideoCodec string
-	AudioCodec string
-	NeedFilter bool // true when pixel-format ≠ yuv420p
-}
-
 type SampleAnalyzer struct{}
 
 // Analyze reads up to peekSize bytes, feeds them to ffprobe and
-// returns detected codecs + whether a yuv420p conversion is required.
-func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
+// returns detected codecs, audio tracks, subtitles and whether a yuv420p conversion is required.
+func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
 	// --- 1. grab a small probe chunk ---------------------------------
 	buf := make([]byte, peekSize)
 	n, _ := io.ReadFull(r, buf) // ignore error: short read is fine
@@ -32,23 +27,30 @@ func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
 		"-of", "json", "-show_streams", "-i", "pipe:0",
 	)
 	if err != nil {
-		return SampleInfo{}, err
+		return domain.MediaInfo{}, err
 	}
 
-	// --- 3. parse json ------------------------------------------------
+	// --- 2. parse json ------------------------------------------------
 	var meta struct {
 		Streams []struct {
+			Index     int    `json:"index"`
 			CodecType string `json:"codec_type"`
 			CodecName string `json:"codec_name"`
 			PixFmt    string `json:"pix_fmt"`
+			Tags      struct {
+				Language string `json:"language"`
+				Title    string `json:"title"`
+			} `json:"tags"`
 		} `json:"streams"`
 	}
 	if err := json.Unmarshal(out, &meta); err != nil {
-		return SampleInfo{}, err
+		return domain.MediaInfo{}, err
 	}
 
-	// --- 4. build result ---------------------------------------------
-	var info SampleInfo
+	// --- 3. build result ---------------------------------------------
+	var info domain.MediaInfo
+	audioIdx := 0
+	subIdx := 0
 	for _, s := range meta.Streams {
 		switch s.CodecType {
 		case "video":
@@ -57,7 +59,21 @@ func (SampleAnalyzer) Analyze(r io.Reader) (SampleInfo, error) {
 				info.NeedFilter = true
 			}
 		case "audio":
-			info.AudioCodec = s.CodecName
+			info.AudioTracks = append(info.AudioTracks, domain.AudioTrack{
+				Index:    audioIdx,
+				Codec:    s.CodecName,
+				Language: s.Tags.Language,
+				Title:    s.Tags.Title,
+			})
+			audioIdx++
+		case "subtitle":
+			info.Subtitles = append(info.Subtitles, domain.SubtitleTrack{
+				Index:    subIdx,
+				Codec:    s.CodecName,
+				Language: s.Tags.Language,
+				Title:    s.Tags.Title,
+			})
+			subIdx++
 		}
 	}
 	return info, nil

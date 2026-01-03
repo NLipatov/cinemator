@@ -230,6 +230,20 @@ button:hover, button:focus-visible {
   color: #be9110;
   font-weight: 600;
 }
+.track-row {
+  display: flex;
+  align-items: center;
+  gap: 0.8em;
+}
+.track-row label {
+  min-width: 5.5em;
+  font-weight: 500;
+  color: var(--color-muted);
+  font-size: 0.98em;
+}
+.track-row select {
+  flex: 1;
+}
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes shake {
   0% { transform: translateX(0px);}

@@ -19,9 +19,10 @@ import (
 )
 
 type HttpServer struct {
-	mgr            application.TorrentManager
-	fileInfoMapper application.Mapper[domain.FileInfo, dto.FileInfo]
-	settings       settings.Settings
+	mgr             application.TorrentManager
+	fileInfoMapper  application.Mapper[domain.FileInfo, dto.FileInfo]
+	mediaInfoMapper *mappers.MediaInfoMapper
+	settings        settings.Settings
 }
 
 func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
@@ -30,9 +31,10 @@ func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
 		return nil, err
 	}
 	return &HttpServer{
-		mgr:            mgr,
-		fileInfoMapper: mappers.NewFileInfoMapper(),
-		settings:       settings,
+		mgr:             mgr,
+		fileInfoMapper:  mappers.NewFileInfoMapper(),
+		mediaInfoMapper: mappers.NewMediaInfoMapper(),
+		settings:        settings,
 	}, nil
 }
 
@@ -48,6 +50,7 @@ func (s *HttpServer) Run() error {
 
 	// http-api endpoints
 	http.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
+	http.HandleFunc("/api/media/info", s.handleGetMediaInfo)
 	http.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
 	http.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
@@ -72,6 +75,28 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 	_ = json.NewEncoder(w).Encode(s.fileInfoMapper.MapArray(files))
 }
 
+func (s *HttpServer) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) {
+	magnet := r.URL.Query().Get("magnet")
+	idx := r.URL.Query().Get("file")
+	if magnet == "" || idx == "" {
+		http.Error(w, "magnet and file required", 400)
+		return
+	}
+	fileIndex, err := strconv.Atoi(idx)
+	if err != nil {
+		http.Error(w, "bad file index", 400)
+		return
+	}
+	info, err := s.mgr.GetMediaInfo(context.Background(), magnet, fileIndex)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.mediaInfoMapper.Map(info))
+}
+
 func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
 	magnet := r.URL.Query().Get("magnet")
 	idx := r.URL.Query().Get("file")
@@ -84,14 +109,29 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "bad file index", 400)
 		return
 	}
-	playlist, _, _, err := s.mgr.PrepareHlsStream(context.Background(), magnet, fileIndex)
+
+	audioTrack := 0
+	if a := r.URL.Query().Get("audio"); a != "" {
+		if parsed, err := strconv.Atoi(a); err == nil {
+			audioTrack = parsed
+		}
+	}
+
+	subtitleTrack := -1
+	if sub := r.URL.Query().Get("subtitle"); sub != "" {
+		if parsed, err := strconv.Atoi(sub); err == nil {
+			subtitleTrack = parsed
+		}
+	}
+
+	playlist, _, _, err := s.mgr.PrepareHlsStream(context.Background(), magnet, fileIndex, audioTrack, subtitleTrack)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	http.Redirect(
 		w, r,
-		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/index.m3u8",
+		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/"+filepath.Base(playlist),
 		http.StatusFound)
 }
 
