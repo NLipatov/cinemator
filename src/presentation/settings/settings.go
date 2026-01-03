@@ -5,9 +5,10 @@ import "time"
 const (
 	hlsPath         = "/var/tmp/cinemator/hls"
 	downloadPath    = "/var/tmp/cinemator/download"
-	viewerTimeout   = 7 * 24 * time.Hour
+	viewerTimeout   = 2 * time.Hour
+	maxCacheBytes   = 2 << 30 // 2 GiB cap for HLS cache
 	httpPort        = 8000
-	minProbeSizeMiB = 2
+	minProbeSizeMiB = 1
 )
 
 type Settings struct {
@@ -27,6 +28,10 @@ func (s *Settings) DownloadPath() string {
 
 func (s *Settings) ViewerTimeout() time.Duration {
 	return viewerTimeout
+}
+
+func (s *Settings) MaxCacheBytes() int64 {
+	return maxCacheBytes
 }
 
 func (s *Settings) HttpPort() int {

@@ -10,11 +10,11 @@ func main() {
 	serverSettings := settings.NewSettings()
 	server, newServerErr := api.NewHttpServer(serverSettings)
 	if newServerErr != nil {
-		log.Println(newServerErr)
+		log.Fatalf("failed to init server: %v", newServerErr)
 	}
 
 	serveErr := server.Run()
 	if serveErr != nil {
-		log.Println(serveErr)
+		log.Fatalf("server stopped: %v", serveErr)
 	}
 }

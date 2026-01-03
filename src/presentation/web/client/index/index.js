@@ -177,7 +177,7 @@
       }
     };
 
-    $('play').onclick = async () => {
+    async function startPlayback(resumeTime = 0) {
       destroyVideoAndHls();
       $('player-block').style.display = 'none';
       removeWarning();
@@ -201,15 +201,27 @@
         if (!resp.ok) throw new Error('Stream error');
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
         $('player-block').style.display = '';
-        playHls(m3u8, subtitleSelected);
+        playHls(m3u8, subtitleSelected, resumeTime);
       } catch (e) {
         removeWarning();
         showMsg('trackMsg', e.message || 'Could not start stream', true);
         return;
       }
-    };
+    }
 
-    function playHls(src, enableSubtitles) {
+    $('play').onclick = () => startPlayback(0);
+    ['audioSelect', 'subtitleSelect'].forEach(id => {
+      const el = $(id);
+      if (!el) return;
+      el.addEventListener('change', () => {
+        if ($('player-block').style.display !== 'none') {
+          const t = $('video').currentTime || 0;
+          startPlayback(t);
+        }
+      });
+    });
+
+    function playHls(src, enableSubtitles, resumeTime = 0) {
       const video = $('video');
       video.style.opacity = 0;
       setTimeout(() => { video.style.opacity = 1; }, 120);
@@ -228,6 +240,9 @@
         hls.attachMedia(video);
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (resumeTime > 0) {
+            video.currentTime = resumeTime;
+          }
           if (enableSubtitles && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
             hls.subtitleTrack = 0;
             hls.subtitleDisplay = true;
@@ -242,6 +257,11 @@
         });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
+        if (resumeTime > 0) {
+          video.addEventListener('loadedmetadata', () => {
+            video.currentTime = resumeTime;
+          }, { once: true });
+        }
         video.addEventListener('canplay', hideWarningOnce, { once: true });
       } else {
         removeWarning();

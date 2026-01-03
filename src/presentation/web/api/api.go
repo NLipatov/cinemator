@@ -7,15 +7,16 @@ import (
 	"cinemator/presentation/settings"
 	"cinemator/presentation/web/dto"
 	"cinemator/presentation/web/mapping/mappers"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type HttpServer struct {
@@ -65,7 +66,7 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "magnet required", 400)
 		return
 	}
-	files, err := s.mgr.GetTorrentFiles(context.Background(), magnet)
+	files, err := s.mgr.GetTorrentFiles(r.Context(), magnet)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -87,7 +88,7 @@ func (s *HttpServer) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "bad file index", 400)
 		return
 	}
-	info, err := s.mgr.GetMediaInfo(context.Background(), magnet, fileIndex)
+	info, err := s.mgr.GetMediaInfo(r.Context(), magnet, fileIndex)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -124,7 +125,7 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	playlist, _, _, err := s.mgr.PrepareHlsStream(context.Background(), magnet, fileIndex, audioTrack, subtitleTrack)
+	playlist, _, _, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -136,8 +137,25 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
-	fullPath := filepath.Join(s.settings.HlsPath(), r.URL.Path)
-	if len(r.URL.Path) > 5 && r.URL.Path[len(r.URL.Path)-5:] == ".m3u8" {
+	clean := path.Clean("/" + r.URL.Path)
+	clean = strings.TrimPrefix(clean, "/")
+	if clean == "" || clean == "." {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	fullPath := filepath.Join(s.settings.HlsPath(), clean)
+	hlsRoot := filepath.Clean(s.settings.HlsPath()) + string(os.PathSeparator)
+	if !strings.HasPrefix(fullPath, hlsRoot) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Track activity for cleanup/keepalive
+	if dir := strings.SplitN(clean, "/", 2)[0]; dir != "" {
+		s.mgr.TouchStream(dir)
+	}
+
+	if strings.HasSuffix(clean, ".m3u8") {
 		data, err := os.ReadFile(fullPath)
 		if err != nil {
 			http.Error(w, "playlist not found", 404)

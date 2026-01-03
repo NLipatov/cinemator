@@ -107,9 +107,8 @@ func (b ArgsBuilder) hls() []string {
 	return []string{
 		"-f", "hls",
 		"-hls_init_time", "0",
-		"-hls_time", "4",
+		"-hls_time", "2",
 		"-hls_list_size", "0",
-		"-hls_playlist_type", "event",
 		"-hls_flags", "independent_segments",
 		"-hls_segment_filename", filepath.Join(b.OutDir, "chunk_%05d.ts"),
 		b.Playlist,

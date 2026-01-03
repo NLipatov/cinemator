@@ -9,8 +9,8 @@ import (
 	"io"
 )
 
-// first 2 MiB of the stream are enough for ffprobe to parse container headers
-const peekSize = 2 << 20 // 2 MiB
+// a 1 MiB peek is typically enough for ffprobe to parse container headers
+const peekSize = 1 << 20 // 1 MiB
 
 type SampleAnalyzer struct{}
 
