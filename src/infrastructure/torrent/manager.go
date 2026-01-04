@@ -195,7 +195,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 }
 
 func (m *manager) preloadLeadingPieces(f *torrent.File) {
-	const preloadPieces = 8
+	const preloadPieces = 64
 	begin := f.BeginPieceIndex()
 	end := begin + preloadPieces
 	if end > f.EndPieceIndex() {
@@ -204,6 +204,21 @@ func (m *manager) preloadLeadingPieces(f *torrent.File) {
 	if end > begin {
 		f.Torrent().DownloadPieces(begin, end)
 	}
+}
+
+func (m *manager) targetReadaheadBytes(f *torrent.File) int64 {
+	const (
+		targetBufferBytes = int64(1 << 30)   // ~1 GiB target to cover ~10-20 minutes of content
+		minAheadBytes     = int64(128 << 20) // ensure at least a short runway
+	)
+	ahead := targetBufferBytes
+	if ahead < minAheadBytes {
+		ahead = minAheadBytes
+	}
+	if l := f.Length(); l > 0 && l < ahead {
+		ahead = l
+	}
+	return ahead
 }
 func (m *manager) convertFileToStream(
 	streamCtx context.Context,
@@ -236,10 +251,11 @@ func (m *manager) convertFileToStream(
 		}
 	}
 	// 2) Convert torrent into HLS by running ffmpeg process in background (it might block)
+	targetReadahead := m.targetReadaheadBytes(f)
 	ffmpegHandler := ffmpeg.NewConverter(streamCtx, func() io.ReadCloser {
 		reader := f.NewReader()
 		reader.SetContext(streamCtx)
-		reader.SetReadahead(32 << 20) // 32 MiB for faster sequential fetch
+		reader.SetReadahead(targetReadahead) // keep a deep sequential window buffered
 		reader.SetResponsive()
 		return reader
 	}, outDir, playlist, subtitlePlaylist, masterPlaylist, selection)
