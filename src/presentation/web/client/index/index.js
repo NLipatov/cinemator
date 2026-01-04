@@ -23,6 +23,7 @@
     // Main logic
     const $ = id => document.getElementById(id);
     let hls = null, files = [];
+    let subtitleDelay = parseFloat(localStorage.getItem('subtitle-delay') || '0');
     let msgTimeout = null;
     let subtitleWaitTimer = null;
     function destroyVideoAndHls() {
@@ -39,7 +40,8 @@
       if (loader) el.innerHTML = '<span class="loader"></span>';
       if (msg) el.innerHTML += msg;
       el.className = 'msg' + (isErr ? ' error' : '');
-      if (msg && !isErr) {
+      const shouldAutoClear = msg && !isErr && !loader;
+      if (shouldAutoClear) {
         msgTimeout = setTimeout(() => { el.textContent = ''; }, 2200);
       }
     }
@@ -166,8 +168,10 @@
             `<option value="${t.index}">${formatTrackLabel(t, 'subtitle')}</option>`
           ).join('');
           if (subRow) subRow.style.display = '';
+          $('subtitleDelayRow').style.display = '';
         } else {
           if (subRow) subRow.style.display = 'none';
+          $('subtitleDelayRow').style.display = 'none';
         }
 
         $('step-tracks').style.display = '';
@@ -221,6 +225,21 @@
       });
     });
 
+    function applySubtitleDelay(video, delaySec) {
+      if (!video || !video.textTracks) return;
+      const track = Array.from(video.textTracks).find(t => t.kind === 'subtitles' || t.kind === 'captions');
+      if (!track || !track.cues) return;
+      for (let i = 0; i < track.cues.length; i++) {
+        const cue = track.cues[i];
+        if (!cue.__origStart) {
+          cue.__origStart = cue.startTime;
+          cue.__origEnd = cue.endTime;
+        }
+        cue.startTime = Math.max(0, cue.__origStart + delaySec);
+        cue.endTime = Math.max(cue.startTime, cue.__origEnd + delaySec);
+      }
+    }
+
     function playHls(src, enableSubtitles, resumeTime = 0) {
       const video = $('video');
       video.style.opacity = 0;
@@ -246,6 +265,7 @@
           if (enableSubtitles && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
             hls.subtitleTrack = 0;
             hls.subtitleDisplay = true;
+            applySubtitleDelay(video, subtitleDelay);
           }
         });
         hls.on(Hls.Events.FRAG_LOADED, hideWarningOnce);
@@ -263,8 +283,28 @@
           }, { once: true });
         }
         video.addEventListener('canplay', hideWarningOnce, { once: true });
+        video.addEventListener('loadeddata', () => applySubtitleDelay(video, subtitleDelay), { once: true });
       } else {
         removeWarning();
         showMsg('playerMsg', 'Your browser does not support HLS.', true);
       }
     }
+
+    function updateDelayDisplay() {
+      const el = $('subDelayValue');
+      if (el) el.textContent = `${subtitleDelay.toFixed(1)}s`;
+    }
+    function changeDelay(delta) {
+      subtitleDelay = Math.max(-10, Math.min(10, subtitleDelay + delta));
+      localStorage.setItem('subtitle-delay', subtitleDelay.toString());
+      updateDelayDisplay();
+      applySubtitleDelay($('video'), subtitleDelay);
+      if (hls && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
+        hls.subtitleDisplay = true;
+      }
+    }
+    updateDelayDisplay();
+    const minusBtn = $('subDelayMinus');
+    const plusBtn = $('subDelayPlus');
+    if (minusBtn) minusBtn.onclick = () => changeDelay(-0.5);
+    if (plusBtn) plusBtn.onclick = () => changeDelay(0.5);

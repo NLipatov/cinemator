@@ -97,6 +97,8 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 		return domain.MediaInfo{}, fmt.Errorf("bad file index")
 	}
 	file := files[fileIndex]
+	origPrio := file.Priority()
+	file.SetPriority(torrent.PiecePriorityHigh)
 	file.Download()
 
 	// Wait for enough bytes to probe
@@ -117,7 +119,9 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	analyzer := ffmpeg.SampleAnalyzer{}
 	reader := file.NewReader()
 	defer reader.Close()
-	return analyzer.Analyze(reader)
+	info, analyzeErr := analyzer.Analyze(reader)
+	file.SetPriority(origPrio)
+	return info, analyzeErr
 }
 
 func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (string, string, context.CancelFunc, error) {
