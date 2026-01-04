@@ -99,26 +99,41 @@ func (c *Converter) ConvertToHLS() error {
 		}()
 	}
 
-	if err := c.writeMasterAfterVideoReady(info, textSubtitle); err != nil {
-		return err
-	}
+	masterReady := make(chan error, 1)
+	go func() { masterReady <- c.writeMasterAfterVideoReady(info, textSubtitle) }()
 
-	if subtitleErrCh == nil {
-		return <-videoErrCh
-	}
+	subtitleDone := subtitleErrCh == nil
+	videoDone := false
+	masterDone := false
 
-	subCh := subtitleErrCh
 	for {
 		select {
 		case <-c.ctx.Done():
 			return c.ctx.Err()
 		case err := <-videoErrCh:
-			return err
-		case err := <-subCh:
+			videoDone = true
+			if err != nil {
+				return err
+			}
+			if videoDone && subtitleDone && masterDone {
+				return nil
+			}
+		case err := <-masterReady:
+			masterDone = true
+			if err != nil {
+				return err
+			}
+			if videoDone && subtitleDone && masterDone {
+				return nil
+			}
+		case err := <-subtitleErrCh:
+			subtitleDone = true
 			if err != nil {
 				log.Printf("Subtitle stream error: %v", err)
 			}
-			subCh = nil
+			if videoDone && subtitleDone && masterDone {
+				return nil
+			}
 		}
 	}
 }
