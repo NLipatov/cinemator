@@ -25,6 +25,7 @@ func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
 	var lastErr error
 
 	for {
+		prevLen := len(data)
 		// read up to target (or max) bytes
 		need := target - len(data)
 		if need > 0 {
@@ -32,8 +33,19 @@ func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
 				need = maxProbeBytes - len(data)
 			}
 			tmp := make([]byte, need)
-			n, _ := io.ReadFull(r, tmp)
+			n, readErr := io.ReadFull(r, tmp)
 			data = append(data, tmp[:n]...)
+			if readErr != nil {
+				if readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
+					return domain.MediaInfo{}, readErr
+				}
+				if n == 0 {
+					if lastErr != nil {
+						return domain.MediaInfo{}, lastErr
+					}
+					return domain.MediaInfo{}, readErr
+				}
+			}
 		}
 
 		info, err := probeSample(data)
@@ -43,6 +55,9 @@ func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
 		lastErr = err
 
 		if len(data) >= maxProbeBytes {
+			return domain.MediaInfo{}, lastErr
+		}
+		if len(data) == prevLen {
 			return domain.MediaInfo{}, lastErr
 		}
 		target += probeStepBytes
