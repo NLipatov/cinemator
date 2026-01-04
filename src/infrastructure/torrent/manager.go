@@ -186,7 +186,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	m.preloadLeadingPieces(file)
 
 	// convertFileToStream closes `ready` itself (success or error)
-	if probeErr := m.convertFileToStream(streamCtx, streamCtx, file, outDir, videoPlaylist, subtitlePlaylist, masterPlaylist, key, ready, s.selection); probeErr != nil {
+	if probeErr := m.convertFileToStream(streamCtx, ctx, file, outDir, videoPlaylist, subtitlePlaylist, masterPlaylist, key, ready, s.selection); probeErr != nil {
 		m.cleanup(key)
 		return "", "", nil, probeErr
 	}
