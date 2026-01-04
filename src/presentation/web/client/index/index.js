@@ -240,10 +240,31 @@
       }
     }
 
+    function watchSubtitleUpdates(video, onUpdate) {
+      if (!video || !video.textTracks) return;
+      const tracks = video.textTracks;
+      const attachTrack = track => {
+        if (!track || !track.addEventListener) return;
+        track.addEventListener('cuechange', onUpdate);
+      };
+      Array.from(tracks).forEach(attachTrack);
+      if (tracks.addEventListener) {
+        tracks.addEventListener('addtrack', e => {
+          attachTrack(e.track);
+          setTimeout(onUpdate, 0);
+        });
+      }
+    }
+
     function playHls(src, enableSubtitles, resumeTime = 0) {
       const video = $('video');
       video.style.opacity = 0;
       setTimeout(() => { video.style.opacity = 1; }, 120);
+
+      const reapplySubtitleDelay = () => applySubtitleDelay(video, subtitleDelay);
+      if (enableSubtitles) {
+        watchSubtitleUpdates(video, reapplySubtitleDelay);
+      }
 
       let fragLoaded = false;
       function hideWarningOnce() {
@@ -265,9 +286,13 @@
           if (enableSubtitles && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
             hls.subtitleTrack = 0;
             hls.subtitleDisplay = true;
-            applySubtitleDelay(video, subtitleDelay);
+            reapplySubtitleDelay();
           }
         });
+        if (enableSubtitles) {
+          hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, reapplySubtitleDelay);
+          hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, reapplySubtitleDelay);
+        }
         hls.on(Hls.Events.FRAG_LOADED, hideWarningOnce);
         hls.on(Hls.Events.ERROR, (evt, data) => {
           if (data.fatal) {
@@ -283,7 +308,7 @@
           }, { once: true });
         }
         video.addEventListener('canplay', hideWarningOnce, { once: true });
-        video.addEventListener('loadeddata', () => applySubtitleDelay(video, subtitleDelay), { once: true });
+        video.addEventListener('loadeddata', () => reapplySubtitleDelay(), { once: true });
       } else {
         removeWarning();
         showMsg('playerMsg', 'Your browser does not support HLS.', true);
