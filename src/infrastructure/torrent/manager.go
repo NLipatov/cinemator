@@ -295,7 +295,9 @@ func (m *manager) cleanup(key streamKey) {
 		m.mu.Unlock()
 		return
 	}
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	outDir := filepath.Join(m.settings.HlsPath(), key.dirName())
 	shouldDrop := false
 	if cnt, ok := m.torrents[key.InfoHash]; ok {
