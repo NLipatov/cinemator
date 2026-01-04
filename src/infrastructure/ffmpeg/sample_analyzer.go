@@ -9,19 +9,50 @@ import (
 	"io"
 )
 
-// a 1 MiB peek is typically enough for ffprobe to parse container headers
-const peekSize = 1 << 20 // 1 MiB
+const (
+	initialProbeBytes = 1 << 20  // 1 MiB
+	probeStepBytes    = 4 << 20  // add 4 MiB on each retry
+	maxProbeBytes     = 16 << 20 // hard cap
+)
 
 type SampleAnalyzer struct{}
 
 // Analyze reads up to peekSize bytes, feeds them to ffprobe and
 // returns detected codecs, audio tracks, subtitles and whether a yuv420p conversion is required.
 func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
-	// --- 1. grab a small probe chunk ---------------------------------
-	buf := make([]byte, peekSize)
-	n, _ := io.ReadFull(r, buf) // ignore error: short read is fine
-	sample := buf[:n]
+	data := make([]byte, 0, maxProbeBytes)
+	target := initialProbeBytes
+	var lastErr error
 
+	for {
+		// read up to target (or max) bytes
+		need := target - len(data)
+		if need > 0 {
+			if need > maxProbeBytes-len(data) {
+				need = maxProbeBytes - len(data)
+			}
+			tmp := make([]byte, need)
+			n, _ := io.ReadFull(r, tmp)
+			data = append(data, tmp[:n]...)
+		}
+
+		info, err := probeSample(data)
+		if err == nil {
+			return info, nil
+		}
+		lastErr = err
+
+		if len(data) >= maxProbeBytes {
+			return domain.MediaInfo{}, lastErr
+		}
+		target += probeStepBytes
+		if target > maxProbeBytes {
+			target = maxProbeBytes
+		}
+	}
+}
+
+func probeSample(sample []byte) (domain.MediaInfo, error) {
 	out, err := cli.RunWithStdin(context.Background(), bytes.NewReader(sample),
 		"ffprobe", "-v", "error",
 		"-of", "json", "-show_streams", "-i", "pipe:0",
@@ -30,7 +61,6 @@ func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
 		return domain.MediaInfo{}, err
 	}
 
-	// --- 2. parse json ------------------------------------------------
 	var meta struct {
 		Streams []struct {
 			Index     int    `json:"index"`
@@ -47,7 +77,6 @@ func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
 		return domain.MediaInfo{}, err
 	}
 
-	// --- 3. build result ---------------------------------------------
 	var info domain.MediaInfo
 	audioIdx := 0
 	subIdx := 0

@@ -7,6 +7,7 @@ import (
 	"cinemator/presentation/settings"
 	"cinemator/presentation/web/dto"
 	"cinemator/presentation/web/mapping/mappers"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type HttpServer struct {
@@ -137,6 +139,7 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
+	const waitTimeout = 30 * time.Second
 	clean := path.Clean("/" + r.URL.Path)
 	clean = strings.TrimPrefix(clean, "/")
 	if clean == "" || clean == "." {
@@ -152,11 +155,11 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 
 	// Track activity for cleanup/keepalive
 	if dir := strings.SplitN(clean, "/", 2)[0]; dir != "" {
-		s.mgr.TouchStream(dir)
+		s.mgr.TouchStream(r.Context(), dir)
 	}
 
 	if strings.HasSuffix(clean, ".m3u8") {
-		data, err := os.ReadFile(fullPath)
+		data, err := readWithWait(r.Context(), fullPath, waitTimeout)
 		if err != nil {
 			http.Error(w, "playlist not found", 404)
 			return
@@ -168,5 +171,33 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if err := waitForPath(r.Context(), fullPath, waitTimeout); err != nil {
+		http.Error(w, "chunk not found", 404)
+		return
+	}
 	http.ServeFile(w, r, fullPath)
+}
+
+func waitForPath(ctx context.Context, path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timeout")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(120 * time.Millisecond):
+		}
+	}
+}
+
+func readWithWait(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
+	if err := waitForPath(ctx, path, timeout); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
 }

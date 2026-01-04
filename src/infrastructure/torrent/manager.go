@@ -157,15 +157,17 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	ready := make(chan struct{})
 	streamCtx, cancel := context.WithCancel(context.Background())
 	s = &streamInfo{
-		ready:    ready,
-		cancel:   cancel,
-		torrent:  t,
-		file:     file,
-		lastView: time.Now(),
-		selection: ffmpeg.StreamSelection{
-			AudioTrackIndex:    audioTrack,
-			SubtitleTrackIndex: subtitleTrack,
-		},
+		ready:            ready,
+		cancel:           cancel,
+		torrent:          t,
+		file:             file,
+		lastView:         time.Now(),
+		outDir:           outDir,
+		selection:        ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack},
+		videoPlaylist:    videoPlaylist,
+		subtitlePlaylist: subtitlePlaylist,
+		masterPlaylist:   masterPlaylist,
+		running:          true,
 	}
 	m.active[key] = s
 	m.torrents[hash]++
@@ -180,7 +182,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	m.preloadLeadingPieces(file)
 
 	// convertFileToStream closes `ready` itself (success or error)
-	if probeErr := m.convertFileToStream(streamCtx, ctx, file, outDir, videoPlaylist, subtitlePlaylist, masterPlaylist, key, ready, s.selection); probeErr != nil {
+	if probeErr := m.convertFileToStream(streamCtx, streamCtx, file, outDir, videoPlaylist, subtitlePlaylist, masterPlaylist, key, ready, s.selection); probeErr != nil {
 		m.cleanup(key)
 		return "", "", nil, probeErr
 	}
@@ -251,14 +253,14 @@ func (m *manager) convertFileToStream(
 		return prepareCtx.Err()
 	case err := <-errCh:
 		close(ready)
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			m.cleanup(key)
 			log.Printf("FFmpeg error: %v", err)
 		}
 		return err
 	case err := <-playlistReady:
 		close(ready)
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) {
 			m.cleanup(key)
 			log.Printf("waitForPlaylist failed: %v", err)
 			return err
@@ -394,14 +396,59 @@ func (m *manager) enforceCacheLimit() {
 			log.Printf("enforceCacheLimit: failed to remove %s: %v", it.path, err)
 			continue
 		}
-		delete(m.active, it.key)
-		delete(m.torrents, it.key.InfoHash)
 		total -= it.size
 		log.Printf("enforceCacheLimit: removed %s (freed %d bytes)", it.path, it.size)
 	}
 }
 
-func (m *manager) TouchStream(dirName string) {
+func (m *manager) pauseStream(key streamKey) {
+	m.mu.Lock()
+	s, ok := m.active[key]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+	if s.paused {
+		m.mu.Unlock()
+		return
+	}
+	if s.cancel != nil {
+		s.cancel()
+		s.cancel = nil
+	}
+	s.paused = true
+	s.running = false
+	s.file.SetPriority(torrent.PiecePriorityNone)
+	m.mu.Unlock()
+	log.Printf("Paused stream due to inactivity: key=%v", key)
+}
+
+func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
+	if s.running {
+		return
+	}
+	streamCtx, cancel := context.WithCancel(context.Background())
+	s.cancel = cancel
+	s.paused = false
+	s.running = true
+	s.file.SetPriority(torrent.PiecePriorityHigh)
+	go func() {
+		ready := make(chan struct{})
+		s.ready = ready
+		err := m.convertFileToStream(streamCtx, streamCtx, s.file, s.outDir, s.videoPlaylist, s.subtitlePlaylist, s.masterPlaylist, key, ready, s.selection)
+		if err != nil {
+			log.Printf("Stream conversion error (resume): %v", err)
+		}
+		m.mu.Lock()
+		s.running = false
+		if errors.Is(err, context.Canceled) {
+			s.paused = true
+		}
+		m.mu.Unlock()
+	}()
+}
+
+func (m *manager) TouchStream(_ context.Context, dirName string) {
 	key, err := parseStreamDir(dirName)
 	if err != nil {
 		return
@@ -410,21 +457,29 @@ func (m *manager) TouchStream(dirName string) {
 	if s, ok := m.active[key]; ok {
 		s.mtx.Lock()
 		s.lastView = time.Now()
+		needResume := s.paused || s.cancel == nil
 		s.mtx.Unlock()
+		if needResume {
+			m.startConversionLocked(key, s)
+		}
 	}
 	m.mu.Unlock()
 }
 
 func (m *manager) viewerWatcher() {
-	ticker := time.NewTicker(m.settings.ViewerTimeout() / 3)
+	ticker := time.NewTicker(time.Minute / 3)
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
 		m.mu.Lock()
 		for key, s := range m.active {
 			s.mtx.Lock()
+			idle := now.Sub(s.lastView) > time.Minute
 			noViewers := now.Sub(s.lastView) > m.settings.ViewerTimeout()
 			s.mtx.Unlock()
+			if idle && !s.paused {
+				go m.pauseStream(key)
+			}
 			if noViewers {
 				log.Printf("Viewer timeout detected, cleaning up stream: key=%v", key)
 				go m.cleanup(key)

@@ -20,13 +20,19 @@ type streamKey struct {
 }
 
 type streamInfo struct {
-	ready     chan struct{}
-	cancel    context.CancelFunc
-	torrent   *torrent.Torrent
-	file      *torrent.File
-	lastView  time.Time
-	mtx       sync.Mutex
-	selection ffmpeg.StreamSelection
+	ready            chan struct{}
+	cancel           context.CancelFunc
+	torrent          *torrent.Torrent
+	file             *torrent.File
+	lastView         time.Time
+	mtx              sync.Mutex
+	selection        ffmpeg.StreamSelection
+	outDir           string
+	videoPlaylist    string
+	subtitlePlaylist string
+	masterPlaylist   string
+	paused           bool
+	running          bool
 }
 
 func (k streamKey) dirName() string {
