@@ -433,6 +433,13 @@ func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
 	if s.running {
 		return
 	}
+	if err := os.RemoveAll(s.outDir); err != nil {
+		log.Printf("startConversionLocked: failed to clean dir %s: %v", s.outDir, err)
+	}
+	if err := os.MkdirAll(s.outDir, 0755); err != nil {
+		log.Printf("startConversionLocked: failed to recreate dir %s: %v", s.outDir, err)
+		return
+	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 	s.paused = false

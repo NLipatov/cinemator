@@ -130,6 +130,7 @@ func (c *Converter) ConvertToHLS() error {
 			subtitleDone = true
 			if err != nil {
 				log.Printf("Subtitle stream error: %v", err)
+				return err
 			}
 			if videoDone && subtitleDone && masterDone {
 				return nil
