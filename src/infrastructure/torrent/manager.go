@@ -487,7 +487,13 @@ func (m *manager) viewerWatcher() {
 		m.mu.Lock()
 		for key, s := range m.active {
 			s.mtx.Lock()
-			idle := now.Sub(s.lastView) > time.Minute
+			readyClosed := false
+			select {
+			case <-s.ready:
+				readyClosed = true
+			default:
+			}
+			idle := readyClosed && now.Sub(s.lastView) > time.Minute
 			noViewers := now.Sub(s.lastView) > m.settings.ViewerTimeout()
 			s.mtx.Unlock()
 			if idle && !s.paused {
