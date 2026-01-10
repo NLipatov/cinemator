@@ -19,6 +19,7 @@ Open [http://localhost:8000](http://localhost:8000) in your browser.
 
 **Prerequisites:**
 * Go installed
+* ffmpeg installed
 ```bash
 cd src
 go build

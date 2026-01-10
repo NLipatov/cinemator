@@ -14,14 +14,18 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 )
 
 type HttpServer struct {
-	mgr            application.TorrentManager
-	fileInfoMapper application.Mapper[domain.FileInfo, dto.FileInfo]
-	settings       settings.Settings
+	mgr             application.TorrentManager
+	fileInfoMapper  application.Mapper[domain.FileInfo, dto.FileInfo]
+	mediaInfoMapper *mappers.MediaInfoMapper
+	settings        settings.Settings
 }
 
 func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
@@ -30,9 +34,10 @@ func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
 		return nil, err
 	}
 	return &HttpServer{
-		mgr:            mgr,
-		fileInfoMapper: mappers.NewFileInfoMapper(),
-		settings:       settings,
+		mgr:             mgr,
+		fileInfoMapper:  mappers.NewFileInfoMapper(),
+		mediaInfoMapper: mappers.NewMediaInfoMapper(),
+		settings:        settings,
 	}, nil
 }
 
@@ -48,6 +53,7 @@ func (s *HttpServer) Run() error {
 
 	// http-api endpoints
 	http.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
+	http.HandleFunc("/api/media/info", s.handleGetMediaInfo)
 	http.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
 	http.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
@@ -62,7 +68,7 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "magnet required", 400)
 		return
 	}
-	files, err := s.mgr.GetTorrentFiles(context.Background(), magnet)
+	files, err := s.mgr.GetTorrentFiles(r.Context(), magnet)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -70,6 +76,28 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.fileInfoMapper.MapArray(files))
+}
+
+func (s *HttpServer) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) {
+	magnet := r.URL.Query().Get("magnet")
+	idx := r.URL.Query().Get("file")
+	if magnet == "" || idx == "" {
+		http.Error(w, "magnet and file required", 400)
+		return
+	}
+	fileIndex, err := strconv.Atoi(idx)
+	if err != nil {
+		http.Error(w, "bad file index", 400)
+		return
+	}
+	info, err := s.mgr.GetMediaInfo(r.Context(), magnet, fileIndex)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.mediaInfoMapper.Map(info))
 }
 
 func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
@@ -84,21 +112,54 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "bad file index", 400)
 		return
 	}
-	playlist, _, _, err := s.mgr.PrepareHlsStream(context.Background(), magnet, fileIndex)
+
+	audioTrack := 0
+	if a := r.URL.Query().Get("audio"); a != "" {
+		if parsed, err := strconv.Atoi(a); err == nil {
+			audioTrack = parsed
+		}
+	}
+
+	subtitleTrack := -1
+	if sub := r.URL.Query().Get("subtitle"); sub != "" {
+		if parsed, err := strconv.Atoi(sub); err == nil {
+			subtitleTrack = parsed
+		}
+	}
+
+	playlist, _, _, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
 	http.Redirect(
 		w, r,
-		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/index.m3u8",
+		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/"+filepath.Base(playlist),
 		http.StatusFound)
 }
 
 func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
-	fullPath := filepath.Join(s.settings.HlsPath(), r.URL.Path)
-	if len(r.URL.Path) > 5 && r.URL.Path[len(r.URL.Path)-5:] == ".m3u8" {
-		data, err := os.ReadFile(fullPath)
+	const waitTimeout = 30 * time.Second
+	clean := path.Clean("/" + r.URL.Path)
+	clean = strings.TrimPrefix(clean, "/")
+	if clean == "" || clean == "." {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	fullPath := filepath.Join(s.settings.HlsPath(), clean)
+	hlsRoot := filepath.Clean(s.settings.HlsPath()) + string(os.PathSeparator)
+	if !strings.HasPrefix(fullPath, hlsRoot) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Track activity for cleanup/keepalive
+	if dir := strings.SplitN(clean, "/", 2)[0]; dir != "" {
+		s.mgr.TouchStream(r.Context(), dir)
+	}
+
+	if strings.HasSuffix(clean, ".m3u8") {
+		data, err := readWithWait(r.Context(), fullPath, waitTimeout)
 		if err != nil {
 			http.Error(w, "playlist not found", 404)
 			return
@@ -110,5 +171,33 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if err := waitForPath(r.Context(), fullPath, waitTimeout); err != nil {
+		http.Error(w, "chunk not found", 404)
+		return
+	}
 	http.ServeFile(w, r, fullPath)
+}
+
+func waitForPath(ctx context.Context, path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("timeout")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(120 * time.Millisecond):
+		}
+	}
+}
+
+func readWithWait(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
+	if err := waitForPath(ctx, path, timeout); err != nil {
+		return nil, err
+	}
+	return os.ReadFile(path)
 }

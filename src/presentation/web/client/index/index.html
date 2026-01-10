@@ -8,10 +8,18 @@
   <link rel="icon" href="/favicon.ico">
 </head>
 <body>
-  <div class="theme-toggle" id="themeToggle" title="Switch theme">
-    <span class="icon" id="icon-moon" style="display:none;">🌙</span>
-    <span class="icon" id="icon-sun"  style="display:none;">☀️</span>
-  </div>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">◼</span>
+      <span class="brand-name">Cinemator</span>
+    </div>
+    <div class="top-actions">
+      <div class="theme-toggle" id="themeToggle" title="Switch theme">
+        <span class="icon" id="icon-moon" style="display:none;">🌙</span>
+        <span class="icon" id="icon-sun"  style="display:none;">☀️</span>
+      </div>
+    </div>
+  </header>
   <div class="card">
     <h2>Cinemator – Universal HLS Player</h2>
     <form id="form" class="step" autocomplete="off">
@@ -23,8 +31,28 @@
     </form>
     <div class="step" id="step-files" style="display:none">
       <select id="filelist" class="input-style"></select>
-      <button id="play" type="button" class="input-style">Play</button>
+      <button id="selectTracks" type="button" class="input-style">Select tracks</button>
       <div class="msg" id="fileMsg"></div>
+    </div>
+    <div class="step" id="step-tracks" style="display:none">
+      <div class="track-row">
+        <label for="audioSelect">Audio:</label>
+        <select id="audioSelect" class="input-style"></select>
+      </div>
+      <div class="track-row">
+        <label for="subtitleSelect">Subtitles:</label>
+        <select id="subtitleSelect" class="input-style"></select>
+      </div>
+      <div class="track-row" id="subtitleDelayRow" style="display:none">
+        <label>Sub delay:</label>
+        <div class="delay-controls">
+          <button type="button" id="subDelayMinus" class="input-style small-btn">-0.5s</button>
+          <div id="subDelayValue" class="delay-value">0.0s</div>
+          <button type="button" id="subDelayPlus" class="input-style small-btn">+0.5s</button>
+        </div>
+      </div>
+      <button id="play" type="button" class="input-style">Play</button>
+      <div class="msg" id="trackMsg"></div>
     </div>
     <div id="warn-container"></div>
     <div id="player-block" class="step" style="display:none">
