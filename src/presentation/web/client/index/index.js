@@ -14,7 +14,7 @@
     $toggle.onclick = function() { setTheme(1-themeIdx); };
     (function() {
       let mode = localStorage.getItem(themeKey);
-      if (!mode) {
+      if (!themes.includes(mode)) {
         mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       }
       setTheme(themes.indexOf(mode), false);
@@ -22,23 +22,34 @@
 
     // Main logic
     const $ = id => document.getElementById(id);
-    let hls = null, files = [];
+    let hls = null;
     let subtitleDelay = parseFloat(localStorage.getItem('subtitle-delay') || '0');
     let msgTimeout = null;
     let subtitleWaitTimer = null;
-    function destroyVideoAndHls() {
+    let requestSeq = 0;
+    const nextRequest = () => ++requestSeq;
+    const isStale = id => id !== requestSeq;
+    function destroyVideoAndHls({ resetLayout = true } = {}) {
       if (hls) { hls.destroy(); hls = null; }
+      if (resetLayout) document.body.classList.remove('has-player');
       const oldVideo = $('video');
       const newVideo = oldVideo.cloneNode(false);
       oldVideo.parentNode.replaceChild(newVideo, oldVideo);
       newVideo.id = 'video';
     }
+    function setOptions(select, options) {
+      select.replaceChildren(...options.map(({ value, label }) => new Option(label, String(value))));
+    }
     function showMsg(id, msg, isErr=false, loader=false) {
       clearTimeout(msgTimeout);
       const el = $(id);
       el.textContent = '';
-      if (loader) el.innerHTML = '<span class="loader"></span>';
-      if (msg) el.innerHTML += msg;
+      if (loader) {
+        const spinner = document.createElement('span');
+        spinner.className = 'loader';
+        el.appendChild(spinner);
+      }
+      if (msg) el.appendChild(document.createTextNode(msg));
       el.className = 'msg' + (isErr ? ' error' : '');
       const shouldAutoClear = msg && !isErr && !loader;
       if (shouldAutoClear) {
@@ -46,33 +57,14 @@
       }
     }
     function showWarning() {
-      const warn = document.createElement('div');
-      warn.className = 'warning';
-      warn.id = 'warnMsg';
-      warn.innerHTML = `
-        <div class="warning-inner">
-          <span class="warning-icon">⚠️</span>
-          <div class="warning-text">
-            <span>Server is downloading and preparing the video.</span>
-            <span>This may take several minutes for large torrents.</span>
-            <strong>Please stay on this page until playback begins.</strong>
-            <span id="warn-extra" style="display:none;"></span>
-          </div>
-        </div>
-      `;
-      removeWarning();
-      $('warn-container').appendChild(warn);
+      clearSubtitleWait();
+      $('warnMsg').hidden = false;
     }
     function setWarningExtra(msg) {
       const extra = document.getElementById('warn-extra');
       if (!extra) return;
-      if (msg) {
-        extra.textContent = msg;
-        extra.style.display = '';
-      } else {
-        extra.textContent = '';
-        extra.style.display = 'none';
-      }
+      extra.textContent = msg || '';
+      extra.hidden = !msg;
     }
     function clearSubtitleWait() {
       if (subtitleWaitTimer) {
@@ -83,31 +75,37 @@
     }
     function removeWarning() {
       clearSubtitleWait();
-      const existing = document.getElementById('warnMsg');
-      if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+      $('warnMsg').hidden = true;
     }
     $('form').onsubmit = async e => {
       e.preventDefault();
+      const magnet = $('magnet').value.trim();
+      if (!magnet) {
+        showMsg('magnetMsg', 'Magnet link required', true);
+        return;
+      }
+      const requestId = nextRequest();
       destroyVideoAndHls();
       showMsg('magnetMsg', 'Loading file list…', false, true);
-      $('filelist').innerHTML = '';
+      $('filelist').textContent = '';
       $('step-files').style.display = 'none';
       $('step-tracks').style.display = 'none';
       $('player-block').style.display = 'none';
       removeWarning();
-      const magnet = $('magnet').value.trim();
-      if (!magnet) return;
       try {
         const res = await fetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet));
         if (!res.ok) throw new Error('Server error');
-        files = await res.json();
+        const files = await res.json();
+        if (isStale(requestId)) return;
         if (!files.length) throw new Error('No playable files found in torrent');
-        $('filelist').innerHTML = files.map(f =>
-          `<option value="${f.index}">${f.name} (${(f.size/1048576).toFixed(2)} MB)</option>`
-        ).join('');
+        setOptions($('filelist'), files.map(f => ({
+          value: f.index,
+          label: `${f.name} (${(f.size/1048576).toFixed(2)} MB)`,
+        })));
         $('step-files').style.display = '';
         showMsg('magnetMsg', '');
       } catch (e) {
+        if (isStale(requestId)) return;
         showMsg('magnetMsg', e.message || 'Error loading files', true);
         return;
       }
@@ -122,15 +120,20 @@
     }
 
     $('selectTracks').onclick = async () => {
-      showMsg('fileMsg', 'Loading track info…', false, true);
-      $('step-tracks').style.display = 'none';
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
-      if (!magnet || idx === undefined) return;
+      if (!magnet || idx === undefined || idx === '') {
+        showMsg('fileMsg', 'Select a file first', true);
+        return;
+      }
+      const requestId = nextRequest();
+      showMsg('fileMsg', 'Loading track info…', false, true);
+      $('step-tracks').style.display = 'none';
       try {
         const res = await fetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`);
         if (!res.ok) throw new Error('Could not load media info');
         const info = await res.json();
+        if (isStale(requestId)) return;
 
         const audioCount = info.audioTracks ? info.audioTracks.length : 0;
         const subCount = info.subtitles ? info.subtitles.length : 0;
@@ -142,8 +145,8 @@
         // If nothing to choose, play immediately
         if (audioCount <= 1 && subCount === 0) {
           showMsg('fileMsg', '');
-          audioSelect.innerHTML = '<option value="0">Default</option>';
-          subSelect.innerHTML = '<option value="-1">None</option>';
+          setOptions(audioSelect, [{ value: 0, label: 'Default' }]);
+          setOptions(subSelect, [{ value: -1, label: 'None' }]);
           if (audioRow) audioRow.style.display = 'none';
           if (subRow) subRow.style.display = 'none';
           $('play').click();
@@ -152,21 +155,26 @@
 
         // Audio tracks
         if (audioCount > 1) {
-          audioSelect.innerHTML = info.audioTracks.map(t =>
-            `<option value="${t.index}">${formatTrackLabel(t, 'audio')}</option>`
-          ).join('');
+          setOptions(audioSelect, info.audioTracks.map(t => ({
+            value: t.index,
+            label: formatTrackLabel(t, 'audio'),
+          })));
           if (audioRow) audioRow.style.display = '';
         } else {
-          audioSelect.innerHTML = '<option value="0">Default</option>';
+          setOptions(audioSelect, [{ value: 0, label: 'Default' }]);
           if (audioRow) audioRow.style.display = 'none';
         }
 
         // Subtitles
-        subSelect.innerHTML = '<option value="-1">None</option>';
+        setOptions(subSelect, [{ value: -1, label: 'None' }]);
         if (subCount > 0) {
-          subSelect.innerHTML += info.subtitles.map(t =>
-            `<option value="${t.index}">${formatTrackLabel(t, 'subtitle')}</option>`
-          ).join('');
+          setOptions(subSelect, [
+            { value: -1, label: 'None' },
+            ...info.subtitles.map(t => ({
+              value: t.index,
+              label: formatTrackLabel(t, 'subtitle'),
+            })),
+          ]);
           if (subRow) subRow.style.display = '';
           $('subtitleDelayRow').style.display = '';
         } else {
@@ -177,23 +185,29 @@
         $('step-tracks').style.display = '';
         showMsg('fileMsg', '');
       } catch (e) {
+        if (isStale(requestId)) return;
         showMsg('fileMsg', e.message || 'Error loading tracks', true);
       }
     };
 
     async function startPlayback(resumeTime = 0) {
-      destroyVideoAndHls();
-      $('player-block').style.display = 'none';
-      removeWarning();
-      showWarning();
-      showMsg('trackMsg', '');
-
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
       const audio = $('audioSelect').value || '0';
       const subtitle = $('subtitleSelect').value || '-1';
       const subtitleSelected = parseInt(subtitle, 10) >= 0;
-      if (!magnet || idx === undefined) return;
+      if (!magnet || idx === undefined || idx === '') {
+        showMsg('trackMsg', 'Select a file first', true);
+        return;
+      }
+      const requestId = nextRequest();
+      const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
+      destroyVideoAndHls({ resetLayout: !wasPlaying });
+      $('player-block').style.display = 'none';
+      removeWarning();
+      showWarning();
+      showMsg('trackMsg', '');
+
       if (subtitleSelected) {
         clearSubtitleWait();
         subtitleWaitTimer = setTimeout(() => {
@@ -203,10 +217,13 @@
       try {
         const resp = await fetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}`, { redirect: 'follow' });
         if (!resp.ok) throw new Error('Stream error');
+        if (isStale(requestId)) return;
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
         $('player-block').style.display = '';
+        document.body.classList.add('has-player');
         playHls(m3u8, subtitleSelected, resumeTime);
       } catch (e) {
+        if (isStale(requestId)) return;
         removeWarning();
         showMsg('trackMsg', e.message || 'Could not start stream', true);
         return;
