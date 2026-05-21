@@ -4,6 +4,7 @@ import (
 	"cinemator/infrastructure/ffmpeg"
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,28 +21,45 @@ type streamKey struct {
 }
 
 type streamInfo struct {
-	ready            chan struct{}
-	cancel           context.CancelFunc
-	torrent          *torrent.Torrent
-	file             *torrent.File
-	lastView         time.Time
-	mtx              sync.Mutex
-	selection        ffmpeg.StreamSelection
+	ready     chan struct{}
+	cancel    context.CancelFunc
+	torrent   *torrent.Torrent
+	file      *torrent.File
+	lastView  time.Time
+	mtx       sync.Mutex
+	selection ffmpeg.StreamSelection
+	paths     streamPaths
+	paused    bool
+	running   bool
+}
+
+type streamPaths struct {
 	outDir           string
 	videoPlaylist    string
 	subtitlePlaylist string
 	masterPlaylist   string
-	paused           bool
-	running          bool
 }
 
 func (k streamKey) dirName() string {
 	return fmt.Sprintf("%s_%d_a%d_s%d", k.InfoHash, k.Index, k.Audio, k.Subtitle)
 }
 
+func (k streamKey) paths(root string) streamPaths {
+	outDir := filepath.Join(root, k.dirName())
+	return streamPaths{
+		outDir:           outDir,
+		videoPlaylist:    filepath.Join(outDir, "index.m3u8"),
+		subtitlePlaylist: filepath.Join(outDir, "subs.m3u8"),
+		masterPlaylist:   filepath.Join(outDir, "master.m3u8"),
+	}
+}
+
 func parseStreamDir(name string) (streamKey, error) {
 	parts := strings.Split(name, "_")
 	if len(parts) != 4 {
+		return streamKey{}, fmt.Errorf("bad stream dir")
+	}
+	if !strings.HasPrefix(parts[2], "a") || !strings.HasPrefix(parts[3], "s") {
 		return streamKey{}, fmt.Errorf("bad stream dir")
 	}
 	audio := strings.TrimPrefix(parts[2], "a")

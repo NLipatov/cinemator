@@ -2,11 +2,8 @@ package api
 
 import (
 	"cinemator/application"
-	"cinemator/domain"
 	"cinemator/infrastructure/torrent"
 	"cinemator/presentation/settings"
-	"cinemator/presentation/web/dto"
-	"cinemator/presentation/web/mapping/mappers"
 	"context"
 	"encoding/json"
 	"errors"
@@ -22,10 +19,8 @@ import (
 )
 
 type HttpServer struct {
-	mgr             application.TorrentManager
-	fileInfoMapper  application.Mapper[domain.FileInfo, dto.FileInfo]
-	mediaInfoMapper *mappers.MediaInfoMapper
-	settings        settings.Settings
+	mgr      application.TorrentManager
+	settings settings.Settings
 }
 
 func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
@@ -34,10 +29,8 @@ func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
 		return nil, err
 	}
 	return &HttpServer{
-		mgr:             mgr,
-		fileInfoMapper:  mappers.NewFileInfoMapper(),
-		mediaInfoMapper: mappers.NewMediaInfoMapper(),
-		settings:        settings,
+		mgr:      mgr,
+		settings: settings,
 	}, nil
 }
 
@@ -75,19 +68,13 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.fileInfoMapper.MapArray(files))
+	_ = json.NewEncoder(w).Encode(files)
 }
 
 func (s *HttpServer) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) {
-	magnet := r.URL.Query().Get("magnet")
-	idx := r.URL.Query().Get("file")
-	if magnet == "" || idx == "" {
-		http.Error(w, "magnet and file required", 400)
-		return
-	}
-	fileIndex, err := strconv.Atoi(idx)
+	magnet, fileIndex, err := parseMagnetAndFile(r)
 	if err != nil {
-		http.Error(w, "bad file index", 400)
+		http.Error(w, err.Error(), 400)
 		return
 	}
 	info, err := s.mgr.GetMediaInfo(r.Context(), magnet, fileIndex)
@@ -97,19 +84,13 @@ func (s *HttpServer) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) 
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.mediaInfoMapper.Map(info))
+	_ = json.NewEncoder(w).Encode(info)
 }
 
 func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
-	magnet := r.URL.Query().Get("magnet")
-	idx := r.URL.Query().Get("file")
-	if magnet == "" || idx == "" {
-		http.Error(w, "magnet and file required", 400)
-		return
-	}
-	fileIndex, err := strconv.Atoi(idx)
+	magnet, fileIndex, err := parseMagnetAndFile(r)
 	if err != nil {
-		http.Error(w, "bad file index", 400)
+		http.Error(w, err.Error(), 400)
 		return
 	}
 
@@ -200,4 +181,17 @@ func readWithWait(ctx context.Context, path string, timeout time.Duration) ([]by
 		return nil, err
 	}
 	return os.ReadFile(path)
+}
+
+func parseMagnetAndFile(r *http.Request) (string, int, error) {
+	magnet := r.URL.Query().Get("magnet")
+	idx := r.URL.Query().Get("file")
+	if magnet == "" || idx == "" {
+		return "", 0, errors.New("magnet and file required")
+	}
+	fileIndex, err := strconv.Atoi(idx)
+	if err != nil {
+		return "", 0, errors.New("bad file index")
+	}
+	return magnet, fileIndex, nil
 }

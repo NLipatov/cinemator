@@ -9,9 +9,8 @@ import (
 
 // StreamSelection specifies which audio/subtitle tracks to include.
 type StreamSelection struct {
-	AudioTrackIndex    int    // -1 or out of range = default (first)
-	SubtitleTrackIndex int    // -1 = none
-	SubtitleFile       string // path to extracted subtitle file (for text subs)
+	AudioTrackIndex    int // -1 or out of range = default (first)
+	SubtitleTrackIndex int // -1 = none
 }
 
 type ArgsBuilder struct {
@@ -70,18 +69,9 @@ func (b ArgsBuilder) Build(info domain.MediaInfo, sel StreamSelection) []string 
 		)
 	}
 
-	// -- video encoding
 	if needVideoEncode {
 		args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency")
-		// Build video filter chain
 		var vfParts []string
-		if hasSubtitle && !isBitmapSubtitle(info.Subtitles[sel.SubtitleTrackIndex].Codec) && sel.SubtitleFile != "" {
-			// Text subtitles from extracted .ass file
-			escaped := strings.ReplaceAll(sel.SubtitleFile, "\\", "\\\\")
-			escaped = strings.ReplaceAll(escaped, ":", "\\:")
-			escaped = strings.ReplaceAll(escaped, "'", "\\'")
-			vfParts = append(vfParts, fmt.Sprintf("ass='%s'", escaped))
-		}
 		if info.NeedFilter {
 			vfParts = append(vfParts, "format=yuv420p")
 		}

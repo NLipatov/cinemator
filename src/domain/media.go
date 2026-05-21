@@ -1,22 +1,22 @@
 package domain
 
 type AudioTrack struct {
-	Index    int
-	Codec    string
-	Language string
-	Title    string
+	Index    int    `json:"index"`
+	Codec    string `json:"codec"`
+	Language string `json:"language"`
+	Title    string `json:"title"`
 }
 
 type SubtitleTrack struct {
-	Index    int
-	Codec    string
-	Language string
-	Title    string
+	Index    int    `json:"index"`
+	Codec    string `json:"codec"`
+	Language string `json:"language"`
+	Title    string `json:"title"`
 }
 
 type MediaInfo struct {
-	VideoCodec  string
-	NeedFilter  bool
-	AudioTracks []AudioTrack
-	Subtitles   []SubtitleTrack
+	VideoCodec  string          `json:"-"`
+	NeedFilter  bool            `json:"-"`
+	AudioTracks []AudioTrack    `json:"audioTracks"`
+	Subtitles   []SubtitleTrack `json:"subtitles"`
 }

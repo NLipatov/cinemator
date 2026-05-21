@@ -64,7 +64,6 @@ func (c *Converter) ConvertToHLS() error {
 	videoSel := c.selection
 	if textSubtitle {
 		videoSel.SubtitleTrackIndex = -1
-		videoSel.SubtitleFile = ""
 	}
 	args := c.builder.Build(info, videoSel)
 	log.Println("ffmpeg", strings.Join(args, " "))
@@ -134,75 +133,6 @@ func (c *Converter) ConvertToHLS() error {
 			}
 			if videoDone && subtitleDone && masterDone {
 				return nil
-			}
-		}
-	}
-}
-
-// extractTextSubtitles extracts text subtitle track to a .ass file
-func (c *Converter) extractTextSubtitles(info domain.MediaInfo) (string, error) {
-	subsFile := filepath.Join(c.builder.OutDir, "subs.ass")
-
-	log.Printf("Extracting subtitles to %s...", subsFile)
-
-	const (
-		attemptTimeout = 2 * time.Minute
-		maxWait        = 20 * time.Minute
-	)
-
-	deadline := time.Now().Add(maxWait)
-	backoff := 500 * time.Millisecond
-	attempt := 0
-
-	for {
-		if c.ctx.Err() != nil {
-			return "", c.ctx.Err()
-		}
-		if time.Now().After(deadline) {
-			return "", fmt.Errorf("subtitle extraction timeout")
-		}
-
-		_ = os.Remove(subsFile)
-		attempt++
-		attemptCtx, cancel := context.WithTimeout(c.ctx, attemptTimeout)
-
-		errCh := make(chan error, 1)
-		go func() {
-			stream := c.newReader()
-			defer stream.Close()
-
-			args := []string{
-				"-i", "pipe:0",
-				"-map", fmt.Sprintf("0:s:%d", c.selection.SubtitleTrackIndex),
-				"-c:s", "ass",
-				"-y", subsFile,
-			}
-
-			log.Println("ffmpeg (extract subs)", strings.Join(args, " "))
-			_, err := cli.RunWithStdin(attemptCtx, stream, "ffmpeg", args...)
-			errCh <- err
-		}()
-
-		err := <-errCh
-		cancel()
-		if err == nil {
-			if stat, statErr := os.Stat(subsFile); statErr == nil && stat.Size() > 100 {
-				log.Printf("Subtitles extracted: %s (%d bytes)", subsFile, stat.Size())
-				return subsFile, nil
-			}
-			err = fmt.Errorf("subtitle file empty or missing")
-		}
-
-		log.Printf("Subtitle extraction attempt %d failed: %v", attempt, err)
-		select {
-		case <-c.ctx.Done():
-			return "", c.ctx.Err()
-		case <-time.After(backoff):
-		}
-		if backoff < 5*time.Second {
-			backoff *= 2
-			if backoff > 5*time.Second {
-				backoff = 5 * time.Second
 			}
 		}
 	}
