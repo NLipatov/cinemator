@@ -29,6 +29,9 @@ type streamInfo struct {
 	mtx       sync.Mutex
 	selection ffmpeg.StreamSelection
 	paths     streamPaths
+	source    *torrentSource
+	readyErr  error
+	readySent bool
 	paused    bool
 	running   bool
 }
@@ -38,6 +41,56 @@ type streamPaths struct {
 	videoPlaylist    string
 	subtitlePlaylist string
 	masterPlaylist   string
+}
+
+func (s *streamInfo) resetReady() {
+	s.mtx.Lock()
+	s.ready = make(chan struct{})
+	s.readyErr = nil
+	s.readySent = false
+	s.mtx.Unlock()
+}
+
+func (s *streamInfo) signalReady(err error) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.readySent {
+		return
+	}
+	s.readyErr = err
+	s.readySent = true
+	if s.ready != nil {
+		close(s.ready)
+	}
+}
+
+func (s *streamInfo) waitReady(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.mtx.Lock()
+	ready := s.ready
+	readyErr := s.readyErr
+	readySent := s.readySent
+	s.mtx.Unlock()
+
+	if ready == nil || readySent {
+		return readyErr
+	}
+
+	select {
+	case <-ready:
+		return s.readyError()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *streamInfo) readyError() error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.readyErr
 }
 
 func (k streamKey) dirName() string {

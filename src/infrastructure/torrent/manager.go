@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"sync"
@@ -22,6 +21,7 @@ type manager struct {
 	client   *torrent.Client
 	active   map[streamKey]*streamInfo
 	torrents map[string]int
+	sources  *rangeServer
 	mu       sync.Mutex
 	settings settings.Settings
 }
@@ -39,10 +39,15 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	if mkdirErr := os.MkdirAll(settings.DownloadPath(), 0755); mkdirErr != nil {
 		return nil, mkdirErr
 	}
+	sources, err := newRangeServer()
+	if err != nil {
+		return nil, err
+	}
 	m := &manager{
 		client:   client,
 		active:   make(map[streamKey]*streamInfo),
 		torrents: make(map[string]int),
+		sources:  sources,
 		settings: settings,
 	}
 	go m.viewerWatcher()
@@ -50,7 +55,7 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 }
 
 func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
-	t, err := m.client.AddMagnet(magnet)
+	t, err := addMagnet(m.client, magnet)
 	if err != nil {
 		return nil, err
 	}
@@ -70,7 +75,7 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 }
 
 func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int) (domain.MediaInfo, error) {
-	t, err := m.client.AddMagnet(magnet)
+	t, err := addMagnet(m.client, magnet)
 	if err != nil {
 		return domain.MediaInfo{}, err
 	}
@@ -89,18 +94,16 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	defer file.SetPriority(origPrio)
 	file.Download()
 
-	if err := waitForProbeBytes(ctx, file, int64(m.settings.MinProbeSizeMiB())<<20); err != nil {
+	source, err := newTorrentSource(file, m.sources)
+	if err != nil {
 		return domain.MediaInfo{}, err
 	}
-
-	analyzer := ffmpeg.SampleAnalyzer{}
-	reader := file.NewReader()
-	defer reader.Close()
-	return analyzer.Analyze(reader)
+	defer source.Close()
+	return source.Probe(ctx)
 }
 
 func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (string, string, context.CancelFunc, error) {
-	t, err := m.client.AddMagnet(magnet)
+	t, err := addMagnet(m.client, magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
 		return "", "", nil, err
@@ -128,11 +131,42 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	if exists {
 		s.mtx.Lock()
 		s.lastView = time.Now()
+		needResume := s.paused || s.cancel == nil
 		s.mtx.Unlock()
+		if needResume {
+			m.startConversionLocked(key, s)
+		}
 		m.mu.Unlock()
-		<-s.ready
+		if err := s.waitReady(ctx); err != nil {
+			return "", "", nil, err
+		}
 		return s.paths.masterPlaylist, s.paths.outDir, s.cancel, nil
 	}
+	m.mu.Unlock()
+
+	source, err := newTorrentSource(file, m.sources)
+	if err != nil {
+		return "", "", nil, err
+	}
+
+	m.mu.Lock()
+	s, exists = m.active[key]
+	if exists {
+		source.Close()
+		s.mtx.Lock()
+		s.lastView = time.Now()
+		needResume := s.paused || s.cancel == nil
+		s.mtx.Unlock()
+		if needResume {
+			m.startConversionLocked(key, s)
+		}
+		m.mu.Unlock()
+		if err := s.waitReady(ctx); err != nil {
+			return "", "", nil, err
+		}
+		return s.paths.masterPlaylist, s.paths.outDir, s.cancel, nil
+	}
+
 	ready := make(chan struct{})
 	streamCtx, cancel := context.WithCancel(context.Background())
 	s = &streamInfo{
@@ -142,6 +176,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		file:      file,
 		lastView:  time.Now(),
 		paths:     paths,
+		source:    source,
 		selection: ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack},
 		running:   true,
 	}
@@ -151,88 +186,109 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 
 	file.Download()
 	file.SetPriority(torrent.PiecePriorityHigh)
-	m.preloadLeadingPieces(file)
+	source.PrefetchRange(0, initialProbeBytes)
 
-	if probeErr := m.convertFileToStream(streamCtx, ctx, key, s); probeErr != nil {
-		m.cleanup(key)
-		return "", "", nil, probeErr
+	m.launchConversion(streamCtx, ctx, key, s)
+	if err := s.waitReady(ctx); err != nil {
+		m.cleanupIfCurrent(key, s)
+		return "", "", nil, err
 	}
 	log.Printf("Stream ready: key=%v, playlist=%s", key, paths.masterPlaylist)
 	return paths.masterPlaylist, paths.outDir, cancel, nil
 }
 
-func (m *manager) preloadLeadingPieces(f *torrent.File) {
-	const preloadPieces = 64
-	begin := f.BeginPieceIndex()
-	end := begin + preloadPieces
-	if end > f.EndPieceIndex() {
-		end = f.EndPieceIndex()
-	}
-	if end > begin {
-		f.Torrent().DownloadPieces(begin, end)
-	}
-}
-
-func (m *manager) targetReadaheadBytes(f *torrent.File) int64 {
-	const (
-		targetBufferBytes = int64(1 << 30)   // ~1 GiB target to cover ~10-20 minutes of content
-		minAheadBytes     = int64(128 << 20) // ensure at least a short runway
-	)
-	ahead := targetBufferBytes
-	if ahead < minAheadBytes {
-		ahead = minAheadBytes
-	}
-	if l := f.Length(); l > 0 && l < ahead {
-		ahead = l
-	}
-	return ahead
-}
-func (m *manager) convertFileToStream(
+func (m *manager) launchConversion(
 	streamCtx context.Context,
-	prepareCtx context.Context,
+	startupCtx context.Context,
 	key streamKey,
 	s *streamInfo,
+) {
+	go func() {
+		err := m.runConversion(streamCtx, startupCtx, s)
+		m.finishConversion(key, s, err)
+	}()
+}
+
+func (m *manager) runConversion(
+	streamCtx context.Context,
+	startupCtx context.Context,
+	s *streamInfo,
 ) error {
-	if prepareCtx == nil {
-		prepareCtx = context.Background()
+	if startupCtx == nil {
+		startupCtx = context.Background()
 	}
-	ready := s.ready
-	if ready != nil {
-		defer close(ready)
-	}
-	if err := waitForProbeBytes(prepareCtx, s.file, int64(m.settings.MinProbeSizeMiB())<<20); err != nil {
+	if err := s.source.WaitRange(startupCtx, 0, initialProbeBytes); err != nil {
+		s.signalReady(err)
 		return err
 	}
 
-	targetReadahead := m.targetReadaheadBytes(s.file)
-	ffmpegHandler := ffmpeg.NewConverter(streamCtx, func() io.ReadCloser {
-		reader := s.file.NewReader()
-		reader.SetContext(streamCtx)
-		reader.SetReadahead(targetReadahead) // keep a deep sequential window buffered
-		reader.SetResponsive()
-		return reader
-	}, s.paths.outDir, s.paths.videoPlaylist, s.paths.subtitlePlaylist, s.paths.masterPlaylist, s.selection)
+	ffmpegHandler := ffmpeg.NewURLConverter(
+		streamCtx,
+		s.source.URL(),
+		s.paths.outDir,
+		s.paths.videoPlaylist,
+		s.paths.subtitlePlaylist,
+		s.paths.masterPlaylist,
+		s.selection,
+	)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- ffmpegHandler.ConvertToHLS()
 	}()
 
 	playlistReady := make(chan error, 1)
-	go func() { playlistReady <- waitForPlaylist(prepareCtx, s.paths.masterPlaylist) }()
-	select {
-	case <-prepareCtx.Done():
-		return prepareCtx.Err()
-	case err := <-errCh:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("FFmpeg error for key=%v: %v", key, err)
-		}
-		return err
-	case err := <-playlistReady:
-		if err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("waitForPlaylist failed for key=%v: %v", key, err)
+	go func() { playlistReady <- waitForPlaylist(startupCtx, s.paths.masterPlaylist) }()
+
+	startupDone := startupCtx.Done()
+	playlistReadyCh := playlistReady
+	readySent := false
+
+	for {
+		select {
+		case err := <-errCh:
+			if !readySent {
+				s.signalReady(err)
+			}
 			return err
+		case <-startupDone:
+			err := startupCtx.Err()
+			if !readySent {
+				s.signalReady(err)
+			}
+			return err
+		case err := <-playlistReadyCh:
+			if err != nil {
+				if !readySent {
+					s.signalReady(err)
+				}
+				return err
+			}
+			s.signalReady(nil)
+			readySent = true
+			startupDone = nil
+			playlistReadyCh = nil
 		}
-		return nil
+	}
+}
+
+func (m *manager) finishConversion(key streamKey, s *streamInfo, err error) {
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("Stream conversion error for key=%v: %v", key, err)
+	}
+
+	m.mu.Lock()
+	if current, ok := m.active[key]; !ok || current != s {
+		m.mu.Unlock()
+		return
+	}
+	s.running = false
+	if errors.Is(err, context.Canceled) {
+		s.paused = true
+	}
+	m.mu.Unlock()
+
+	if err != nil && !errors.Is(err, context.Canceled) {
+		m.cleanupIfCurrent(key, s)
 	}
 }
 
@@ -256,25 +312,6 @@ func waitForPlaylist(ctx context.Context, path string) error {
 				return errors.New("playlist not ready (timeout)")
 			}
 			time.Sleep(step)
-		}
-	}
-}
-
-func waitForProbeBytes(ctx context.Context, file *torrent.File, minBytes int64) error {
-	if minBytes <= 0 {
-		return nil
-	}
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if file.BytesCompleted() >= minBytes {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
 		}
 	}
 }

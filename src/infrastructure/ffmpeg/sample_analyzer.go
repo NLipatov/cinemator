@@ -1,81 +1,26 @@
 package ffmpeg
 
 import (
-	"bytes"
 	"cinemator/domain"
 	"cinemator/infrastructure/cli"
 	"context"
 	"encoding/json"
-	"io"
-)
-
-const (
-	initialProbeBytes = 1 << 20  // 1 MiB
-	probeStepBytes    = 4 << 20  // add 4 MiB on each retry
-	maxProbeBytes     = 16 << 20 // hard cap
 )
 
 type SampleAnalyzer struct{}
 
-// Analyze reads up to peekSize bytes, feeds them to ffprobe and
-// returns detected codecs, audio tracks, subtitles and whether a yuv420p conversion is required.
-func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
-	data := make([]byte, 0, maxProbeBytes)
-	target := initialProbeBytes
-	var lastErr error
-
-	for {
-		prevLen := len(data)
-		// read up to target (or max) bytes
-		need := target - len(data)
-		if need > 0 {
-			if need > maxProbeBytes-len(data) {
-				need = maxProbeBytes - len(data)
-			}
-			tmp := make([]byte, need)
-			n, readErr := io.ReadFull(r, tmp)
-			data = append(data, tmp[:n]...)
-			if readErr != nil {
-				if readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
-					return domain.MediaInfo{}, readErr
-				}
-				if n == 0 {
-					if lastErr != nil {
-						return domain.MediaInfo{}, lastErr
-					}
-					return domain.MediaInfo{}, readErr
-				}
-			}
-		}
-
-		info, err := probeSample(data)
-		if err == nil {
-			return info, nil
-		}
-		lastErr = err
-
-		if len(data) >= maxProbeBytes {
-			return domain.MediaInfo{}, lastErr
-		}
-		if len(data) == prevLen {
-			return domain.MediaInfo{}, lastErr
-		}
-		target += probeStepBytes
-		if target > maxProbeBytes {
-			target = maxProbeBytes
-		}
-	}
-}
-
-func probeSample(sample []byte) (domain.MediaInfo, error) {
-	out, err := cli.RunWithStdin(context.Background(), bytes.NewReader(sample),
+func (SampleAnalyzer) AnalyzeURL(ctx context.Context, sourceURL string) (domain.MediaInfo, error) {
+	out, err := cli.RunWithStdin(ctx, nil,
 		"ffprobe", "-v", "error",
-		"-of", "json", "-show_streams", "-i", "pipe:0",
+		"-of", "json", "-show_streams", "-i", sourceURL,
 	)
 	if err != nil {
 		return domain.MediaInfo{}, err
 	}
+	return parseProbeOutput(out)
+}
 
+func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 	var meta struct {
 		Streams []struct {
 			Index     int    `json:"index"`

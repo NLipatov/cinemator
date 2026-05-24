@@ -3,12 +3,11 @@ package settings
 import "time"
 
 const (
-	hlsPath         = "/var/tmp/cinemator/hls"
-	downloadPath    = "/var/tmp/cinemator/download"
-	viewerTimeout   = 2 * time.Hour
-	maxCacheBytes   = 2 << 30 // 2 GiB cap for HLS cache
-	httpPort        = 8000
-	minProbeSizeMiB = 1
+	hlsPath       = "/var/tmp/cinemator/hls"
+	downloadPath  = "/var/tmp/cinemator/download"
+	viewerTimeout = 2 * time.Hour
+	maxCacheBytes = 2 << 30 // 2 GiB cap for HLS cache
+	httpPort      = 8000
 )
 
 type Settings struct {
@@ -36,8 +35,4 @@ func (s *Settings) MaxCacheBytes() int64 {
 
 func (s *Settings) HttpPort() int {
 	return httpPort
-}
-
-func (s *Settings) MinProbeSizeMiB() int {
-	return minProbeSizeMiB
 }

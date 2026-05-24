@@ -1,8 +1,11 @@
 package torrent
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStreamKeyDirNameAndParse(t *testing.T) {
@@ -58,5 +61,28 @@ func TestParseStreamDirRejectsMalformedNames(t *testing.T) {
 				t.Fatalf("parseStreamDir(%q) succeeded, want error", name)
 			}
 		})
+	}
+}
+
+func TestStreamInfoWaitReadyReturnsSignalError(t *testing.T) {
+	want := errors.New("probe failed")
+	s := &streamInfo{}
+	s.resetReady()
+	s.signalReady(want)
+
+	if got := s.waitReady(context.Background()); !errors.Is(got, want) {
+		t.Fatalf("waitReady() = %v, want %v", got, want)
+	}
+}
+
+func TestStreamInfoWaitReadyHonorsContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+
+	s := &streamInfo{}
+	s.resetReady()
+
+	if err := s.waitReady(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitReady() = %v, want deadline exceeded", err)
 	}
 }

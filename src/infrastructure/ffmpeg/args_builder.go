@@ -15,6 +15,7 @@ type StreamSelection struct {
 
 type ArgsBuilder struct {
 	OutDir, Playlist string
+	Input            string
 }
 
 // isBitmapSubtitle returns true for image-based subtitle formats
@@ -29,17 +30,19 @@ func isBitmapSubtitle(codec string) bool {
 func (b ArgsBuilder) Build(info domain.MediaInfo, sel StreamSelection) []string {
 	hasSubtitle := sel.SubtitleTrackIndex >= 0 && sel.SubtitleTrackIndex < len(info.Subtitles)
 
-	// -- input source (always pipe)
-	args := []string{"-fflags", "+genpts", "-i", "pipe:0"}
+	args := []string{"-fflags", "+genpts", "-i", b.Input}
 
+	hasAudio := len(info.AudioTracks) > 0
 	audioIdx := sel.AudioTrackIndex
-	if audioIdx < 0 || audioIdx >= len(info.AudioTracks) {
+	if !hasAudio {
+		audioIdx = -1
+	} else if audioIdx < 0 || audioIdx >= len(info.AudioTracks) {
 		audioIdx = 0
 	}
 
 	// -- determine audio codec for selected track
 	audioCodec := ""
-	if len(info.AudioTracks) > audioIdx {
+	if hasAudio {
 		audioCodec = info.AudioTracks[audioIdx].Codec
 	}
 
@@ -53,20 +56,20 @@ func (b ArgsBuilder) Build(info domain.MediaInfo, sel StreamSelection) []string 
 		args = append(args,
 			"-filter_complex", fmt.Sprintf("[0:v][0:s:%d]overlay[v]", sel.SubtitleTrackIndex),
 			"-map", "[v]",
-			"-map", fmt.Sprintf("0:a:%d", audioIdx),
 		)
 	} else if hasSubtitle {
-		// Text subtitles: use subtitles filter reading from same pipe
+		// Text subtitles: emit video here and write WebVTT in the subtitle pass
 		args = append(args,
 			"-map", "0:v:0",
-			"-map", fmt.Sprintf("0:a:%d", audioIdx),
 		)
 	} else {
 		// No subtitles: simple mapping
 		args = append(args,
 			"-map", "0:v:0",
-			"-map", fmt.Sprintf("0:a:%d", audioIdx),
 		)
+	}
+	if hasAudio {
+		args = append(args, "-map", fmt.Sprintf("0:a:%d", audioIdx))
 	}
 
 	if needVideoEncode {
@@ -83,10 +86,12 @@ func (b ArgsBuilder) Build(info domain.MediaInfo, sel StreamSelection) []string 
 	}
 
 	// -- audio encoding
-	if needAudioEncode {
-		args = append(args, "-c:a", "aac", "-b:a", "128k", "-ac", "2")
-	} else {
-		args = append(args, "-c:a", "copy")
+	if hasAudio {
+		if needAudioEncode {
+			args = append(args, "-c:a", "aac", "-b:a", "128k", "-ac", "2")
+		} else {
+			args = append(args, "-c:a", "copy")
+		}
 	}
 
 	return append(args, b.hls()...)

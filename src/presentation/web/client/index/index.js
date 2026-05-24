@@ -246,15 +246,26 @@
       if (!video || !video.textTracks) return;
       const track = Array.from(video.textTracks).find(t => t.kind === 'subtitles' || t.kind === 'captions');
       if (!track || !track.cues) return;
+      track.mode = 'showing';
       for (let i = 0; i < track.cues.length; i++) {
         const cue = track.cues[i];
-        if (!cue.__origStart) {
+        if (cue.__origStart === undefined) {
           cue.__origStart = cue.startTime;
           cue.__origEnd = cue.endTime;
         }
         cue.startTime = Math.max(0, cue.__origStart + delaySec);
         cue.endTime = Math.max(cue.startTime, cue.__origEnd + delaySec);
       }
+    }
+
+    function showSubtitleTextTracks(video) {
+      if (!video || !video.textTracks) return;
+      let enabled = false;
+      Array.from(video.textTracks).forEach(track => {
+        if (track.kind !== 'subtitles' && track.kind !== 'captions') return;
+        track.mode = enabled ? 'disabled' : 'showing';
+        enabled = true;
+      });
     }
 
     function watchSubtitleUpdates(video, onUpdate) {
@@ -268,6 +279,7 @@
       if (tracks.addEventListener) {
         tracks.addEventListener('addtrack', e => {
           attachTrack(e.track);
+          showSubtitleTextTracks(video);
           setTimeout(onUpdate, 0);
         });
       }
@@ -303,12 +315,19 @@
           if (enableSubtitles && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
             hls.subtitleTrack = 0;
             hls.subtitleDisplay = true;
+            showSubtitleTextTracks(video);
             reapplySubtitleDelay();
           }
         });
         if (enableSubtitles) {
-          hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, reapplySubtitleDelay);
-          hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, reapplySubtitleDelay);
+          hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, () => {
+            showSubtitleTextTracks(video);
+            reapplySubtitleDelay();
+          });
+          hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, () => {
+            showSubtitleTextTracks(video);
+            reapplySubtitleDelay();
+          });
         }
         hls.on(Hls.Events.FRAG_LOADED, hideWarningOnce);
         hls.on(Hls.Events.ERROR, (evt, data) => {
@@ -325,7 +344,10 @@
           }, { once: true });
         }
         video.addEventListener('canplay', hideWarningOnce, { once: true });
-        video.addEventListener('loadeddata', () => reapplySubtitleDelay(), { once: true });
+        video.addEventListener('loadeddata', () => {
+          if (enableSubtitles) showSubtitleTextTracks(video);
+          reapplySubtitleDelay();
+        }, { once: true });
       } else {
         removeWarning();
         showMsg('playerMsg', 'Your browser does not support HLS.', true);

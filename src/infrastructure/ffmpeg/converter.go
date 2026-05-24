@@ -5,7 +5,6 @@ import (
 	"cinemator/infrastructure/cli"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -16,26 +15,25 @@ import (
 // Converter wraps "probe → decide arguments → run ffmpeg".
 type Converter struct {
 	ctx       context.Context
-	newReader func() io.ReadCloser // returns a fresh reader of the same input
-	analyzer  SampleAnalyzer       // parses first 2 MiB via ffprobe
-	builder   ArgsBuilder          // builds CLI args for ffmpeg
-	selection StreamSelection      // which audio/subtitle tracks to use
+	inputURL  string
+	analyzer  SampleAnalyzer
+	builder   ArgsBuilder     // builds CLI args for ffmpeg
+	selection StreamSelection // which audio/subtitle tracks to use
 	videoList string
 	subList   string
 	master    string
 }
 
-// NewConverter wires all helpers together.
-func NewConverter(ctx context.Context,
-	newReader func() io.ReadCloser,
+func NewURLConverter(ctx context.Context,
+	inputURL string,
 	outDir, videoPlaylist, subtitlePlaylist, masterPlaylist string,
 	selection StreamSelection,
 ) *Converter {
 	return &Converter{
 		ctx:       ctx,
-		newReader: newReader,
+		inputURL:  inputURL,
 		analyzer:  SampleAnalyzer{},
-		builder:   ArgsBuilder{OutDir: outDir, Playlist: videoPlaylist},
+		builder:   ArgsBuilder{OutDir: outDir, Playlist: videoPlaylist, Input: inputURL},
 		selection: selection,
 		videoList: videoPlaylist,
 		subList:   subtitlePlaylist,
@@ -45,10 +43,8 @@ func NewConverter(ctx context.Context,
 
 // ConvertToHLS probes the stream, builds arguments once and launches ffmpeg.
 func (c *Converter) ConvertToHLS() error {
-	// --- 1. probe the first 2 MiB ------------------------------------
-	probe := c.newReader()
-	info, err := c.analyzer.Analyze(probe)
-	_ = probe.Close()
+	// --- 1. probe the seekable input ----------------------------------
+	info, err := c.analyzer.AnalyzeURL(c.ctx, c.inputURL)
 	if err != nil {
 		return err
 	}
@@ -71,13 +67,7 @@ func (c *Converter) ConvertToHLS() error {
 	// --- 4. run ffmpeg ------------------------------------------------
 	videoErrCh := make(chan error, 1)
 	go func() {
-		stream := c.newReader()
-		defer func() {
-			if closeErr := stream.Close(); closeErr != nil {
-				log.Println(closeErr)
-			}
-		}()
-		_, err := cli.RunWithStdin(c.ctx, stream, "ffmpeg", args...)
+		err := c.runFFmpeg(args)
 		videoErrCh <- err
 	}()
 
@@ -85,15 +75,9 @@ func (c *Converter) ConvertToHLS() error {
 	if textSubtitle {
 		subtitleErrCh = make(chan error, 1)
 		go func() {
-			stream := c.newReader()
-			defer func() {
-				if closeErr := stream.Close(); closeErr != nil {
-					log.Println(closeErr)
-				}
-			}()
 			subArgs := c.subtitleArgs(c.selection.SubtitleTrackIndex)
 			log.Println("ffmpeg (subtitle)", strings.Join(subArgs, " "))
-			_, err := cli.RunWithStdin(c.ctx, stream, "ffmpeg", subArgs...)
+			err := c.runFFmpeg(subArgs)
 			subtitleErrCh <- err
 		}()
 	}
@@ -138,10 +122,15 @@ func (c *Converter) ConvertToHLS() error {
 	}
 }
 
+func (c *Converter) runFFmpeg(args []string) error {
+	_, err := cli.RunWithStdin(c.ctx, nil, "ffmpeg", args...)
+	return err
+}
+
 func (c *Converter) subtitleArgs(subIdx int) []string {
 	return []string{
 		"-fflags", "+genpts",
-		"-i", "pipe:0",
+		"-i", c.inputURL,
 		"-map", fmt.Sprintf("0:s:%d", subIdx),
 		"-c:s", "webvtt",
 		"-f", "segment",
