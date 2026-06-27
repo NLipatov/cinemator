@@ -29,6 +29,10 @@ type streamInfo struct {
 	mtx       sync.Mutex
 	selection ffmpeg.StreamSelection
 	paths     streamPaths
+	source    *torrentSource
+	runID     uint64
+	readyErr  error
+	readySent bool
 	paused    bool
 	running   bool
 }
@@ -38,6 +42,66 @@ type streamPaths struct {
 	videoPlaylist    string
 	subtitlePlaylist string
 	masterPlaylist   string
+}
+
+func (s *streamInfo) beginRun() uint64 {
+	s.mtx.Lock()
+	s.runID++
+	s.ready = make(chan struct{})
+	s.readyErr = nil
+	s.readySent = false
+	runID := s.runID
+	s.mtx.Unlock()
+	return runID
+}
+
+func (s *streamInfo) signalReady(runID uint64, err error) bool {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if runID != s.runID || s.readySent {
+		return false
+	}
+	s.readyErr = err
+	s.readySent = true
+	if s.ready != nil {
+		close(s.ready)
+	}
+	return true
+}
+
+func (s *streamInfo) isCurrentRun(runID uint64) bool {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return runID == s.runID
+}
+
+func (s *streamInfo) waitReady(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	s.mtx.Lock()
+	ready := s.ready
+	readyErr := s.readyErr
+	readySent := s.readySent
+	s.mtx.Unlock()
+
+	if ready == nil || readySent {
+		return readyErr
+	}
+
+	select {
+	case <-ready:
+		return s.readyError()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *streamInfo) readyError() error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return s.readyErr
 }
 
 func (k streamKey) dirName() string {

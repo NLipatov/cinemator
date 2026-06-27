@@ -1,10 +1,10 @@
 :root {
   --radius: 0.5rem;
   --line: 0.0625rem;
-  --page-max: 74rem;
+  --page-max: 72rem;
   --control-max: 52rem;
   --side-panel: 21rem;
-  --header-height: 4rem;
+  --header-height: 3.65rem;
   --shadow: 0 1.8rem 5rem rgba(0, 0, 0, 0.38);
   --shadow-soft: 0 0.8rem 2.2rem rgba(0, 0, 0, 0.22);
   --shadow-inset: inset 0 0.0625rem 0 rgba(255, 255, 255, 0.16);
@@ -79,31 +79,12 @@ body {
 body {
   min-height: 100vh;
   width: 100vw;
-  padding: calc(var(--header-height) + clamp(2rem, 7vh, 4.5rem)) clamp(1rem, 3vw, 2.5rem) 2rem;
+  padding: calc(var(--header-height) + clamp(1rem, 4vh, 2.4rem)) clamp(0.9rem, 2.6vw, 2.2rem) 1.4rem;
   box-sizing: border-box;
 }
 
 [hidden] {
   display: none !important;
-}
-
-body::before {
-  position: fixed;
-  inset: 0;
-  z-index: -1;
-  pointer-events: none;
-  content: '';
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.07), transparent 20rem),
-    linear-gradient(115deg, transparent 0%, rgba(255, 255, 255, 0.035) 42%, transparent 72%),
-    radial-gradient(ellipse at 50% 0, rgba(255, 255, 255, 0.1), transparent 26rem);
-}
-
-[data-theme="light"] body::before {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.96), transparent 18rem),
-    linear-gradient(115deg, transparent 0%, rgba(255, 255, 255, 0.64) 42%, transparent 72%),
-    radial-gradient(ellipse at 50% 0, rgba(255, 255, 255, 0.96), transparent 25rem);
 }
 
 .topbar {
@@ -147,14 +128,14 @@ body::before {
 .top-actions {
   display: flex;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.45rem;
 }
 
 .theme-toggle {
   position: relative;
-  width: 2.35rem;
-  height: 2.35rem;
-  min-width: 2.35rem;
+  width: 2.2rem;
+  height: 2.2rem;
+  min-width: 2.2rem;
   padding: 0;
   display: flex;
   align-items: center;
@@ -198,7 +179,7 @@ body::before {
   display: grid;
   align-items: start;
   justify-items: center;
-  gap: 1.15rem;
+  gap: 0.85rem;
 }
 
 body.has-player .app-shell {
@@ -222,30 +203,8 @@ body.has-player .app-shell {
   width: min(100%, var(--control-max));
   justify-self: center;
   position: relative;
-  padding: clamp(1rem, 2vw, 1.35rem);
-  background: var(--color-card-strong);
-  box-shadow: var(--shadow), var(--shadow-inset);
-  overflow: hidden;
-}
-
-.source-panel::before {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  content: '';
-  border-radius: inherit;
-  box-shadow: inset 0 0.0625rem 0 rgba(255, 255, 255, 0.12);
-}
-
-.source-panel::after {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  content: '';
-  background:
-    linear-gradient(120deg, rgba(255, 255, 255, 0.11), transparent 36%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.04), transparent 54%);
-  opacity: 0.82;
+  padding: clamp(0.85rem, 1.6vw, 1.1rem);
+  box-shadow: var(--shadow-soft), var(--shadow-inset);
 }
 
 body.has-player .source-panel {
@@ -260,7 +219,7 @@ body.has-player .source-panel {
   z-index: 1;
   display: grid;
   align-items: start;
-  gap: 0.8rem;
+  gap: 0.6rem;
 }
 
 .source-label {
@@ -280,25 +239,25 @@ body.has-player .source-panel {
   justify-self: center;
   display: grid;
   align-items: start;
-  gap: 1.1rem;
+  gap: 0.8rem;
 }
 
 body.has-player .workspace {
   width: 100%;
   justify-self: stretch;
   grid-template-columns: minmax(16rem, var(--side-panel)) minmax(0, 1fr);
-  gap: 1rem;
+  gap: 0.85rem;
 }
 
 .control-stack {
   display: grid;
   align-items: start;
-  gap: 1rem;
+  gap: 0.75rem;
 }
 
 .panel,
 .player-stage {
-  padding: 1rem;
+  padding: 0.85rem;
   box-shadow: var(--shadow-soft), var(--shadow-inset);
 }
 
@@ -315,7 +274,7 @@ body.has-player .workspace {
 
 .step {
   display: grid;
-  gap: 0.875rem;
+  gap: 0.7rem;
   animation: fadein .42s cubic-bezier(.4,.14,.24,1) 1;
 }
 
@@ -327,8 +286,8 @@ body.has-player .workspace {
 
 .input-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 6.5rem;
-  gap: 0.7rem;
+  grid-template-columns: minmax(0, 1fr) 5.8rem;
+  gap: 0.55rem;
   width: 100%;
   align-items: stretch;
 }
@@ -337,9 +296,9 @@ body.has-player .workspace {
 input,
 select,
 button {
-  min-height: 2.75rem;
+  min-height: 2.45rem;
   box-sizing: border-box;
-  padding: 0.72rem 0.95rem;
+  padding: 0.58rem 0.78rem;
   color: var(--color-input-fg);
   background: var(--color-input-bg);
   border: var(--line) solid var(--color-border);
@@ -347,14 +306,14 @@ button {
   box-shadow: none;
   outline: none;
   font-family: inherit;
-  font-size: 0.98rem;
+  font-size: 0.94rem;
   line-height: 1.2;
   transition: border var(--transition), background var(--transition), color var(--transition), box-shadow var(--transition), transform .1s;
 }
 
 #magnet {
   font-family: var(--font-mono);
-  font-size: 0.93rem;
+  font-size: 0.88rem;
 }
 
 .input-style:focus,
@@ -367,7 +326,7 @@ select:focus {
 }
 
 select.input-style {
-  padding-right: 2.1rem;
+  padding-right: 1.8rem;
 }
 
 select {
@@ -400,9 +359,8 @@ button:focus-visible {
 }
 
 .player-stage {
-  gap: 0.75rem;
+  gap: 0.65rem;
   box-shadow: var(--shadow);
-  background: var(--color-card-strong);
 }
 
 #video {
@@ -428,10 +386,10 @@ button:focus-visible {
 }
 
 .msg {
-  min-height: 1.22em;
+  min-height: 1.1em;
   margin-top: 0;
   color: var(--color-muted);
-  font-size: 0.9rem;
+  font-size: 0.85rem;
   letter-spacing: 0;
   line-height: 1.35;
   opacity: 0.96;
@@ -461,11 +419,11 @@ button:focus-visible {
   display: flex;
   flex-direction: column;
   align-items: stretch;
-  padding: 1rem 1.05rem;
+  padding: 0.8rem 0.9rem;
   color: var(--color-warning);
-  background: var(--color-card-subtle);
+  background: var(--color-card);
   border-left: 0.1875rem solid var(--color-warning);
-  font-size: 0.92rem;
+  font-size: 0.88rem;
   animation: fadein .34s cubic-bezier(.35,.7,.13,1) 1;
 }
 
@@ -473,7 +431,7 @@ button:focus-visible {
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 0.9rem;
+  gap: 0.7rem;
 }
 
 .warning-icon {
@@ -503,15 +461,16 @@ button:focus-visible {
 
 .track-row {
   display: grid;
-  grid-template-columns: 5rem minmax(0, 1fr);
+  grid-template-columns: 5.2rem minmax(0, 1fr);
   align-items: center;
-  gap: 0.8rem;
+  gap: 0.6rem;
 }
 
 .track-row label {
   color: var(--color-muted);
-  font-size: 0.9rem;
+  font-size: 0.86rem;
   font-weight: 560;
+  white-space: nowrap;
 }
 
 .track-row select {
@@ -530,25 +489,39 @@ button:focus-visible {
 }
 
 .delay-controls {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: center;
-  gap: 0.5rem;
+  justify-self: center;
+  width: min(100%, 13.5rem);
+  gap: 0.35rem;
 }
 
 .delay-value {
-  min-width: 4.5rem;
-  padding: 0.55rem 0.75rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 2.45rem;
+  padding: 0.58rem 0.35rem;
+  box-sizing: border-box;
   color: var(--color-fg);
   background: var(--color-card-subtle);
   border: var(--line) solid var(--color-border);
-  border-radius: 0.5rem;
+  border-radius: 0.46rem;
   font-weight: 720;
+  font-size: 0.9rem;
+  line-height: 1.2;
   text-align: center;
+  white-space: nowrap;
 }
 
 .small-btn {
+  width: 100%;
   min-width: 0;
-  padding: 0.55rem 0.85rem;
+  padding: 0.58rem 0.35rem;
+  font-size: 0.88rem;
+  white-space: nowrap;
 }
 
 @keyframes spin {
@@ -589,7 +562,7 @@ button:focus-visible {
   .panel,
   .player-stage,
   .source-panel {
-    padding: 0.9rem;
+    padding: 0.75rem;
   }
 
   #video {
@@ -599,7 +572,7 @@ button:focus-visible {
 
 @media (max-width: 500px) {
   :root {
-    --header-height: 3.8rem;
+    --header-height: 3.45rem;
   }
 
   body {
@@ -632,7 +605,7 @@ button:focus-visible {
 
   .delay-controls .small-btn,
   .delay-value {
-    flex: 1;
+    width: 100%;
   }
 
   #video {

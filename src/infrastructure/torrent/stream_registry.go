@@ -2,7 +2,6 @@ package torrent
 
 import (
 	"context"
-	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -10,6 +9,8 @@ import (
 
 	"github.com/anacrolix/torrent"
 )
+
+const idlePauseTimeout = 15 * time.Minute
 
 func (m *manager) CleanupStreams() {
 	now := time.Now()
@@ -27,16 +28,39 @@ func (m *manager) CleanupStreams() {
 }
 
 func (m *manager) cleanup(key streamKey) {
+	m.cleanupMatching(key, nil, 0, false)
+}
+
+func (m *manager) cleanupIfCurrent(key streamKey, expected *streamInfo) {
+	m.cleanupMatching(key, expected, 0, false)
+}
+
+func (m *manager) cleanupIfCurrentRun(key streamKey, expected *streamInfo, runID uint64) {
+	m.cleanupMatching(key, expected, runID, true)
+}
+
+func (m *manager) cleanupMatching(key streamKey, expected *streamInfo, runID uint64, checkRun bool) {
 	m.mu.Lock()
 	s, ok := m.active[key]
 	if !ok {
-		log.Printf("cleanup called, but no active stream found: key=%v", key)
+		if expected == nil {
+			log.Printf("cleanup called, but no active stream found: key=%v", key)
+		}
+		m.mu.Unlock()
+		return
+	}
+	if expected != nil && s != expected {
+		m.mu.Unlock()
+		return
+	}
+	if checkRun && !s.isCurrentRun(runID) {
 		m.mu.Unlock()
 		return
 	}
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.source.Close()
 	shouldDrop := false
 	if cnt, ok := m.torrents[key.InfoHash]; ok {
 		if cnt <= 1 {
@@ -93,11 +117,8 @@ func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
 	if s.running {
 		return
 	}
-	if err := os.RemoveAll(s.paths.outDir); err != nil {
-		log.Printf("startConversionLocked: failed to clean dir %s: %v", s.paths.outDir, err)
-	}
-	if err := os.MkdirAll(s.paths.outDir, 0755); err != nil {
-		log.Printf("startConversionLocked: failed to recreate dir %s: %v", s.paths.outDir, err)
+	if err := resetStreamOutput(s.paths); err != nil {
+		log.Printf("startConversionLocked: failed to reset dir %s: %v", s.paths.outDir, err)
 		return
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
@@ -105,22 +126,15 @@ func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
 	s.paused = false
 	s.running = true
 	s.file.SetPriority(torrent.PiecePriorityHigh)
-	s.ready = make(chan struct{})
-	go func() {
-		err := m.convertFileToStream(streamCtx, streamCtx, key, s)
-		if err != nil {
-			log.Printf("Stream conversion error (resume): %v", err)
-			if !errors.Is(err, context.Canceled) {
-				m.cleanup(key)
-			}
-		}
-		m.mu.Lock()
-		s.running = false
-		if errors.Is(err, context.Canceled) {
-			s.paused = true
-		}
-		m.mu.Unlock()
-	}()
+	runID := s.beginRun()
+	m.launchConversion(streamCtx, key, s, runID)
+}
+
+func resetStreamOutput(paths streamPaths) error {
+	if err := os.RemoveAll(paths.outDir); err != nil {
+		return err
+	}
+	return os.MkdirAll(paths.outDir, 0755)
 }
 
 func (m *manager) TouchStream(_ context.Context, dirName string) {
@@ -155,7 +169,7 @@ func (m *manager) viewerWatcher() {
 				readyClosed = true
 			default:
 			}
-			idle := readyClosed && now.Sub(s.lastView) > time.Minute
+			idle := readyClosed && now.Sub(s.lastView) > idlePauseTimeout
 			noViewers := now.Sub(s.lastView) > m.settings.ViewerTimeout()
 			s.mtx.Unlock()
 			if idle && !s.paused {
