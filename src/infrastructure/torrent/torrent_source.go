@@ -13,6 +13,7 @@ import (
 
 const (
 	initialProbeBytes = 1 << 20
+	maxProbeBytes     = 16 << 20
 	probeTailBytes    = 1 << 20
 )
 
@@ -58,13 +59,22 @@ func (s *torrentSource) Close() {
 
 func (s *torrentSource) Probe(ctx context.Context) (domain.MediaInfo, error) {
 	s.PrefetchRange(0, initialProbeBytes)
-	if tailOffset := s.file.Length() - probeTailBytes; tailOffset > 0 {
-		s.PrefetchRange(tailOffset, probeTailBytes)
-	}
 	if err := s.WaitRange(ctx, 0, initialProbeBytes); err != nil {
 		return domain.MediaInfo{}, err
 	}
-	return ffmpeg.SampleAnalyzer{}.AnalyzeURL(ctx, s.url)
+
+	reader := s.file.NewReader()
+	reader.SetContext(ctx)
+	reader.SetReadahead(maxProbeBytes)
+	defer reader.Close()
+	if info, err := (ffmpeg.SampleAnalyzer{}).Analyze(reader); err == nil {
+		return info, nil
+	}
+
+	if tailOffset := s.file.Length() - probeTailBytes; tailOffset > 0 {
+		s.PrefetchRange(tailOffset, probeTailBytes)
+	}
+	return (ffmpeg.SampleAnalyzer{}).AnalyzeURL(ctx, s.url)
 }
 
 func (s *torrentSource) PrefetchRange(offset, length int64) {
