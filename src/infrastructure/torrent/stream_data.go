@@ -30,6 +30,7 @@ type streamInfo struct {
 	selection ffmpeg.StreamSelection
 	paths     streamPaths
 	source    *torrentSource
+	runID     uint64
 	readyErr  error
 	readySent bool
 	paused    bool
@@ -43,25 +44,35 @@ type streamPaths struct {
 	masterPlaylist   string
 }
 
-func (s *streamInfo) resetReady() {
+func (s *streamInfo) beginRun() uint64 {
 	s.mtx.Lock()
+	s.runID++
 	s.ready = make(chan struct{})
 	s.readyErr = nil
 	s.readySent = false
+	runID := s.runID
 	s.mtx.Unlock()
+	return runID
 }
 
-func (s *streamInfo) signalReady(err error) {
+func (s *streamInfo) signalReady(runID uint64, err error) bool {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	if s.readySent {
-		return
+	if runID != s.runID || s.readySent {
+		return false
 	}
 	s.readyErr = err
 	s.readySent = true
 	if s.ready != nil {
 		close(s.ready)
 	}
+	return true
+}
+
+func (s *streamInfo) isCurrentRun(runID uint64) bool {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	return runID == s.runID
 }
 
 func (s *streamInfo) waitReady(ctx context.Context) error {

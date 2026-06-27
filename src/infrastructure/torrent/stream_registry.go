@@ -28,14 +28,18 @@ func (m *manager) CleanupStreams() {
 }
 
 func (m *manager) cleanup(key streamKey) {
-	m.cleanupMatching(key, nil)
+	m.cleanupMatching(key, nil, 0, false)
 }
 
 func (m *manager) cleanupIfCurrent(key streamKey, expected *streamInfo) {
-	m.cleanupMatching(key, expected)
+	m.cleanupMatching(key, expected, 0, false)
 }
 
-func (m *manager) cleanupMatching(key streamKey, expected *streamInfo) {
+func (m *manager) cleanupIfCurrentRun(key streamKey, expected *streamInfo, runID uint64) {
+	m.cleanupMatching(key, expected, runID, true)
+}
+
+func (m *manager) cleanupMatching(key streamKey, expected *streamInfo, runID uint64, checkRun bool) {
 	m.mu.Lock()
 	s, ok := m.active[key]
 	if !ok {
@@ -46,6 +50,10 @@ func (m *manager) cleanupMatching(key streamKey, expected *streamInfo) {
 		return
 	}
 	if expected != nil && s != expected {
+		m.mu.Unlock()
+		return
+	}
+	if checkRun && !s.isCurrentRun(runID) {
 		m.mu.Unlock()
 		return
 	}
@@ -109,8 +117,8 @@ func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
 	if s.running {
 		return
 	}
-	if err := os.MkdirAll(s.paths.outDir, 0755); err != nil {
-		log.Printf("startConversionLocked: failed to ensure dir %s: %v", s.paths.outDir, err)
+	if err := resetStreamOutput(s.paths); err != nil {
+		log.Printf("startConversionLocked: failed to reset dir %s: %v", s.paths.outDir, err)
 		return
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
@@ -118,8 +126,15 @@ func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
 	s.paused = false
 	s.running = true
 	s.file.SetPriority(torrent.PiecePriorityHigh)
-	s.resetReady()
-	m.launchConversion(streamCtx, streamCtx, key, s)
+	runID := s.beginRun()
+	m.launchConversion(streamCtx, key, s, runID)
+}
+
+func resetStreamOutput(paths streamPaths) error {
+	if err := os.RemoveAll(paths.outDir); err != nil {
+		return err
+	}
+	return os.MkdirAll(paths.outDir, 0755)
 }
 
 func (m *manager) TouchStream(_ context.Context, dirName string) {

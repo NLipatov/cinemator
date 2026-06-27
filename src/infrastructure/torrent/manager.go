@@ -122,9 +122,6 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	hash := t.InfoHash().HexString()
 	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack}
 	paths := key.paths(m.settings.HlsPath())
-	if mkdirErr := os.MkdirAll(paths.outDir, 0755); mkdirErr != nil {
-		return "", "", nil, fmt.Errorf("mkdir %s: %w", paths.outDir, mkdirErr)
-	}
 
 	m.mu.Lock()
 	s, exists := m.active[key]
@@ -166,11 +163,14 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		}
 		return s.paths.masterPlaylist, s.paths.outDir, s.cancel, nil
 	}
+	if err := resetStreamOutput(paths); err != nil {
+		source.Close()
+		m.mu.Unlock()
+		return "", "", nil, fmt.Errorf("reset stream output %s: %w", paths.outDir, err)
+	}
 
-	ready := make(chan struct{})
 	streamCtx, cancel := context.WithCancel(context.Background())
 	s = &streamInfo{
-		ready:     ready,
 		cancel:    cancel,
 		torrent:   t,
 		file:      file,
@@ -180,6 +180,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		selection: ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack},
 		running:   true,
 	}
+	runID := s.beginRun()
 	m.active[key] = s
 	m.torrents[hash]++
 	m.mu.Unlock()
@@ -188,9 +189,9 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	file.SetPriority(torrent.PiecePriorityHigh)
 	source.PrefetchRange(0, initialProbeBytes)
 
-	m.launchConversion(streamCtx, ctx, key, s)
+	m.launchConversion(streamCtx, key, s, runID)
 	if err := s.waitReady(ctx); err != nil {
-		m.cleanupIfCurrent(key, s)
+		m.cleanupIfCurrentRun(key, s, runID)
 		return "", "", nil, err
 	}
 	log.Printf("Stream ready: key=%v, playlist=%s", key, paths.masterPlaylist)
@@ -199,26 +200,23 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 
 func (m *manager) launchConversion(
 	streamCtx context.Context,
-	startupCtx context.Context,
 	key streamKey,
 	s *streamInfo,
+	runID uint64,
 ) {
 	go func() {
-		err := m.runConversion(streamCtx, startupCtx, s)
-		m.finishConversion(key, s, err)
+		err := m.runConversion(streamCtx, s, runID)
+		m.finishConversion(key, s, runID, err)
 	}()
 }
 
 func (m *manager) runConversion(
 	streamCtx context.Context,
-	startupCtx context.Context,
 	s *streamInfo,
+	runID uint64,
 ) error {
-	if startupCtx == nil {
-		startupCtx = context.Background()
-	}
-	if err := s.source.WaitRange(startupCtx, 0, initialProbeBytes); err != nil {
-		s.signalReady(err)
+	if err := s.source.WaitRange(streamCtx, 0, initialProbeBytes); err != nil {
+		s.signalReady(runID, err)
 		return err
 	}
 
@@ -237,9 +235,9 @@ func (m *manager) runConversion(
 	}()
 
 	playlistReady := make(chan error, 1)
-	go func() { playlistReady <- waitForPlaylist(startupCtx, s.paths.masterPlaylist) }()
+	go func() { playlistReady <- waitForPlaylist(streamCtx, s.paths.masterPlaylist) }()
 
-	startupDone := startupCtx.Done()
+	streamDone := streamCtx.Done()
 	playlistReadyCh := playlistReady
 	readySent := false
 
@@ -247,39 +245,38 @@ func (m *manager) runConversion(
 		select {
 		case err := <-errCh:
 			if !readySent {
-				s.signalReady(err)
+				s.signalReady(runID, err)
 			}
 			return err
-		case <-startupDone:
-			err := startupCtx.Err()
+		case <-streamDone:
+			err := streamCtx.Err()
 			if !readySent {
-				s.signalReady(err)
+				s.signalReady(runID, err)
 			}
 			return err
 		case err := <-playlistReadyCh:
 			if err != nil {
 				if !readySent {
-					s.signalReady(err)
+					s.signalReady(runID, err)
 				}
 				return err
 			}
-			s.signalReady(nil)
+			s.signalReady(runID, nil)
 			readySent = true
-			startupDone = nil
+			streamDone = nil
 			playlistReadyCh = nil
 		}
 	}
 }
 
-func (m *manager) finishConversion(key streamKey, s *streamInfo, err error) {
-	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("Stream conversion error for key=%v: %v", key, err)
-	}
-
+func (m *manager) finishConversion(key streamKey, s *streamInfo, runID uint64, err error) {
 	m.mu.Lock()
-	if current, ok := m.active[key]; !ok || current != s {
+	if current, ok := m.active[key]; !ok || current != s || !s.isCurrentRun(runID) {
 		m.mu.Unlock()
 		return
+	}
+	if err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("Stream conversion error for key=%v: %v", key, err)
 	}
 	s.running = false
 	if errors.Is(err, context.Canceled) {
@@ -288,7 +285,7 @@ func (m *manager) finishConversion(key streamKey, s *streamInfo, err error) {
 	m.mu.Unlock()
 
 	if err != nil && !errors.Is(err, context.Canceled) {
-		m.cleanupIfCurrent(key, s)
+		m.cleanupIfCurrentRun(key, s, runID)
 	}
 }
 
