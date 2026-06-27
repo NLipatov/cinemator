@@ -28,8 +28,13 @@ type rangeServer struct {
 }
 
 type rangeSource struct {
-	file      *torrent.File
+	file      rangeFile
 	readahead int64
+}
+
+type rangeFile interface {
+	Length() int64
+	NewReader() torrent.Reader
 }
 
 func newRangeServer() (*rangeServer, error) {

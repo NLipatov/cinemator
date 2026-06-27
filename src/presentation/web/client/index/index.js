@@ -246,7 +246,6 @@
       if (!video || !video.textTracks) return;
       const track = Array.from(video.textTracks).find(t => t.kind === 'subtitles' || t.kind === 'captions');
       if (!track || !track.cues) return;
-      track.mode = 'showing';
       for (let i = 0; i < track.cues.length; i++) {
         const cue = track.cues[i];
         if (cue.__origStart === undefined) {
