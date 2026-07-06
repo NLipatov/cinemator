@@ -141,6 +141,9 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 
 	if strings.HasSuffix(clean, ".m3u8") {
 		data, err := readWithWait(r.Context(), fullPath, waitTimeout)
+		if err == nil && path.Base(clean) == "index.m3u8" {
+			data, err = readMediaPlaylistWithWait(r.Context(), fullPath, waitTimeout)
+		}
 		if err != nil {
 			http.Error(w, "playlist not found", 404)
 			return
@@ -181,6 +184,42 @@ func readWithWait(ctx context.Context, path string, timeout time.Duration) ([]by
 		return nil, err
 	}
 	return os.ReadFile(path)
+}
+
+func readMediaPlaylistWithWait(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil && playlistHasSegment(string(data)) {
+			return data, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("playlist segment not ready")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(120 * time.Millisecond):
+		}
+	}
+}
+
+func playlistHasSegment(data string) bool {
+	expectURI := false
+	for _, raw := range strings.Split(data, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#EXTINF") {
+			expectURI = true
+			continue
+		}
+		if expectURI && !strings.HasPrefix(line, "#") {
+			return true
+		}
+	}
+	return false
 }
 
 func parseMagnetAndFile(r *http.Request) (string, int, error) {
