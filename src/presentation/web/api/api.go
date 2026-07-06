@@ -2,6 +2,7 @@ package api
 
 import (
 	"cinemator/application"
+	"cinemator/infrastructure/hls"
 	"cinemator/infrastructure/torrent"
 	"cinemator/presentation/settings"
 	"context"
@@ -140,7 +141,13 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if strings.HasSuffix(clean, ".m3u8") {
-		data, err := readWithWait(r.Context(), fullPath, waitTimeout)
+		var data []byte
+		var err error
+		if path.Base(clean) == "index.m3u8" {
+			data, err = readMediaPlaylistWithWait(r.Context(), fullPath, waitTimeout)
+		} else {
+			data, err = readWithWait(r.Context(), fullPath, waitTimeout)
+		}
 		if err != nil {
 			http.Error(w, "playlist not found", 404)
 			return
@@ -181,6 +188,24 @@ func readWithWait(ctx context.Context, path string, timeout time.Duration) ([]by
 		return nil, err
 	}
 	return os.ReadFile(path)
+}
+
+func readMediaPlaylistWithWait(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil && hls.HasSegment(string(data)) {
+			return data, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("playlist segment not ready")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(120 * time.Millisecond):
+		}
+	}
 }
 
 func parseMagnetAndFile(r *http.Request) (string, int, error) {

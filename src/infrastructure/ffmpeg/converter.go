@@ -3,6 +3,7 @@ package ffmpeg
 import (
 	"cinemator/domain"
 	"cinemator/infrastructure/cli"
+	"cinemator/infrastructure/hls"
 	"context"
 	"fmt"
 	"log"
@@ -144,7 +145,7 @@ func (c *Converter) subtitleArgs(subIdx int) []string {
 }
 
 func (c *Converter) writeMasterAfterVideoReady(info domain.MediaInfo, withSubs bool) error {
-	if err := waitForFile(c.ctx, c.videoList, 20*time.Minute); err != nil {
+	if err := waitForPlaylistSegment(c.ctx, c.videoList, 20*time.Minute); err != nil {
 		return err
 	}
 
@@ -161,18 +162,19 @@ func (c *Converter) writeEmptySubtitlePlaylist() error {
 	return os.WriteFile(c.subList, []byte(data), 0644)
 }
 
-func waitForFile(ctx context.Context, path string, timeout time.Duration) error {
+func waitForPlaylistSegment(ctx context.Context, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			if _, err := os.Stat(path); err == nil {
+			data, err := os.ReadFile(path)
+			if err == nil && hls.HasSegment(string(data)) {
 				return nil
 			}
 			if time.Now().After(deadline) {
-				return fmt.Errorf("playlist not ready (timeout): %s", path)
+				return fmt.Errorf("playlist segment not ready (timeout): %s", path)
 			}
 			time.Sleep(150 * time.Millisecond)
 		}

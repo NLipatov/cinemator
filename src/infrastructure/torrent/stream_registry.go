@@ -146,11 +146,7 @@ func (m *manager) TouchStream(_ context.Context, dirName string) {
 	if s, ok := m.active[key]; ok {
 		s.mtx.Lock()
 		s.lastView = time.Now()
-		needResume := s.paused || s.cancel == nil
 		s.mtx.Unlock()
-		if needResume {
-			m.startConversionLocked(key, s)
-		}
 	}
 	m.mu.Unlock()
 }
