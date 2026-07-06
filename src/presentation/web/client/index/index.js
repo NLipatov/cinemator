@@ -30,10 +30,12 @@
     let playbackRecoveryInFlight = false;
     let lastPlaybackRecoveryAt = 0;
     let lastStreamActivityAt = 0;
+    let forcedRecoveryAttempts = 0;
     let requestSeq = 0;
     const idleRecoveryMs = 12 * 60 * 1000;
     const recoveryThrottleMs = 5000;
     const stallRecoveryDelayMs = 3500;
+    const maxForcedRecoveryAttempts = 3;
     const nextRequest = () => ++requestSeq;
     const isStale = id => id !== requestSeq;
     function destroyVideoAndHls({ resetLayout = true } = {}) {
@@ -220,6 +222,9 @@
       showMsg('trackMsg', '');
       showMsg('playerMsg', keepPlayerVisible ? 'Restoring stream...' : '', false, keepPlayerVisible);
       lastStreamActivityAt = Date.now();
+      if (!keepPlayerVisible) {
+        forcedRecoveryAttempts = 0;
+      }
 
       if (subtitleSelected) {
         clearSubtitleWait();
@@ -238,7 +243,12 @@
       } catch (e) {
         if (isStale(requestId)) return;
         removeWarning();
-        showMsg('trackMsg', e.message || 'Could not start stream', true);
+        const msg = e.message || 'Could not start stream';
+        if (keepPlayerVisible) {
+          showMsg('playerMsg', msg, true);
+        } else {
+          showMsg('trackMsg', msg, true);
+        }
         return;
       }
     }
@@ -311,6 +321,13 @@
 
       playbackRecoveryInFlight = true;
       lastPlaybackRecoveryAt = now;
+      if (force) {
+        if (forcedRecoveryAttempts >= maxForcedRecoveryAttempts) {
+          playbackRecoveryInFlight = false;
+          return false;
+        }
+        forcedRecoveryAttempts++;
+      }
       const resumeTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
       startPlayback(resumeTime, { keepPlayerVisible: true }).finally(() => {
         playbackRecoveryInFlight = false;
@@ -330,12 +347,20 @@
       }, stallRecoveryDelayMs);
     }
 
+    function showPlaybackError(details) {
+      removeWarning();
+      showMsg('playerMsg', 'Playback error: ' + (details || 'Fatal error'), true);
+    }
+
     function attachPlaybackRecovery(video) {
       video.addEventListener('play', () => requestPlaybackRecovery('play'));
       video.addEventListener('seeking', () => requestPlaybackRecovery('seeking'));
       video.addEventListener('waiting', () => schedulePlaybackRecovery('waiting'));
       video.addEventListener('stalled', () => schedulePlaybackRecovery('stalled'));
-      video.addEventListener('error', () => requestPlaybackRecovery('native-error', true));
+      video.addEventListener('error', () => {
+        if (requestPlaybackRecovery('native-error', true)) return;
+        showPlaybackError('Native media error');
+      });
     }
 
     function playHls(src, enableSubtitles, resumeTime = 0) {
@@ -359,8 +384,13 @@
       }
       function markStreamActive() {
         lastStreamActivityAt = Date.now();
+        forcedRecoveryAttempts = 0;
         showMsg('playerMsg', '');
         hideWarningOnce();
+      }
+      function markPlaybackProgress() {
+        lastStreamActivityAt = Date.now();
+        forcedRecoveryAttempts = 0;
       }
 
       if (Hls.isSupported()) {
@@ -398,9 +428,8 @@
             return;
           }
           if (data.fatal) {
-            removeWarning();
             if (requestPlaybackRecovery('hls-error', true)) return;
-            showMsg('playerMsg', 'Playback error: ' + (data.details || 'Fatal error'), true);
+            showPlaybackError(data.details || 'Fatal error');
           }
         });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -411,6 +440,9 @@
           }, { once: true });
         }
         video.addEventListener('canplay', markStreamActive, { once: true });
+        video.addEventListener('playing', markStreamActive);
+        video.addEventListener('progress', markPlaybackProgress);
+        video.addEventListener('timeupdate', markPlaybackProgress);
         video.addEventListener('loadeddata', () => {
           markStreamActive();
           if (enableSubtitles) showSubtitleTextTracks(video);

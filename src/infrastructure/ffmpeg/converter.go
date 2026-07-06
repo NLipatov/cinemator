@@ -3,6 +3,7 @@ package ffmpeg
 import (
 	"cinemator/domain"
 	"cinemator/infrastructure/cli"
+	"cinemator/infrastructure/hls"
 	"context"
 	"fmt"
 	"log"
@@ -169,7 +170,7 @@ func waitForPlaylistSegment(ctx context.Context, path string, timeout time.Durat
 			return ctx.Err()
 		default:
 			data, err := os.ReadFile(path)
-			if err == nil && playlistHasSegment(string(data)) {
+			if err == nil && hls.HasSegment(string(data)) {
 				return nil
 			}
 			if time.Now().After(deadline) {
@@ -178,24 +179,6 @@ func waitForPlaylistSegment(ctx context.Context, path string, timeout time.Durat
 			time.Sleep(150 * time.Millisecond)
 		}
 	}
-}
-
-func playlistHasSegment(data string) bool {
-	expectURI := false
-	for _, raw := range strings.Split(data, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "#EXTINF") {
-			expectURI = true
-			continue
-		}
-		if expectURI && !strings.HasPrefix(line, "#") {
-			return true
-		}
-	}
-	return false
 }
 
 func buildMasterPlaylist(videoList, subList string, withSubs bool, lang string) string {
