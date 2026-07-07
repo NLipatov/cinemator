@@ -37,6 +37,7 @@
     let downloadEvents = null;
     let downloadFallbackPolling = false;
     let downloadPollingTimer = null;
+    let openExtendDownloadID = null;
     let requestSeq = 0;
     const idleRecoveryMs = 12 * 60 * 1000;
     const recoveryThrottleMs = 5000;
@@ -144,14 +145,19 @@
     }
 
     function closeExtendMenus(except = null) {
+      let preservedID = null;
       document.querySelectorAll('.download-menu.open').forEach(menu => {
-        if (menu === except) return;
+        const toggle = menu.querySelector('button[data-action="toggle-extend"]');
+        if (menu === except) {
+          preservedID = toggle ? toggle.dataset.id : openExtendDownloadID;
+          return;
+        }
         menu.classList.remove('open');
         const popup = menu.querySelector('.download-extend-menu');
-        const toggle = menu.querySelector('button[data-action="toggle-extend"]');
         if (popup) popup.hidden = true;
         if (toggle) toggle.setAttribute('aria-expanded', 'false');
       });
+      openExtendDownloadID = preservedID;
     }
 
     function toggleExtendMenu(toggle) {
@@ -164,6 +170,17 @@
       popup.hidden = !willOpen;
       menu.classList.toggle('open', willOpen);
       toggle.setAttribute('aria-expanded', String(willOpen));
+      openExtendDownloadID = willOpen ? toggle.dataset.id : null;
+    }
+
+    function openExtendMenu(menu) {
+      const popup = menu.querySelector('.download-extend-menu');
+      const toggle = menu.querySelector('button[data-action="toggle-extend"]');
+      if (!popup || !toggle) return;
+      popup.hidden = false;
+      menu.classList.add('open');
+      toggle.setAttribute('aria-expanded', 'true');
+      openExtendDownloadID = toggle.dataset.id;
     }
 
     function createExtendMenu(downloadID) {
@@ -201,8 +218,11 @@
 
     function renderDownloads(downloads) {
       const list = $('downloadsList');
+      const restoreExtendID = openExtendDownloadID;
+      let restoredExtendMenu = false;
       list.textContent = '';
       if (!downloads.length) {
+        openExtendDownloadID = null;
         const empty = document.createElement('div');
         empty.className = 'downloads-empty';
         empty.textContent = 'No downloads yet';
@@ -236,7 +256,12 @@
         const metaText = document.createElement('span');
         metaText.className = 'download-meta-text';
         metaText.textContent = `${formatDownloadSize(download)} · ${formatExpiry(download.expiresAt)}`;
-        meta.append(metaText, createExtendMenu(download.id));
+        const extendMenu = createExtendMenu(download.id);
+        if (download.id === restoreExtendID) {
+          openExtendMenu(extendMenu);
+          restoredExtendMenu = true;
+        }
+        meta.append(metaText, extendMenu);
 
         const actions = document.createElement('div');
         actions.className = 'download-actions';
@@ -254,6 +279,7 @@
         row.append(main, meta, actions);
         list.appendChild(row);
       });
+      if (!restoredExtendMenu) openExtendDownloadID = null;
     }
 
     async function loadDownloads({ quiet = false, suppressError = false } = {}) {

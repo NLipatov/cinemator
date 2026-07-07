@@ -134,9 +134,14 @@ func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	s := &streamInfo{running: true, paused: true}
 	runID := s.beginRun()
+	events := newDownloadEventBroadcaster()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	updates := events.subscribe(ctx)
 
 	m := &manager{
 		active: map[streamKey]*streamInfo{key: s},
+		events: events,
 	}
 	m.finishConversion(key, s, runID, nil)
 
@@ -148,6 +153,11 @@ func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
 	}
 	if !s.completed {
 		t.Fatal("finishConversion() did not mark successful run as completed")
+	}
+	select {
+	case <-updates:
+	case <-time.After(time.Second):
+		t.Fatal("finishConversion() did not notify download subscribers")
 	}
 }
 

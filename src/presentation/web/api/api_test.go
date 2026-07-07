@@ -72,6 +72,7 @@ func TestHandleDownloadActionStatusMapping(t *testing.T) {
 		path       string
 		manager    fakeTorrentManager
 		wantStatus int
+		wantAllow  string
 	}{
 		{
 			name:       "bad delete id",
@@ -94,6 +95,22 @@ func TestHandleDownloadActionStatusMapping(t *testing.T) {
 			manager:    fakeTorrentManager{},
 			wantStatus: http.StatusNoContent,
 		},
+		{
+			name:       "unsupported download method",
+			method:     http.MethodPut,
+			path:       "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			manager:    fakeTorrentManager{},
+			wantStatus: http.StatusMethodNotAllowed,
+			wantAllow:  http.MethodDelete,
+		},
+		{
+			name:       "unsupported extend method",
+			method:     http.MethodGet,
+			path:       "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend",
+			manager:    fakeTorrentManager{},
+			wantStatus: http.StatusMethodNotAllowed,
+			wantAllow:  http.MethodPost,
+		},
 	}
 
 	for _, tt := range tests {
@@ -106,6 +123,101 @@ func TestHandleDownloadActionStatusMapping(t *testing.T) {
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			if tt.wantAllow != "" && rec.Header().Get("Allow") != tt.wantAllow {
+				t.Fatalf("Allow = %q, want %q", rec.Header().Get("Allow"), tt.wantAllow)
+			}
+		})
+	}
+}
+
+func TestParseExtendDays(t *testing.T) {
+	tests := []struct {
+		name    string
+		target  string
+		body    string
+		want    int
+		wantErr bool
+	}{
+		{
+			name:   "query wins over body",
+			target: "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend?days=3",
+			body:   `{"days":30}`,
+			want:   3,
+		},
+		{
+			name:   "body days",
+			target: "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend",
+			body:   `{"days":30}`,
+			want:   30,
+		},
+		{
+			name:   "empty body defaults",
+			target: "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend",
+			body:   "",
+			want:   7,
+		},
+		{
+			name:   "zero body defaults",
+			target: "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend",
+			body:   `{"days":0}`,
+			want:   7,
+		},
+		{
+			name:    "zero query rejected",
+			target:  "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend?days=0",
+			body:    `{"days":7}`,
+			wantErr: true,
+		},
+		{
+			name:    "too large query rejected",
+			target:  "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend?days=366",
+			body:    "",
+			wantErr: true,
+		},
+		{
+			name:    "malformed query rejected",
+			target:  "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend?days=soon",
+			body:    "",
+			wantErr: true,
+		},
+		{
+			name:    "negative body rejected",
+			target:  "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend",
+			body:    `{"days":-1}`,
+			wantErr: true,
+		},
+		{
+			name:    "too large body rejected",
+			target:  "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend",
+			body:    `{"days":366}`,
+			wantErr: true,
+		},
+		{
+			name:    "malformed body rejected",
+			target:  "/api/downloads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/extend",
+			body:    `{`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, tt.target, strings.NewReader(tt.body))
+
+			got, err := parseExtendDays(req)
+
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("parseExtendDays() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseExtendDays() error = %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("parseExtendDays() = %d, want %d", got, tt.want)
 			}
 		})
 	}

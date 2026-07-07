@@ -398,7 +398,7 @@ body.has-player .downloads-panel {
   display: block;
   width: 1.05rem;
   height: 1.05rem;
-  background: currentColor;
+  background: currentcolor;
 }
 
 .download-action.delete::before {

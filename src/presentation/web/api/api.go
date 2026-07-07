@@ -167,7 +167,12 @@ func (s *HttpServer) handleDownloadAction(w http.ResponseWriter, r *http.Request
 	}
 	id := parts[0]
 
-	if r.Method == http.MethodDelete && len(parts) == 1 {
+	if len(parts) == 1 {
+		if r.Method != http.MethodDelete {
+			w.Header().Set("Allow", http.MethodDelete)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		if err := s.mgr.DeleteDownload(r.Context(), id); err != nil {
 			http.Error(w, err.Error(), downloadErrorStatus(err))
 			return
@@ -176,7 +181,12 @@ func (s *HttpServer) handleDownloadAction(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "extend" {
+	if len(parts) == 2 && parts[1] == "extend" {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
 		days, err := parseExtendDays(r)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)

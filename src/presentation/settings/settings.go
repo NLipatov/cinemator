@@ -35,27 +35,27 @@ func NewSettings() Settings {
 	}
 }
 
-func (s *Settings) HlsPath() string {
+func (s Settings) HlsPath() string {
 	return s.hlsPath
 }
 
-func (s *Settings) DownloadPath() string {
+func (s Settings) DownloadPath() string {
 	return s.downloadPath
 }
 
-func (s *Settings) ViewerTimeout() time.Duration {
+func (s Settings) ViewerTimeout() time.Duration {
 	return s.viewerTimeout
 }
 
-func (s *Settings) MaxCacheBytes() int64 {
+func (s Settings) MaxCacheBytes() int64 {
 	return s.maxCacheBytes
 }
 
-func (s *Settings) HttpPort() int {
+func (s Settings) HttpPort() int {
 	return s.httpPort
 }
 
-func (s *Settings) TorrentPort() int {
+func (s Settings) TorrentPort() int {
 	return s.torrentPort
 }
 

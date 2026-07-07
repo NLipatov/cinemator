@@ -283,9 +283,6 @@ func (m *manager) DeleteDownload(ctx context.Context, id string) error {
 	if err := m.removeDownloadHlsDirs(id); err != nil {
 		return err
 	}
-	if err := os.RemoveAll(filepath.Join(m.settings.DownloadPath(), id)); err != nil {
-		return err
-	}
 	if err := m.downloads.delete(ctx, id); err != nil {
 		return err
 	}
@@ -306,6 +303,9 @@ func (m *manager) SubscribeDownloadEvents(ctx context.Context) <-chan struct{} {
 }
 
 func (m *manager) notifyDownloadsChanged() {
+	if m.events == nil {
+		return
+	}
 	m.events.notify()
 }
 
@@ -471,13 +471,18 @@ func (m *manager) finishConversion(key streamKey, s *streamInfo, runID uint64, e
 		log.Printf("Stream conversion error for key=%v: %v", key, err)
 	}
 	s.running = false
+	notifyCompleted := false
 	if err == nil {
 		s.completed = true
 		s.paused = false
+		notifyCompleted = true
 	} else if errors.Is(err, context.Canceled) {
 		s.paused = true
 	}
 	m.mu.Unlock()
+	if notifyCompleted {
+		m.notifyDownloadsChanged()
+	}
 
 	if err != nil && !errors.Is(err, context.Canceled) {
 		m.cleanupIfCurrentRun(key, s, runID)
