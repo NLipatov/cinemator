@@ -2,6 +2,7 @@ package api
 
 import (
 	"cinemator/application"
+	"cinemator/domain"
 	"cinemator/infrastructure/hls"
 	"cinemator/infrastructure/torrent"
 	"cinemator/presentation/settings"
@@ -9,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -44,10 +46,14 @@ func (s *HttpServer) Run() error {
 	// http-web client endpoints
 	http.Handle("/", http.FileServer(http.Dir("presentation/web/client/index")))
 	http.Handle("/favicon.ico", http.FileServer(http.Dir("presentation/web/client/static")))
+	http.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir("presentation/web/client/static/assets"))))
 
 	// http-api endpoints
 	http.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
 	http.HandleFunc("/api/media/info", s.handleGetMediaInfo)
+	http.HandleFunc("/api/downloads", s.handleListDownloads)
+	http.HandleFunc("/api/downloads/events", s.handleDownloadEvents)
+	http.HandleFunc("/api/downloads/", s.handleDownloadAction)
 	http.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
 	http.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
@@ -88,6 +94,106 @@ func (s *HttpServer) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) 
 	_ = json.NewEncoder(w).Encode(info)
 }
 
+func (s *HttpServer) handleListDownloads(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	downloads, err := s.mgr.ListDownloads(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, downloads)
+}
+
+func (s *HttpServer) handleDownloadEvents(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	events := s.mgr.SubscribeDownloadEvents(r.Context())
+	header := w.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("Connection", "keep-alive")
+	header.Set("X-Accel-Buffering", "no")
+
+	if err := writeSSEEvent(w, "changed"); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	keepAlive := time.NewTicker(25 * time.Second)
+	defer keepAlive.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case _, ok := <-events:
+			if !ok {
+				return
+			}
+			if err := writeSSEEvent(w, "changed"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-keepAlive.C:
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+func (s *HttpServer) handleDownloadAction(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/api/downloads/")
+	if strings.Trim(rest, "/") == "" {
+		s.handleListDownloads(w, r)
+		return
+	}
+	parts := strings.Split(strings.Trim(rest, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.Error(w, "download id required", http.StatusBadRequest)
+		return
+	}
+	id := parts[0]
+
+	if r.Method == http.MethodDelete && len(parts) == 1 {
+		if err := s.mgr.DeleteDownload(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), downloadErrorStatus(err))
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if r.Method == http.MethodPost && len(parts) == 2 && parts[1] == "extend" {
+		days, err := parseExtendDays(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		download, err := s.mgr.ExtendDownload(r.Context(), id, time.Duration(days)*24*time.Hour)
+		if err != nil {
+			http.Error(w, err.Error(), downloadErrorStatus(err))
+			return
+		}
+		writeJSON(w, download)
+		return
+	}
+
+	http.Error(w, "not found", http.StatusNotFound)
+}
+
 func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
 	magnet, fileIndex, err := parseMagnetAndFile(r)
 	if err != nil {
@@ -118,6 +224,60 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		w, r,
 		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/"+filepath.Base(playlist),
 		http.StatusFound)
+}
+
+func parseExtendDays(r *http.Request) (int, error) {
+	const (
+		defaultDays = 7
+		maxDays     = 365
+	)
+	if raw := r.URL.Query().Get("days"); raw != "" {
+		days, err := strconv.Atoi(raw)
+		if err != nil || days <= 0 || days > maxDays {
+			return 0, errors.New("days must be between 1 and 365")
+		}
+		return days, nil
+	}
+
+	var body struct {
+		Days int `json:"days"`
+	}
+	if r.Body == nil {
+		return defaultDays, nil
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if errors.Is(err, io.EOF) {
+			return defaultDays, nil
+		}
+		return 0, errors.New("bad extend request")
+	}
+	if body.Days == 0 {
+		return defaultDays, nil
+	}
+	if body.Days < 0 || body.Days > maxDays {
+		return 0, errors.New("days must be between 1 and 365")
+	}
+	return body.Days, nil
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeSSEEvent(w io.Writer, event string) error {
+	_, err := fmt.Fprintf(w, "event: %s\ndata: {}\n\n", event)
+	return err
+}
+
+func downloadErrorStatus(err error) int {
+	if errors.Is(err, domain.ErrBadDownloadID) {
+		return http.StatusBadRequest
+	}
+	if errors.Is(err, domain.ErrDownloadNotFound) {
+		return http.StatusNotFound
+	}
+	return http.StatusInternalServerError
 }
 
 func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {

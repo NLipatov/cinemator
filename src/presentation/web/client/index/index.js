@@ -31,11 +31,24 @@
     let lastPlaybackRecoveryAt = 0;
     let lastStreamActivityAt = 0;
     let forcedRecoveryAttempts = 0;
+    let downloadCatalog = [];
+    let downloadsLoading = false;
+    let downloadsRefreshQueued = false;
+    let downloadEvents = null;
+    let downloadFallbackPolling = false;
+    let downloadPollingTimer = null;
     let requestSeq = 0;
     const idleRecoveryMs = 12 * 60 * 1000;
     const recoveryThrottleMs = 5000;
     const stallRecoveryDelayMs = 3500;
     const maxForcedRecoveryAttempts = 3;
+    const downloadFallbackInitialMs = 5000;
+    const downloadFallbackPollingMs = 30000;
+    const extendOptions = [
+      { days: 1, label: '1 day' },
+      { days: 7, label: '7 days' },
+      { days: 30, label: '30 days' },
+    ];
     const nextRequest = () => ++requestSeq;
     const isStale = id => id !== requestSeq;
     function destroyVideoAndHls({ resetLayout = true } = {}) {
@@ -52,6 +65,12 @@
     }
     function setOptions(select, options) {
       select.replaceChildren(...options.map(({ value, label }) => new Option(label, String(value))));
+    }
+    function setFileList(files) {
+      setOptions($('filelist'), files.map(f => ({
+        value: f.index,
+        label: `${f.name} (${formatBytes(f.size)})`,
+      })));
     }
     function showMsg(id, msg, isErr=false, loader=false) {
       clearTimeout(msgTimeout);
@@ -90,6 +109,324 @@
       clearSubtitleWait();
       $('warnMsg').hidden = true;
     }
+
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let value = bytes;
+      let idx = 0;
+      while (value >= 1024 && idx < units.length - 1) {
+        value /= 1024;
+        idx++;
+      }
+      const digits = value >= 10 || idx === 0 ? 0 : 1;
+      return `${value.toFixed(digits)} ${units[idx]}`;
+    }
+
+    function formatExpiry(value) {
+      const expires = new Date(value);
+      if (!Number.isFinite(expires.getTime())) return 'no expiry';
+      const diffMs = expires.getTime() - Date.now();
+      const absMs = Math.abs(diffMs);
+      const units = [
+        { label: 'd', ms: 24 * 60 * 60 * 1000 },
+        { label: 'h', ms: 60 * 60 * 1000 },
+        { label: 'm', ms: 60 * 1000 },
+      ];
+      const unit = units.find(u => absMs >= u.ms) || units[units.length - 1];
+      const valueRounded = Math.max(1, Math.round(absMs / unit.ms));
+      return diffMs < 0 ? `expired ${valueRounded}${unit.label} ago` : `${valueRounded}${unit.label} left`;
+    }
+
+    function closeExtendMenus(except = null) {
+      document.querySelectorAll('.download-menu.open').forEach(menu => {
+        if (menu === except) return;
+        menu.classList.remove('open');
+        const popup = menu.querySelector('.download-extend-menu');
+        const toggle = menu.querySelector('button[data-action="toggle-extend"]');
+        if (popup) popup.hidden = true;
+        if (toggle) toggle.setAttribute('aria-expanded', 'false');
+      });
+    }
+
+    function toggleExtendMenu(toggle) {
+      const menu = toggle.closest('.download-menu');
+      if (!menu) return;
+      const popup = menu.querySelector('.download-extend-menu');
+      if (!popup) return;
+      const willOpen = popup.hidden;
+      closeExtendMenus(menu);
+      popup.hidden = !willOpen;
+      menu.classList.toggle('open', willOpen);
+      toggle.setAttribute('aria-expanded', String(willOpen));
+    }
+
+    function createExtendMenu(downloadID) {
+      const extendMenu = document.createElement('div');
+      extendMenu.className = 'download-menu download-expiry-menu';
+      const extendBtn = document.createElement('button');
+      extendBtn.type = 'button';
+      extendBtn.className = 'download-expiry-extend';
+      extendBtn.dataset.action = 'toggle-extend';
+      extendBtn.dataset.id = downloadID;
+      extendBtn.title = 'Extend download';
+      extendBtn.setAttribute('aria-label', 'Extend download');
+      extendBtn.setAttribute('aria-haspopup', 'menu');
+      extendBtn.setAttribute('aria-expanded', 'false');
+      extendBtn.textContent = '+';
+
+      const popup = document.createElement('div');
+      popup.className = 'download-extend-menu';
+      popup.setAttribute('role', 'menu');
+      popup.hidden = true;
+      extendOptions.forEach(({ days, label }) => {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'download-menu-item';
+        item.dataset.action = 'extend';
+        item.dataset.id = downloadID;
+        item.dataset.days = String(days);
+        item.setAttribute('role', 'menuitem');
+        item.textContent = label;
+        popup.appendChild(item);
+      });
+      extendMenu.append(extendBtn, popup);
+      return extendMenu;
+    }
+
+    function renderDownloads(downloads) {
+      const list = $('downloadsList');
+      list.textContent = '';
+      if (!downloads.length) {
+        const empty = document.createElement('div');
+        empty.className = 'downloads-empty';
+        empty.textContent = 'No downloads yet';
+        list.appendChild(empty);
+        return;
+      }
+
+      downloads.forEach(download => {
+        const row = document.createElement('div');
+        row.className = 'download-row';
+        row.dataset.id = download.id;
+        row.tabIndex = 0;
+        row.setAttribute('role', 'button');
+        row.setAttribute('aria-label', `Open ${download.title || download.id}`);
+
+        const main = document.createElement('div');
+        main.className = 'download-main';
+        const titleRow = document.createElement('div');
+        titleRow.className = 'download-title-row';
+        const title = document.createElement('div');
+        title.className = 'download-title';
+        title.textContent = download.title || `Torrent ${download.id.slice(0, 8)}`;
+        titleRow.appendChild(title);
+        const subtitle = document.createElement('div');
+        subtitle.className = 'download-subtitle';
+        subtitle.textContent = download.id;
+        main.append(titleRow, subtitle);
+
+        const meta = document.createElement('div');
+        meta.className = 'download-meta';
+        const metaText = document.createElement('span');
+        metaText.className = 'download-meta-text';
+        metaText.textContent = `${formatBytes(download.size)} · ${formatExpiry(download.expiresAt)}`;
+        meta.append(metaText, createExtendMenu(download.id));
+
+        const actions = document.createElement('div');
+        actions.className = 'download-actions';
+
+        const deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'download-action input-style delete icon-only';
+        deleteBtn.dataset.action = 'delete';
+        deleteBtn.dataset.id = download.id;
+        deleteBtn.title = 'Delete';
+        deleteBtn.setAttribute('aria-label', 'Delete');
+
+        actions.append(deleteBtn);
+
+        row.append(main, meta, actions);
+        list.appendChild(row);
+      });
+    }
+
+    async function loadDownloads({ quiet = false, suppressError = false } = {}) {
+      if (downloadsLoading) {
+        downloadsRefreshQueued = true;
+        return;
+      }
+      downloadsLoading = true;
+      if (!quiet) showMsg('downloadsMsg', 'Loading downloads...', false, true);
+      try {
+        const res = await fetch('/api/downloads');
+        if (!res.ok) throw new Error('Could not load downloads');
+        downloadCatalog = await res.json();
+        renderDownloads(downloadCatalog);
+        if (!quiet) showMsg('downloadsMsg', '');
+      } catch (e) {
+        if (!suppressError) {
+          showMsg('downloadsMsg', e.message || 'Could not load downloads', true);
+        }
+      } finally {
+        downloadsLoading = false;
+        if (downloadsRefreshQueued) {
+          downloadsRefreshQueued = false;
+          loadDownloads({ quiet: true, suppressError: true });
+        }
+      }
+    }
+
+    function findDownload(id) {
+      return downloadCatalog.find(download => download.id === id);
+    }
+
+    function openDownload(download) {
+      if (!download || !download.magnet || !download.files || download.files.length === 0) {
+        showMsg('downloadsMsg', 'Download metadata is incomplete', true);
+        return;
+      }
+      nextRequest();
+      destroyVideoAndHls();
+      $('magnet').value = download.magnet;
+      setFileList(download.files);
+      $('step-files').style.display = '';
+      $('step-tracks').style.display = 'none';
+      $('player-block').style.display = 'none';
+      showMsg('magnetMsg', '');
+      showMsg('fileMsg', '');
+      showMsg('trackMsg', '');
+      showMsg('downloadsMsg', '');
+      removeWarning();
+    }
+
+    async function extendDownload(id, days) {
+      showMsg('downloadsMsg', 'Extending download...', false, true);
+      try {
+        const res = await fetch(`/api/downloads/${encodeURIComponent(id)}/extend`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ days }),
+        });
+        if (!res.ok) throw new Error('Could not extend download');
+        await loadDownloads({ quiet: true });
+        showMsg('downloadsMsg', `Download extended by ${days}d`);
+      } catch (e) {
+        showMsg('downloadsMsg', e.message || 'Could not extend download', true);
+      }
+    }
+
+    async function deleteDownload(id) {
+      const download = findDownload(id);
+      if (!download || !window.confirm(`Delete ${download.title || id}?`)) return;
+      showMsg('downloadsMsg', 'Deleting download...', false, true);
+      try {
+        const res = await fetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error('Could not delete download');
+        if ($('magnet').value.trim() === download.magnet) {
+          nextRequest();
+          destroyVideoAndHls();
+          $('magnet').value = '';
+          $('filelist').textContent = '';
+          $('step-files').style.display = 'none';
+          $('step-tracks').style.display = 'none';
+          $('player-block').style.display = 'none';
+          removeWarning();
+        }
+        await loadDownloads({ quiet: true });
+        showMsg('downloadsMsg', 'Download deleted');
+      } catch (e) {
+        showMsg('downloadsMsg', e.message || 'Could not delete download', true);
+      }
+    }
+
+    function stopDownloadFallbackPolling() {
+      downloadFallbackPolling = false;
+      if (downloadPollingTimer) {
+        clearTimeout(downloadPollingTimer);
+        downloadPollingTimer = null;
+      }
+    }
+
+    function scheduleDownloadFallbackPolling(delay = downloadFallbackPollingMs) {
+      downloadFallbackPolling = true;
+      if (downloadPollingTimer) return;
+      downloadPollingTimer = setTimeout(() => {
+        downloadPollingTimer = null;
+        if (!downloadFallbackPolling) return;
+        if (document.visibilityState !== 'hidden') {
+          loadDownloads({ quiet: true, suppressError: true });
+        }
+        scheduleDownloadFallbackPolling(downloadFallbackPollingMs);
+      }, delay);
+    }
+
+    function startDownloadEvents() {
+      if (!window.EventSource) {
+        scheduleDownloadFallbackPolling(0);
+        return;
+      }
+
+      const events = new EventSource('/api/downloads/events');
+      downloadEvents = events;
+      events.addEventListener('open', () => {
+        if (downloadEvents === events) stopDownloadFallbackPolling();
+      });
+      events.addEventListener('changed', () => {
+        loadDownloads({ quiet: true, suppressError: true });
+      });
+      events.addEventListener('error', () => {
+        if (downloadEvents === events) scheduleDownloadFallbackPolling(downloadFallbackInitialMs);
+      });
+    }
+
+    $('downloadsList').addEventListener('click', e => {
+      const extendToggle = e.target.closest('button[data-action="toggle-extend"][data-id]');
+      if (extendToggle) {
+        toggleExtendMenu(extendToggle);
+        return;
+      }
+      const btn = e.target.closest('button[data-action][data-id]');
+      if (btn) {
+        if (btn.dataset.action === 'extend') {
+          closeExtendMenus();
+          extendDownload(btn.dataset.id, parseInt(btn.dataset.days || '7', 10));
+        }
+        if (btn.dataset.action === 'delete') deleteDownload(btn.dataset.id);
+        return;
+      }
+
+      const row = e.target.closest('.download-row[data-id]');
+      if (row) openDownload(findDownload(row.dataset.id));
+    });
+    $('downloadsList').addEventListener('keydown', e => {
+      const row = e.target.closest('.download-row[data-id]');
+      if (!row || e.target !== row) return;
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        openDownload(findDownload(row.dataset.id));
+      }
+    });
+    document.addEventListener('click', e => {
+      if (!e.target.closest('.download-menu')) closeExtendMenus();
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeExtendMenus();
+    });
+    window.addEventListener('focus', () => {
+      loadDownloads({ quiet: true, suppressError: true });
+    });
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        loadDownloads({ quiet: true, suppressError: true });
+      }
+    });
+    window.addEventListener('beforeunload', () => {
+      if (downloadEvents) downloadEvents.close();
+    });
+    loadDownloads();
+    startDownloadEvents();
+
     $('form').onsubmit = async e => {
       e.preventDefault();
       const magnet = $('magnet').value.trim();
@@ -111,12 +448,10 @@
         const files = await res.json();
         if (isStale(requestId)) return;
         if (!files.length) throw new Error('No playable files found in torrent');
-        setOptions($('filelist'), files.map(f => ({
-          value: f.index,
-          label: `${f.name} (${(f.size/1048576).toFixed(2)} MB)`,
-        })));
+        setFileList(files);
         $('step-files').style.display = '';
         showMsg('magnetMsg', '');
+        loadDownloads({ quiet: true });
       } catch (e) {
         if (isStale(requestId)) return;
         showMsg('magnetMsg', e.message || 'Error loading files', true);
@@ -147,6 +482,7 @@
         if (!res.ok) throw new Error('Could not load media info');
         const info = await res.json();
         if (isStale(requestId)) return;
+        loadDownloads({ quiet: true });
 
         const audioCount = info.audioTracks ? info.audioTracks.length : 0;
         const subCount = info.subtitles ? info.subtitles.length : 0;
@@ -240,6 +576,7 @@
         $('player-block').style.display = '';
         document.body.classList.add('has-player');
         playHls(m3u8, subtitleSelected, resumeTime);
+        loadDownloads({ quiet: true });
       } catch (e) {
         if (isStale(requestId)) return;
         removeWarning();
