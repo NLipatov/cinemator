@@ -138,6 +138,11 @@
       return diffMs < 0 ? `expired ${valueRounded}${unit.label} ago` : `${valueRounded}${unit.label} left`;
     }
 
+    function formatDownloadSize(download) {
+      const diskSize = Number.isFinite(download.diskSize) ? download.diskSize : 0;
+      return `${formatBytes(diskSize)} / ${formatBytes(download.size)}`;
+    }
+
     function closeExtendMenus(except = null) {
       document.querySelectorAll('.download-menu.open').forEach(menu => {
         if (menu === except) return;
@@ -230,7 +235,7 @@
         meta.className = 'download-meta';
         const metaText = document.createElement('span');
         metaText.className = 'download-meta-text';
-        metaText.textContent = `${formatBytes(download.size)} · ${formatExpiry(download.expiresAt)}`;
+        metaText.textContent = `${formatDownloadSize(download)} · ${formatExpiry(download.expiresAt)}`;
         meta.append(metaText, createExtendMenu(download.id));
 
         const actions = document.createElement('div');
@@ -570,7 +575,7 @@
       }
       try {
         const resp = await fetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}`, { redirect: 'follow' });
-        if (!resp.ok) throw new Error('Stream error');
+        if (!resp.ok) throw new Error((await resp.text()).trim() || 'Stream error');
         if (isStale(requestId)) return;
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
         $('player-block').style.display = '';

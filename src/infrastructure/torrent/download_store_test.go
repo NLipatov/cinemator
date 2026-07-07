@@ -33,11 +33,17 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 	if download.Size != 14 {
 		t.Fatalf("download size = %d, want 14", download.Size)
 	}
+	if download.DiskSize != 0 {
+		t.Fatalf("download disk size = %d, want 0", download.DiskSize)
+	}
 	if download.Status != domain.DownloadStatusReady {
 		t.Fatalf("download status = %q, want ready", download.Status)
 	}
 	if _, err := os.Stat(filepath.Join(store.root, id, downloadStoreDirName, "metadata.json")); err != nil {
 		t.Fatalf("metadata not written inside download dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(store.root, id, "payload.bin"), []byte("payload"), 0644); err != nil {
+		t.Fatalf("write payload file: %v", err)
 	}
 
 	downloads, err := store.list(context.Background())
@@ -46,6 +52,9 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 	}
 	if len(downloads) != 1 || downloads[0].ID != id {
 		t.Fatalf("list() = %#v, want one download with id %s", downloads, id)
+	}
+	if downloads[0].DiskSize <= 0 {
+		t.Fatalf("listed download disk size = %d, want positive", downloads[0].DiskSize)
 	}
 
 	extended, err := store.extend(context.Background(), id, 24*time.Hour)

@@ -250,7 +250,7 @@ body.has-player .downloads-panel {
 
 .download-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 10rem 2.45rem;
+  grid-template-columns: minmax(0, 1fr) minmax(11.5rem, max-content) 2.45rem;
   align-items: center;
   gap: 0.7rem;
   padding: 0.7rem 0;

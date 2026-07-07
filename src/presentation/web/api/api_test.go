@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -148,6 +150,30 @@ func TestHandleDownloadEventsStreamsChangedEvents(t *testing.T) {
 	events <- struct{}{}
 	if block := readSSEBlock(t, reader); !strings.Contains(block, "event: changed\n") {
 		t.Fatalf("changed SSE block = %q, want changed event", block)
+	}
+}
+
+func TestReadMediaPlaylistWithWaitWaitsForSegment(t *testing.T) {
+	dir := t.TempDir()
+	playlist := filepath.Join(dir, "subs.m3u8")
+	if err := os.WriteFile(playlist, []byte("#EXTM3U\n#EXT-X-TARGETDURATION:4\n"), 0644); err != nil {
+		t.Fatalf("write empty playlist: %v", err)
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		data := "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.000,\nsubs_00000.vtt\n"
+		_ = os.WriteFile(playlist, []byte(data), 0644)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	data, err := readMediaPlaylistWithWait(ctx, playlist, time.Second)
+	if err != nil {
+		t.Fatalf("readMediaPlaylistWithWait() error = %v", err)
+	}
+	if !strings.Contains(string(data), "subs_00000.vtt") {
+		t.Fatalf("playlist = %q, want segment uri", data)
 	}
 }
 

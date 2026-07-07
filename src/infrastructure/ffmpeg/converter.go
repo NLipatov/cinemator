@@ -53,9 +53,6 @@ func (c *Converter) ConvertToHLS() error {
 	// --- 2. decide subtitle strategy ---------------------------------
 	hasSubtitle := c.selection.SubtitleTrackIndex >= 0 && c.selection.SubtitleTrackIndex < len(info.Subtitles)
 	textSubtitle := hasSubtitle && !isBitmapSubtitle(info.Subtitles[c.selection.SubtitleTrackIndex].Codec)
-	if textSubtitle {
-		_ = c.writeEmptySubtitlePlaylist()
-	}
 
 	// --- 3. build the final ffmpeg CLI --------------------------------
 	videoSel := c.selection
@@ -84,7 +81,7 @@ func (c *Converter) ConvertToHLS() error {
 	}
 
 	masterReady := make(chan error, 1)
-	go func() { masterReady <- c.writeMasterAfterVideoReady(info, textSubtitle) }()
+	go func() { masterReady <- c.writeMasterAfterRenditionsReady(info, textSubtitle) }()
 
 	subtitleDone := subtitleErrCh == nil
 	videoDone := false
@@ -144,9 +141,15 @@ func (c *Converter) subtitleArgs(subIdx int) []string {
 	}
 }
 
-func (c *Converter) writeMasterAfterVideoReady(info domain.MediaInfo, withSubs bool) error {
-	if err := waitForPlaylistSegment(c.ctx, c.videoList, 20*time.Minute); err != nil {
+func (c *Converter) writeMasterAfterRenditionsReady(info domain.MediaInfo, withSubs bool) error {
+	const readinessTimeout = 20 * time.Minute
+	if err := waitForPlaylistSegment(c.ctx, c.videoList, readinessTimeout); err != nil {
 		return err
+	}
+	if withSubs {
+		if err := waitForPlaylistSegment(c.ctx, c.subList, readinessTimeout); err != nil {
+			return fmt.Errorf("subtitle playlist not ready: %w", err)
+		}
 	}
 
 	lang := ""
@@ -155,11 +158,6 @@ func (c *Converter) writeMasterAfterVideoReady(info domain.MediaInfo, withSubs b
 	}
 	masterData := buildMasterPlaylist(filepath.Base(c.videoList), filepath.Base(c.subList), withSubs, lang)
 	return os.WriteFile(c.master, []byte(masterData), 0644)
-}
-
-func (c *Converter) writeEmptySubtitlePlaylist() error {
-	data := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n"
-	return os.WriteFile(c.subList, []byte(data), 0644)
 }
 
 func waitForPlaylistSegment(ctx context.Context, path string, timeout time.Duration) error {

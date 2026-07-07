@@ -25,6 +25,7 @@ type Download struct {
 	Title          string         `json:"title"`
 	Status         DownloadStatus `json:"status"`
 	Size           int64          `json:"size"`
+	DiskSize       int64          `json:"diskSize,omitempty"`
 	Files          []FileInfo     `json:"files"`
 	CreatedAt      time.Time      `json:"createdAt"`
 	UpdatedAt      time.Time      `json:"updatedAt"`

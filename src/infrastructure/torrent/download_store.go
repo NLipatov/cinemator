@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -71,6 +73,7 @@ func (s *downloadStore) upsert(ctx context.Context, id, magnet string, files []d
 	if err := s.writeLocked(download); err != nil {
 		return domain.Download{}, err
 	}
+	download.DiskSize = s.diskSizeLocked(id)
 	return download, nil
 }
 
@@ -111,6 +114,7 @@ func (s *downloadStore) list(ctx context.Context) ([]domain.Download, error) {
 		} else if download.Status == domain.DownloadStatusExpired {
 			download.Status = domain.DownloadStatusReady
 		}
+		download.DiskSize = s.diskSizeLocked(entry.Name())
 		downloads = append(downloads, download)
 	}
 	sort.SliceStable(downloads, func(i, j int) bool {
@@ -223,6 +227,7 @@ func (s *downloadStore) extend(ctx context.Context, id string, extension time.Du
 	if err := s.writeLocked(download); err != nil {
 		return domain.Download{}, err
 	}
+	download.DiskSize = s.diskSizeLocked(id)
 	return download, nil
 }
 
@@ -275,6 +280,7 @@ func (s *downloadStore) writeLocked(download domain.Download) error {
 		return err
 	}
 	download.ID = id
+	download.DiskSize = 0
 	data, err := json.MarshalIndent(download, "", "  ")
 	if err != nil {
 		return err
@@ -299,6 +305,68 @@ func (s *downloadStore) downloadDir(id string) string {
 
 func (s *downloadStore) metadataPath(id string) string {
 	return filepath.Join(s.downloadDir(id), downloadStoreDirName, "metadata.json")
+}
+
+func (s *downloadStore) diskSizeLocked(id string) int64 {
+	var total int64
+	_ = filepath.WalkDir(s.downloadDir(id), func(_ string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if entry.IsDir() {
+			if entry.Name() == downloadStoreDirName {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil
+		}
+		total += allocatedFileSize(info)
+		return nil
+	})
+	return total
+}
+
+func allocatedFileSize(info fs.FileInfo) int64 {
+	if blocks, ok := fileBlocks(info); ok && blocks > 0 {
+		return blocks * 512
+	}
+	return info.Size()
+}
+
+func fileBlocks(info fs.FileInfo) (int64, bool) {
+	sys := info.Sys()
+	if sys == nil {
+		return 0, false
+	}
+	value := reflect.ValueOf(sys)
+	if value.Kind() == reflect.Ptr {
+		if value.IsNil() {
+			return 0, false
+		}
+		value = value.Elem()
+	}
+	if value.Kind() != reflect.Struct {
+		return 0, false
+	}
+	field := value.FieldByName("Blocks")
+	if !field.IsValid() {
+		return 0, false
+	}
+	switch field.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return field.Int(), true
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		blocks := field.Uint()
+		if blocks > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(blocks), true
+	default:
+		return 0, false
+	}
 }
 
 func cleanInfoHash(id string) (string, error) {

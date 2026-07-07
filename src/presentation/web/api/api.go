@@ -303,10 +303,10 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(clean, ".m3u8") {
 		var data []byte
 		var err error
-		if path.Base(clean) == "index.m3u8" {
-			data, err = readMediaPlaylistWithWait(r.Context(), fullPath, waitTimeout)
-		} else {
+		if path.Base(clean) == "master.m3u8" {
 			data, err = readWithWait(r.Context(), fullPath, waitTimeout)
+		} else {
+			data, err = readMediaPlaylistWithWait(r.Context(), fullPath, waitTimeout)
 		}
 		if err != nil {
 			http.Error(w, "playlist not found", 404)

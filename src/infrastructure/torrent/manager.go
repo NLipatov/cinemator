@@ -150,7 +150,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		resumed := false
 		s.mtx.Lock()
 		s.lastView = time.Now()
-		needResume := s.paused || s.cancel == nil
+		needResume := !s.completed && (s.paused || s.cancel == nil)
 		s.mtx.Unlock()
 		if needResume {
 			m.startConversionLocked(key, s)
@@ -179,7 +179,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		resumed := false
 		s.mtx.Lock()
 		s.lastView = time.Now()
-		needResume := s.paused || s.cancel == nil
+		needResume := !s.completed && (s.paused || s.cancel == nil)
 		s.mtx.Unlock()
 		if needResume {
 			m.startConversionLocked(key, s)
@@ -316,7 +316,9 @@ func (m *manager) downloadStatuses() map[string]domain.DownloadStatus {
 	for key, stream := range m.active {
 		status := domain.DownloadStatusStreaming
 		stream.mtx.Lock()
-		if stream.paused {
+		if stream.completed {
+			status = domain.DownloadStatusReady
+		} else if stream.paused {
 			status = domain.DownloadStatusPaused
 		}
 		stream.mtx.Unlock()
@@ -469,7 +471,10 @@ func (m *manager) finishConversion(key streamKey, s *streamInfo, runID uint64, e
 		log.Printf("Stream conversion error for key=%v: %v", key, err)
 	}
 	s.running = false
-	if errors.Is(err, context.Canceled) {
+	if err == nil {
+		s.completed = true
+		s.paused = false
+	} else if errors.Is(err, context.Canceled) {
 		s.paused = true
 	}
 	m.mu.Unlock()

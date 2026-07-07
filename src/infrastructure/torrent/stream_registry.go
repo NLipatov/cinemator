@@ -95,7 +95,7 @@ func (m *manager) pauseStream(key streamKey) {
 		m.mu.Unlock()
 		return
 	}
-	if s.paused {
+	if s.paused || s.completed || !s.running {
 		m.mu.Unlock()
 		return
 	}
@@ -112,7 +112,7 @@ func (m *manager) pauseStream(key streamKey) {
 }
 
 func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
-	if s.running {
+	if s.running || s.completed {
 		return
 	}
 	if err := resetStreamOutput(s.paths); err != nil {
@@ -163,7 +163,7 @@ func (m *manager) viewerWatcher() {
 				readyClosed = true
 			default:
 			}
-			idle := readyClosed && now.Sub(s.lastView) > idlePauseTimeout
+			idle := readyClosed && s.running && !s.completed && now.Sub(s.lastView) > idlePauseTimeout
 			noViewers := now.Sub(s.lastView) > m.settings.ViewerTimeout()
 			s.mtx.Unlock()
 			if idle && !s.paused {
