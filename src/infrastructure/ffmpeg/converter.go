@@ -15,14 +15,15 @@ import (
 
 // Converter wraps "probe → decide arguments → run ffmpeg".
 type Converter struct {
-	ctx       context.Context
-	inputURL  string
-	analyzer  SampleAnalyzer
-	builder   ArgsBuilder     // builds CLI args for ffmpeg
-	selection StreamSelection // which audio/subtitle tracks to use
-	videoList string
-	subList   string
-	master    string
+	ctx        context.Context
+	inputURL   string
+	analyzer   SampleAnalyzer
+	builder    ArgsBuilder     // builds CLI args for ffmpeg
+	selection  StreamSelection // which audio/subtitle tracks to use
+	videoList  string
+	subList    string
+	rawSubList string
+	master     string
 }
 
 func NewURLConverter(ctx context.Context,
@@ -31,14 +32,15 @@ func NewURLConverter(ctx context.Context,
 	selection StreamSelection,
 ) *Converter {
 	return &Converter{
-		ctx:       ctx,
-		inputURL:  inputURL,
-		analyzer:  SampleAnalyzer{},
-		builder:   ArgsBuilder{OutDir: outDir, Playlist: videoPlaylist, Input: inputURL},
-		selection: selection,
-		videoList: videoPlaylist,
-		subList:   subtitlePlaylist,
-		master:    masterPlaylist,
+		ctx:        ctx,
+		inputURL:   inputURL,
+		analyzer:   SampleAnalyzer{},
+		builder:    ArgsBuilder{OutDir: outDir, Playlist: videoPlaylist, Input: inputURL},
+		selection:  selection,
+		videoList:  videoPlaylist,
+		subList:    subtitlePlaylist,
+		rawSubList: filepath.Join(outDir, "subs.raw.m3u8"),
+		master:     masterPlaylist,
 	}
 }
 
@@ -70,6 +72,7 @@ func (c *Converter) ConvertToHLS() error {
 	}()
 
 	var subtitleErrCh chan error
+	var subtitlePlaylistErrCh chan error
 	if textSubtitle {
 		subtitleErrCh = make(chan error, 1)
 		go func() {
@@ -78,12 +81,19 @@ func (c *Converter) ConvertToHLS() error {
 			err := c.runFFmpeg(subArgs)
 			subtitleErrCh <- err
 		}()
+
+		subtitlePlaylistErrCh = make(chan error, 1)
+		go func() {
+			err := c.writeNormalizedSubtitlePlaylist()
+			subtitlePlaylistErrCh <- err
+		}()
 	}
 
 	masterReady := make(chan error, 1)
 	go func() { masterReady <- c.writeMasterAfterRenditionsReady(info, textSubtitle) }()
 
 	subtitleDone := subtitleErrCh == nil
+	subtitlePlaylistDone := subtitlePlaylistErrCh == nil
 	videoDone := false
 	masterDone := false
 
@@ -96,7 +106,7 @@ func (c *Converter) ConvertToHLS() error {
 			if err != nil {
 				return err
 			}
-			if videoDone && subtitleDone && masterDone {
+			if videoDone && subtitleDone && subtitlePlaylistDone && masterDone {
 				return nil
 			}
 		case err := <-masterReady:
@@ -104,7 +114,7 @@ func (c *Converter) ConvertToHLS() error {
 			if err != nil {
 				return err
 			}
-			if videoDone && subtitleDone && masterDone {
+			if videoDone && subtitleDone && subtitlePlaylistDone && masterDone {
 				return nil
 			}
 		case err := <-subtitleErrCh:
@@ -113,7 +123,15 @@ func (c *Converter) ConvertToHLS() error {
 				log.Printf("Subtitle stream error: %v", err)
 				return err
 			}
-			if videoDone && subtitleDone && masterDone {
+			if videoDone && subtitleDone && subtitlePlaylistDone && masterDone {
+				return nil
+			}
+		case err := <-subtitlePlaylistErrCh:
+			subtitlePlaylistDone = true
+			if err != nil {
+				return err
+			}
+			if videoDone && subtitleDone && subtitlePlaylistDone && masterDone {
 				return nil
 			}
 		}
@@ -133,12 +151,23 @@ func (c *Converter) subtitleArgs(subIdx int) []string {
 		"-c:s", "webvtt",
 		"-f", "segment",
 		"-segment_time", "4",
-		"-segment_list", c.subList,
+		"-segment_list", c.rawSubList,
 		"-segment_list_type", "m3u8",
 		"-segment_list_size", "0",
 		"-segment_format", "webvtt",
 		filepath.Join(c.builder.OutDir, "subs_%05d.vtt"),
 	}
+}
+
+func (c *Converter) writeNormalizedSubtitlePlaylist() error {
+	normalizer := subtitlePlaylistNormalizer{
+		ctx:         c.ctx,
+		rawPlaylist: c.rawSubList,
+		outPlaylist: c.subList,
+		videoList:   c.videoList,
+		segmentDir:  c.builder.OutDir,
+	}
+	return normalizer.run()
 }
 
 func (c *Converter) writeMasterAfterRenditionsReady(info domain.MediaInfo, withSubs bool) error {
