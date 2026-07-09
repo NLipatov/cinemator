@@ -14,11 +14,12 @@ import (
 )
 
 type subtitlePlaylistNormalizer struct {
-	ctx         context.Context
-	rawPlaylist string
-	outPlaylist string
-	videoList   string
-	segmentDir  string
+	ctx               context.Context
+	rawPlaylist       string
+	outPlaylist       string
+	videoList         string
+	segmentDir        string
+	subtitleCompleted <-chan struct{}
 }
 
 type playlistSegment struct {
@@ -39,6 +40,8 @@ type normalizedSubtitleSegment struct {
 }
 
 var webVTTCueTimingRE = regexp.MustCompile(`^\s*((?:\d{2,}:)?\d{2}:\d{2}\.\d{3})\s+-->\s+((?:\d{2,}:)?\d{2}:\d{2}\.\d{3})`)
+
+var ErrSubtitleTrackEmpty = errors.New("selected subtitle track has no cues")
 
 func (n subtitlePlaylistNormalizer) run() error {
 	ticker := time.NewTicker(150 * time.Millisecond)
@@ -65,6 +68,9 @@ func (n subtitlePlaylistNormalizer) refreshOnce() (bool, error) {
 	rawData, err := os.ReadFile(n.rawPlaylist)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
+			if n.subtitleExtractionDone() {
+				return false, ErrSubtitleTrackEmpty
+			}
 			return false, nil
 		}
 		return false, err
@@ -101,6 +107,18 @@ func (n subtitlePlaylistNormalizer) refreshOnce() (bool, error) {
 	return rawEnded && videoEnded && complete, nil
 }
 
+func (n subtitlePlaylistNormalizer) subtitleExtractionDone() bool {
+	if n.subtitleCompleted == nil {
+		return false
+	}
+	select {
+	case <-n.subtitleCompleted:
+		return true
+	default:
+		return false
+	}
+}
+
 func buildNormalizedSubtitlePlaylist(
 	rawSegments []playlistSegment,
 	rawEnded bool,
@@ -135,6 +153,9 @@ func buildNormalizedSubtitlePlaylist(
 	}
 
 	if len(segments) == 0 {
+		if rawEnded && complete {
+			return "", false, complete, ErrSubtitleTrackEmpty
+		}
 		return "", false, complete, nil
 	}
 

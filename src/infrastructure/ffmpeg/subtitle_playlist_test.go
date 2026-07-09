@@ -1,6 +1,8 @@
 package ffmpeg
 
 import (
+	"context"
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -47,6 +49,55 @@ func TestBuildNormalizedSubtitlePlaylistKeepsCueTimelineGaps(t *testing.T) {
 	assertDuration(t, segments[2].Duration, 26.560)
 	if !strings.Contains(got, "#EXT-X-TARGETDURATION:221\n") {
 		t.Fatalf("normalized playlist target duration does not cover the largest gap:\n%s", got)
+	}
+}
+
+func TestBuildNormalizedSubtitlePlaylistRejectsEmptyTrack(t *testing.T) {
+	dir := t.TempDir()
+
+	_, ok, complete, err := buildNormalizedSubtitlePlaylist(nil, true, 300, true, dir)
+	if !errors.Is(err, ErrSubtitleTrackEmpty) {
+		t.Fatalf("buildNormalizedSubtitlePlaylist() error = %v, want %v", err, ErrSubtitleTrackEmpty)
+	}
+	if ok {
+		t.Fatal("buildNormalizedSubtitlePlaylist() reported segments for an empty track")
+	}
+	if !complete {
+		t.Fatal("buildNormalizedSubtitlePlaylist() reported incomplete inputs")
+	}
+}
+
+func TestBuildNormalizedSubtitlePlaylistRejectsCueLessSegments(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "subs_00000.vtt"), []byte("WEBVTT\n\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	rawSegments := []playlistSegment{{URI: "subs_00000.vtt", Duration: 1}}
+	_, ok, complete, err := buildNormalizedSubtitlePlaylist(rawSegments, true, 300, true, dir)
+	if !errors.Is(err, ErrSubtitleTrackEmpty) {
+		t.Fatalf("buildNormalizedSubtitlePlaylist() error = %v, want %v", err, ErrSubtitleTrackEmpty)
+	}
+	if ok {
+		t.Fatal("buildNormalizedSubtitlePlaylist() reported segments for a cue-less VTT segment")
+	}
+	if !complete {
+		t.Fatal("buildNormalizedSubtitlePlaylist() reported incomplete inputs")
+	}
+}
+
+func TestSubtitlePlaylistNormalizerRejectsMissingRawPlaylistAfterSubtitleCompletes(t *testing.T) {
+	done := make(chan struct{})
+	close(done)
+	normalizer := subtitlePlaylistNormalizer{
+		ctx:               context.Background(),
+		rawPlaylist:       filepath.Join(t.TempDir(), "missing.m3u8"),
+		subtitleCompleted: done,
+	}
+
+	_, err := normalizer.refreshOnce()
+	if !errors.Is(err, ErrSubtitleTrackEmpty) {
+		t.Fatalf("refreshOnce() error = %v, want %v", err, ErrSubtitleTrackEmpty)
 	}
 }
 

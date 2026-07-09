@@ -75,16 +75,20 @@ func (c *Converter) ConvertToHLS() error {
 	var subtitlePlaylistErrCh chan error
 	if textSubtitle {
 		subtitleErrCh = make(chan error, 1)
+		subtitleCompleted := make(chan struct{})
 		go func() {
 			subArgs := c.subtitleArgs(c.selection.SubtitleTrackIndex)
 			log.Println("ffmpeg (subtitle)", strings.Join(subArgs, " "))
 			err := c.runFFmpeg(subArgs)
+			if err == nil {
+				close(subtitleCompleted)
+			}
 			subtitleErrCh <- err
 		}()
 
 		subtitlePlaylistErrCh = make(chan error, 1)
 		go func() {
-			err := c.writeNormalizedSubtitlePlaylist()
+			err := c.writeNormalizedSubtitlePlaylist(subtitleCompleted)
 			subtitlePlaylistErrCh <- err
 		}()
 	}
@@ -159,13 +163,14 @@ func (c *Converter) subtitleArgs(subIdx int) []string {
 	}
 }
 
-func (c *Converter) writeNormalizedSubtitlePlaylist() error {
+func (c *Converter) writeNormalizedSubtitlePlaylist(subtitleCompleted <-chan struct{}) error {
 	normalizer := subtitlePlaylistNormalizer{
-		ctx:         c.ctx,
-		rawPlaylist: c.rawSubList,
-		outPlaylist: c.subList,
-		videoList:   c.videoList,
-		segmentDir:  c.builder.OutDir,
+		ctx:               c.ctx,
+		rawPlaylist:       c.rawSubList,
+		outPlaylist:       c.subList,
+		videoList:         c.videoList,
+		segmentDir:        c.builder.OutDir,
+		subtitleCompleted: subtitleCompleted,
 	}
 	return normalizer.run()
 }
