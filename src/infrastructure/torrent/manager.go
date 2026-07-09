@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,20 +17,26 @@ import (
 	"cinemator/presentation/settings"
 
 	"github.com/anacrolix/torrent"
+	"github.com/anacrolix/torrent/metainfo"
+	"github.com/anacrolix/torrent/storage"
 )
 
 type manager struct {
-	client   *torrent.Client
-	active   map[streamKey]*streamInfo
-	torrents map[string]int
-	sources  *rangeServer
-	mu       sync.Mutex
-	settings settings.Settings
+	client    *torrent.Client
+	active    map[streamKey]*streamInfo
+	torrents  map[string]int
+	sources   *rangeServer
+	downloads *downloadStore
+	events    *downloadEventBroadcaster
+	mu        sync.Mutex
+	settings  settings.Settings
 }
 
 func NewManager(settings settings.Settings) (application.TorrentManager, error) {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = settings.DownloadPath()
+	cfg.ListenPort = settings.TorrentPort()
+	cfg.DefaultStorage = storage.NewFileByInfoHash(settings.DownloadPath())
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
 		return nil, err
@@ -43,12 +51,18 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	if err != nil {
 		return nil, err
 	}
+	downloads, err := newDownloadStore(settings.DownloadPath())
+	if err != nil {
+		return nil, err
+	}
 	m := &manager{
-		client:   client,
-		active:   make(map[streamKey]*streamInfo),
-		torrents: make(map[string]int),
-		sources:  sources,
-		settings: settings,
+		client:    client,
+		active:    make(map[streamKey]*streamInfo),
+		torrents:  make(map[string]int),
+		sources:   sources,
+		downloads: downloads,
+		events:    newDownloadEventBroadcaster(),
+		settings:  settings,
 	}
 	go m.viewerWatcher()
 	return m, nil
@@ -71,6 +85,11 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 	for i, f := range files {
 		result[i] = domain.FileInfo{Index: i, Name: f.DisplayPath(), Size: f.Length()}
 	}
+	if _, err := m.downloads.upsert(ctx, t.InfoHash().HexString(), magnet, result); err != nil {
+		log.Printf("GetTorrentFiles: failed to write download metadata: %v", err)
+	} else {
+		m.notifyDownloadsChanged()
+	}
 	return result, nil
 }
 
@@ -88,6 +107,7 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	if fileIndex < 0 || fileIndex >= len(files) {
 		return domain.MediaInfo{}, fmt.Errorf("bad file index")
 	}
+	m.touchDownload(ctx, t.InfoHash().HexString())
 	file := files[fileIndex]
 	origPrio := file.Priority()
 	file.SetPriority(torrent.PiecePriorityHigh)
@@ -120,20 +140,26 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	}
 	file := files[fileIndex]
 	hash := t.InfoHash().HexString()
+	m.touchDownload(ctx, hash)
 	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack}
 	paths := key.paths(m.settings.HlsPath())
 
 	m.mu.Lock()
 	s, exists := m.active[key]
 	if exists {
+		resumed := false
 		s.mtx.Lock()
 		s.lastView = time.Now()
-		needResume := s.paused || s.cancel == nil
+		needResume := !s.completed && (s.paused || s.cancel == nil)
 		s.mtx.Unlock()
 		if needResume {
 			m.startConversionLocked(key, s)
+			resumed = true
 		}
 		m.mu.Unlock()
+		if resumed {
+			m.notifyDownloadsChanged()
+		}
 		if err := s.waitReady(ctx); err != nil {
 			return "", "", nil, err
 		}
@@ -150,14 +176,19 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	s, exists = m.active[key]
 	if exists {
 		source.Close()
+		resumed := false
 		s.mtx.Lock()
 		s.lastView = time.Now()
-		needResume := s.paused || s.cancel == nil
+		needResume := !s.completed && (s.paused || s.cancel == nil)
 		s.mtx.Unlock()
 		if needResume {
 			m.startConversionLocked(key, s)
+			resumed = true
 		}
 		m.mu.Unlock()
+		if resumed {
+			m.notifyDownloadsChanged()
+		}
 		if err := s.waitReady(ctx); err != nil {
 			return "", "", nil, err
 		}
@@ -184,6 +215,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	m.active[key] = s
 	m.torrents[hash]++
 	m.mu.Unlock()
+	m.notifyDownloadsChanged()
 
 	file.Download()
 	file.SetPriority(torrent.PiecePriorityHigh)
@@ -196,6 +228,166 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	}
 	log.Printf("Stream ready: key=%v, playlist=%s", key, paths.masterPlaylist)
 	return paths.masterPlaylist, paths.outDir, cancel, nil
+}
+
+func (m *manager) ListDownloads(ctx context.Context) ([]domain.Download, error) {
+	downloads, err := m.downloads.list(ctx)
+	if err != nil {
+		return nil, err
+	}
+	statuses := m.downloadStatuses()
+	for i := range downloads {
+		if downloads[i].Status == domain.DownloadStatusExpired {
+			continue
+		}
+		if status, ok := statuses[downloads[i].ID]; ok {
+			downloads[i].Status = status
+		}
+	}
+	return downloads, nil
+}
+
+func (m *manager) ExtendDownload(ctx context.Context, id string, extension time.Duration) (domain.Download, error) {
+	download, err := m.downloads.extend(ctx, id, extension)
+	if err != nil {
+		return domain.Download{}, err
+	}
+	if status, ok := m.downloadStatuses()[download.ID]; ok && download.Status != domain.DownloadStatusExpired {
+		download.Status = status
+	}
+	m.notifyDownloadsChanged()
+	return download, nil
+}
+
+func (m *manager) DeleteDownload(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+
+	keys := m.streamKeysForDownload(id)
+	for _, key := range keys {
+		m.cleanup(key)
+	}
+	if t, ok := m.client.Torrent(metainfo.NewHashFromHex(id)); ok {
+		t.Drop()
+	}
+
+	m.mu.Lock()
+	delete(m.torrents, id)
+	m.mu.Unlock()
+
+	if err := m.removeDownloadHlsDirs(id); err != nil {
+		return err
+	}
+	if err := m.downloads.delete(ctx, id); err != nil {
+		return err
+	}
+	m.notifyDownloadsChanged()
+	return nil
+}
+
+func (m *manager) touchDownload(ctx context.Context, id string) {
+	if err := m.downloads.touch(ctx, id); err != nil && !errors.Is(err, domain.ErrDownloadNotFound) {
+		log.Printf("failed to touch download metadata: %v", err)
+	} else if err == nil {
+		m.notifyDownloadsChanged()
+	}
+}
+
+func (m *manager) SubscribeDownloadEvents(ctx context.Context) <-chan struct{} {
+	return m.events.subscribe(ctx)
+}
+
+func (m *manager) notifyDownloadsChanged() {
+	if m.events == nil {
+		return
+	}
+	m.events.notify()
+}
+
+func (m *manager) downloadStatuses() map[string]domain.DownloadStatus {
+	statuses := make(map[string]domain.DownloadStatus)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key, stream := range m.active {
+		status := domain.DownloadStatusStreaming
+		stream.mtx.Lock()
+		if stream.completed {
+			status = domain.DownloadStatusReady
+		} else if stream.paused {
+			status = domain.DownloadStatusPaused
+		}
+		stream.mtx.Unlock()
+
+		current, ok := statuses[key.InfoHash]
+		if !ok || current != domain.DownloadStatusStreaming {
+			statuses[key.InfoHash] = status
+		}
+	}
+	return statuses
+}
+
+func (m *manager) streamKeysForDownload(id string) []streamKey {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keys := make([]streamKey, 0)
+	for key := range m.active {
+		if key.InfoHash == id {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func (m *manager) downloadActive(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key := range m.active {
+		if key.InfoHash == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *manager) cleanupExpiredDownloads(ctx context.Context) {
+	ids, err := m.downloads.expiredIDs(ctx, time.Now().UTC())
+	if err != nil {
+		log.Printf("cleanupExpiredDownloads: failed to list expired downloads: %v", err)
+		return
+	}
+	for _, id := range ids {
+		if m.downloadActive(id) {
+			continue
+		}
+		if err := m.DeleteDownload(ctx, id); err != nil {
+			log.Printf("cleanupExpiredDownloads: failed to delete %s: %v", id, err)
+		}
+	}
+}
+
+func (m *manager) removeDownloadHlsDirs(id string) error {
+	entries, err := os.ReadDir(m.settings.HlsPath())
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	prefix := id + "_"
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(m.settings.HlsPath(), entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *manager) launchConversion(
@@ -279,10 +471,18 @@ func (m *manager) finishConversion(key streamKey, s *streamInfo, runID uint64, e
 		log.Printf("Stream conversion error for key=%v: %v", key, err)
 	}
 	s.running = false
-	if errors.Is(err, context.Canceled) {
+	notifyCompleted := false
+	if err == nil {
+		s.completed = true
+		s.paused = false
+		notifyCompleted = true
+	} else if errors.Is(err, context.Canceled) {
 		s.paused = true
 	}
 	m.mu.Unlock()
+	if notifyCompleted {
+		m.notifyDownloadsChanged()
+	}
 
 	if err != nil && !errors.Is(err, context.Canceled) {
 		m.cleanupIfCurrentRun(key, s, runID)

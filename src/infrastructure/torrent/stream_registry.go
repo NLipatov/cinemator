@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -25,6 +24,7 @@ func (m *manager) CleanupStreams() {
 	}
 	m.mu.Unlock()
 	m.enforceCacheLimit()
+	m.cleanupExpiredDownloads(context.Background())
 }
 
 func (m *manager) cleanup(key streamKey) {
@@ -80,14 +80,11 @@ func (m *manager) cleanupMatching(key streamKey, expected *streamInfo, runID uin
 	}
 	delete(m.active, key)
 	m.mu.Unlock()
+	m.notifyDownloadsChanged()
 	log.Printf("Stream cleaned up: key=%v", key)
 	if shouldDrop {
 		log.Printf("Dropping torrent: %s", key.InfoHash)
 		s.torrent.Drop()
-		dlDir := filepath.Join(m.settings.DownloadPath(), key.InfoHash)
-		if rmErr := os.RemoveAll(dlDir); rmErr != nil && !os.IsNotExist(rmErr) {
-			log.Printf("Failed to remove download dir %s: %v", dlDir, rmErr)
-		}
 	}
 }
 
@@ -98,7 +95,7 @@ func (m *manager) pauseStream(key streamKey) {
 		m.mu.Unlock()
 		return
 	}
-	if s.paused {
+	if s.paused || s.completed || !s.running {
 		m.mu.Unlock()
 		return
 	}
@@ -110,11 +107,12 @@ func (m *manager) pauseStream(key streamKey) {
 	s.running = false
 	s.file.SetPriority(torrent.PiecePriorityNone)
 	m.mu.Unlock()
+	m.notifyDownloadsChanged()
 	log.Printf("Paused stream due to inactivity: key=%v", key)
 }
 
 func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
-	if s.running {
+	if s.running || s.completed {
 		return
 	}
 	if err := resetStreamOutput(s.paths); err != nil {
@@ -165,7 +163,7 @@ func (m *manager) viewerWatcher() {
 				readyClosed = true
 			default:
 			}
-			idle := readyClosed && now.Sub(s.lastView) > idlePauseTimeout
+			idle := readyClosed && s.running && !s.completed && now.Sub(s.lastView) > idlePauseTimeout
 			noViewers := now.Sub(s.lastView) > m.settings.ViewerTimeout()
 			s.mtx.Unlock()
 			if idle && !s.paused {
@@ -178,5 +176,6 @@ func (m *manager) viewerWatcher() {
 		}
 		m.mu.Unlock()
 		m.enforceCacheLimit()
+		m.cleanupExpiredDownloads(context.Background())
 	}
 }

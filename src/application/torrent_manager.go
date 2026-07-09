@@ -3,6 +3,7 @@ package application
 import (
 	"cinemator/domain"
 	"context"
+	"time"
 )
 
 type TorrentManager interface {
@@ -10,5 +11,9 @@ type TorrentManager interface {
 	GetMediaInfo(ctx context.Context, magnet string, fileIndex int) (domain.MediaInfo, error)
 	PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (playlistPath, hlsDir string, cancel context.CancelFunc, err error)
 	TouchStream(ctx context.Context, dirName string)
+	ListDownloads(ctx context.Context) ([]domain.Download, error)
+	ExtendDownload(ctx context.Context, id string, extension time.Duration) (domain.Download, error)
+	DeleteDownload(ctx context.Context, id string) error
+	SubscribeDownloadEvents(ctx context.Context) <-chan struct{}
 	CleanupStreams()
 }

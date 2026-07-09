@@ -35,6 +35,7 @@ type streamInfo struct {
 	readySent bool
 	paused    bool
 	running   bool
+	completed bool
 }
 
 type streamPaths struct {
@@ -50,6 +51,7 @@ func (s *streamInfo) beginRun() uint64 {
 	s.ready = make(chan struct{})
 	s.readyErr = nil
 	s.readySent = false
+	s.completed = false
 	runID := s.runID
 	s.mtx.Unlock()
 	return runID

@@ -130,6 +130,72 @@ func TestFinishConversionIgnoresStaleRun(t *testing.T) {
 	}
 }
 
+func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	s := &streamInfo{running: true, paused: true}
+	runID := s.beginRun()
+	events := newDownloadEventBroadcaster()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	updates := events.subscribe(ctx)
+
+	m := &manager{
+		active: map[streamKey]*streamInfo{key: s},
+		events: events,
+	}
+	m.finishConversion(key, s, runID, nil)
+
+	if s.running {
+		t.Fatal("finishConversion() left successful run marked as running")
+	}
+	if s.paused {
+		t.Fatal("finishConversion() left successful run marked as paused")
+	}
+	if !s.completed {
+		t.Fatal("finishConversion() did not mark successful run as completed")
+	}
+	select {
+	case <-updates:
+	case <-time.After(time.Second):
+		t.Fatal("finishConversion() did not notify download subscribers")
+	}
+}
+
+func TestCompletedStreamIsNotPausedOrReset(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	paths := key.paths(t.TempDir())
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := filepath.Join(paths.outDir, "chunk_00001.ts")
+	if err := os.WriteFile(sentinel, []byte("cached"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled := false
+	s := &streamInfo{
+		cancel:    func() { canceled = true },
+		paths:     paths,
+		completed: true,
+	}
+	m := &manager{
+		active: map[streamKey]*streamInfo{key: s},
+	}
+
+	m.pauseStream(key)
+	if canceled {
+		t.Fatal("pauseStream() canceled a completed stream")
+	}
+	if s.paused {
+		t.Fatal("pauseStream() marked a completed stream as paused")
+	}
+
+	m.startConversionLocked(key, s)
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("startConversionLocked() removed completed HLS cache: %v", err)
+	}
+}
+
 func TestCleanupIfCurrentRunIgnoresStaleRun(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	s := &streamInfo{}
