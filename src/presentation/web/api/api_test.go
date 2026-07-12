@@ -20,6 +20,7 @@ type fakeTorrentManager struct {
 	extendErr error
 	deleteErr error
 	events    <-chan struct{}
+	prepare   string
 }
 
 func (m fakeTorrentManager) GetTorrentFiles(context.Context, string) ([]domain.FileInfo, error) {
@@ -30,8 +31,8 @@ func (m fakeTorrentManager) GetMediaInfo(context.Context, string, int) (domain.M
 	return domain.MediaInfo{}, nil
 }
 
-func (m fakeTorrentManager) PrepareHlsStream(context.Context, string, int, int, int) (string, string, context.CancelFunc, error) {
-	return "", "", nil, nil
+func (m fakeTorrentManager) PrepareHlsStream(context.Context, string, int, int, int) (string, error) {
+	return m.prepare, nil
 }
 
 func (m fakeTorrentManager) TouchStream(context.Context, string) {}
@@ -126,6 +127,68 @@ func TestHandleDownloadActionStatusMapping(t *testing.T) {
 			}
 			if tt.wantAllow != "" && rec.Header().Get("Allow") != tt.wantAllow {
 				t.Fatalf("Allow = %q, want %q", rec.Header().Get("Allow"), tt.wantAllow)
+			}
+		})
+	}
+}
+
+func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		target     string
+		wantStatus int
+		wantAllow  string
+	}{
+		{
+			name:       "valid",
+			method:     http.MethodGet,
+			target:     "/api/hls/prepare?magnet=magnet&file=0&audio=1&subtitle=-1",
+			wantStatus: http.StatusFound,
+		},
+		{
+			name:       "malformed audio",
+			method:     http.MethodGet,
+			target:     "/api/hls/prepare?magnet=magnet&file=0&audio=default",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "invalid subtitle",
+			method:     http.MethodGet,
+			target:     "/api/hls/prepare?magnet=magnet&file=0&subtitle=-2",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "negative file",
+			method:     http.MethodGet,
+			target:     "/api/hls/prepare?magnet=magnet&file=-1",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "unsupported method",
+			method:     http.MethodPost,
+			target:     "/api/hls/prepare?magnet=magnet&file=0",
+			wantStatus: http.StatusMethodNotAllowed,
+			wantAllow:  http.MethodGet,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := HttpServer{
+				mgr:      fakeTorrentManager{prepare: filepath.Join(t.TempDir(), "stream", "master.m3u8")},
+				settings: settings.NewSettings(),
+			}
+			req := httptest.NewRequest(tt.method, tt.target, nil)
+			rec := httptest.NewRecorder()
+
+			server.handlePrepareHlsStream(rec, req)
+
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %q", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			if got := rec.Header().Get("Allow"); got != tt.wantAllow {
+				t.Fatalf("Allow = %q, want %q", got, tt.wantAllow)
 			}
 		})
 	}

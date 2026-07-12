@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -111,13 +112,12 @@ func (m *manager) pauseStream(key streamKey) {
 	log.Printf("Paused stream due to inactivity: key=%v", key)
 }
 
-func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
+func (m *manager) startConversionLocked(key streamKey, s *streamInfo) error {
 	if s.running || s.completed {
-		return
+		return nil
 	}
 	if err := resetStreamOutput(s.paths); err != nil {
-		log.Printf("startConversionLocked: failed to reset dir %s: %v", s.paths.outDir, err)
-		return
+		return fmt.Errorf("reset stream output %s: %w", s.paths.outDir, err)
 	}
 	streamCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
@@ -126,6 +126,7 @@ func (m *manager) startConversionLocked(key streamKey, s *streamInfo) {
 	s.file.SetPriority(torrent.PiecePriorityHigh)
 	runID := s.beginRun()
 	m.launchConversion(streamCtx, key, s, runID)
+	return nil
 }
 
 func resetStreamOutput(paths streamPaths) error {
@@ -157,13 +158,13 @@ func (m *manager) viewerWatcher() {
 		m.mu.Lock()
 		for key, s := range m.active {
 			s.mtx.Lock()
-			readyClosed := false
+			playable := false
 			select {
-			case <-s.ready:
-				readyClosed = true
+			case <-s.playable:
+				playable = true
 			default:
 			}
-			idle := readyClosed && s.running && !s.completed && now.Sub(s.lastView) > idlePauseTimeout
+			idle := playable && s.running && !s.completed && now.Sub(s.lastView) > idlePauseTimeout
 			noViewers := now.Sub(s.lastView) > m.settings.ViewerTimeout()
 			s.mtx.Unlock()
 			if idle && !s.paused {

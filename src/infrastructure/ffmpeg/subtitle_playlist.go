@@ -43,6 +43,11 @@ var webVTTCueTimingRE = regexp.MustCompile(`^\s*((?:\d{2,}:)?\d{2}:\d{2}\.\d{3})
 
 var ErrSubtitleTrackEmpty = errors.New("selected subtitle track has no cues")
 
+const (
+	subtitlePrerollFilename        = "subs_preroll.vtt"
+	subtitlePrerollSegmentDuration = 4.0
+)
+
 func (n subtitlePlaylistNormalizer) run() error {
 	ticker := time.NewTicker(150 * time.Millisecond)
 	defer ticker.Stop()
@@ -65,20 +70,22 @@ func (n subtitlePlaylistNormalizer) run() error {
 }
 
 func (n subtitlePlaylistNormalizer) refreshOnce() (bool, error) {
+	var rawSegments []playlistSegment
+	rawEnded := false
 	rawData, err := os.ReadFile(n.rawPlaylist)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if n.subtitleExtractionDone() {
 				return false, ErrSubtitleTrackEmpty
 			}
-			return false, nil
+		} else {
+			return false, err
 		}
-		return false, err
-	}
-
-	rawSegments, rawEnded, err := parseMediaPlaylist(rawData)
-	if err != nil {
-		return false, err
+	} else {
+		rawSegments, rawEnded, err = parseMediaPlaylist(rawData)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	videoDuration := 0.0
@@ -141,13 +148,9 @@ func buildNormalizedSubtitlePlaylist(
 			continue
 		}
 
-		start := bounds.firstStart
-		if len(segments) == 0 {
-			start = 0
-		}
 		segments = append(segments, normalizedSubtitleSegment{
 			URI:   raw.URI,
-			Start: start,
+			Start: bounds.firstStart,
 			End:   bounds.lastEnd,
 		})
 	}
@@ -156,10 +159,19 @@ func buildNormalizedSubtitlePlaylist(
 		if rawEnded && complete {
 			return "", false, complete, ErrSubtitleTrackEmpty
 		}
+		if videoDuration > 0 {
+			segments = appendSubtitlePreroll(segments, videoDuration)
+			return renderSubtitlePlaylist(segments, false), true, complete, nil
+		}
 		return "", false, complete, nil
 	}
 
-	for i := range segments {
+	prerollDuration := math.Max(0, segments[0].Start)
+	preroll := appendSubtitlePreroll(nil, prerollDuration)
+	prerollCount := len(preroll)
+	segments = append(preroll, segments...)
+
+	for i := prerollCount; i < len(segments); i++ {
 		nextStart := segments[i].End
 		if i+1 < len(segments) {
 			nextStart = segments[i+1].Start
@@ -170,6 +182,34 @@ func buildNormalizedSubtitlePlaylist(
 	}
 
 	return renderSubtitlePlaylist(segments, rawEnded && videoEnded), true, complete, nil
+}
+
+func appendSubtitlePreroll(segments []normalizedSubtitleSegment, duration float64) []normalizedSubtitleSegment {
+	if duration <= 0 {
+		return segments
+	}
+	duration = math.Max(0.001, duration)
+	start := 0.0
+	for duration > subtitlePrerollSegmentDuration {
+		if duration-subtitlePrerollSegmentDuration < 0.001 {
+			duration = subtitlePrerollSegmentDuration
+			break
+		}
+		segments = append(segments, normalizedSubtitleSegment{
+			URI:      subtitlePrerollFilename,
+			Start:    start,
+			End:      start + subtitlePrerollSegmentDuration,
+			Duration: subtitlePrerollSegmentDuration,
+		})
+		start += subtitlePrerollSegmentDuration
+		duration -= subtitlePrerollSegmentDuration
+	}
+	return append(segments, normalizedSubtitleSegment{
+		URI:      subtitlePrerollFilename,
+		Start:    start,
+		End:      start + duration,
+		Duration: duration,
+	})
 }
 
 func renderSubtitlePlaylist(segments []normalizedSubtitleSegment, ended bool) string {

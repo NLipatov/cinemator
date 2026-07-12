@@ -39,6 +39,7 @@
     let downloadPollingTimer = null;
     let openExtendDownloadID = null;
     let requestSeq = 0;
+    let flowRequestController = null;
     const idleRecoveryMs = 12 * 60 * 1000;
     const recoveryThrottleMs = 5000;
     const stallRecoveryDelayMs = 3500;
@@ -50,8 +51,29 @@
       { days: 7, label: '7 days' },
       { days: 30, label: '30 days' },
     ];
-    const nextRequest = () => ++requestSeq;
     const isStale = id => id !== requestSeq;
+    function cancelFlowRequest() {
+      requestSeq++;
+      if (flowRequestController) {
+        flowRequestController.abort();
+        flowRequestController = null;
+      }
+    }
+    function beginFlowRequest() {
+      cancelFlowRequest();
+      const request = {
+        id: requestSeq,
+        controller: new AbortController(),
+      };
+      request.signal = request.controller.signal;
+      flowRequestController = request.controller;
+      return request;
+    }
+    function finishFlowRequest(request) {
+      if (flowRequestController === request.controller) {
+        flowRequestController = null;
+      }
+    }
     function destroyVideoAndHls({ resetLayout = true } = {}) {
       if (hls) { hls.destroy(); hls = null; }
       if (playbackRecoveryTimer) {
@@ -317,7 +339,7 @@
         showMsg('downloadsMsg', 'Download metadata is incomplete', true);
         return;
       }
-      nextRequest();
+      cancelFlowRequest();
       destroyVideoAndHls();
       $('magnet').value = download.magnet;
       setFileList(download.files);
@@ -355,7 +377,7 @@
         const res = await fetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('Could not delete download');
         if ($('magnet').value.trim() === download.magnet) {
-          nextRequest();
+          cancelFlowRequest();
           destroyVideoAndHls();
           $('magnet').value = '';
           $('filelist').textContent = '';
@@ -465,7 +487,8 @@
         showMsg('magnetMsg', 'Magnet link required', true);
         return;
       }
-      const requestId = nextRequest();
+      const request = beginFlowRequest();
+      const requestId = request.id;
       destroyVideoAndHls();
       showMsg('magnetMsg', 'Loading file list…', false, true);
       $('filelist').textContent = '';
@@ -474,8 +497,8 @@
       $('player-block').style.display = 'none';
       removeWarning();
       try {
-        const res = await fetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet));
-        if (!res.ok) throw new Error('Server error');
+        const res = await fetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: request.signal });
+        if (!res.ok) throw new Error((await res.text()).trim() || 'Server error');
         const files = await res.json();
         if (isStale(requestId)) return;
         if (!files.length) throw new Error('No playable files found in torrent');
@@ -484,9 +507,12 @@
         showMsg('magnetMsg', '');
         loadDownloads({ quiet: true });
       } catch (e) {
+        if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
         showMsg('magnetMsg', e.message || 'Error loading files', true);
         return;
+      } finally {
+        finishFlowRequest(request);
       }
     };
 
@@ -505,12 +531,13 @@
         showMsg('fileMsg', 'Select a file first', true);
         return;
       }
-      const requestId = nextRequest();
+      const request = beginFlowRequest();
+      const requestId = request.id;
       showMsg('fileMsg', 'Loading track info…', false, true);
       $('step-tracks').style.display = 'none';
       try {
-        const res = await fetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`);
-        if (!res.ok) throw new Error('Could not load media info');
+        const res = await fetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal });
+        if (!res.ok) throw new Error((await res.text()).trim() || 'Could not load media info');
         const info = await res.json();
         if (isStale(requestId)) return;
         loadDownloads({ quiet: true });
@@ -565,8 +592,11 @@
         $('step-tracks').style.display = '';
         showMsg('fileMsg', '');
       } catch (e) {
+        if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
         showMsg('fileMsg', e.message || 'Error loading tracks', true);
+      } finally {
+        finishFlowRequest(request);
       }
     };
 
@@ -580,7 +610,8 @@
         showMsg('trackMsg', 'Select a file first', true);
         return;
       }
-      const requestId = nextRequest();
+      const request = beginFlowRequest();
+      const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
       destroyVideoAndHls({ resetLayout: !wasPlaying });
       $('player-block').style.display = keepPlayerVisible ? '' : 'none';
@@ -600,7 +631,10 @@
         }, 8000);
       }
       try {
-        const resp = await fetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}`, { redirect: 'follow' });
+        const resp = await fetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}`, {
+          redirect: 'follow',
+          signal: request.signal,
+        });
         if (!resp.ok) throw new Error((await resp.text()).trim() || 'Stream error');
         if (isStale(requestId)) return;
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
@@ -609,6 +643,7 @@
         playHls(m3u8, subtitleSelected, resumeTime);
         loadDownloads({ quiet: true });
       } catch (e) {
+        if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
         removeWarning();
         const msg = e.message || 'Could not start stream';
@@ -618,6 +653,8 @@
           showMsg('trackMsg', msg, true);
         }
         return;
+      } finally {
+        finishFlowRequest(request);
       }
     }
 
@@ -762,7 +799,7 @@
       }
 
       if (Hls.isSupported()) {
-        hls = new Hls();
+        hls = new Hls({ startPosition: resumeTime });
         hls.loadSource(src);
         hls.attachMedia(video);
 
@@ -802,11 +839,9 @@
         });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
-        if (resumeTime > 0) {
-          video.addEventListener('loadedmetadata', () => {
-            video.currentTime = resumeTime;
-          }, { once: true });
-        }
+        video.addEventListener('loadedmetadata', () => {
+          video.currentTime = resumeTime;
+        }, { once: true });
         video.addEventListener('canplay', markStreamActive, { once: true });
         video.addEventListener('playing', markStreamActive);
         video.addEventListener('progress', markPlaybackProgress);

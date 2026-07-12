@@ -17,12 +17,15 @@ const (
 
 type SampleAnalyzer struct{}
 
-func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
+func (SampleAnalyzer) Analyze(ctx context.Context, r io.Reader) (domain.MediaInfo, error) {
 	data := make([]byte, 0, maxProbeBytes)
 	target := initialProbeBytes
 	var lastErr error
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return domain.MediaInfo{}, err
+		}
 		prevLen := len(data)
 		need := target - len(data)
 		if need > 0 {
@@ -45,7 +48,7 @@ func (SampleAnalyzer) Analyze(r io.Reader) (domain.MediaInfo, error) {
 			}
 		}
 
-		info, err := probeSample(data)
+		info, err := probeSample(ctx, data)
 		if err == nil {
 			return info, nil
 		}
@@ -75,8 +78,8 @@ func (SampleAnalyzer) AnalyzeURL(ctx context.Context, sourceURL string) (domain.
 	return parseProbeOutput(out)
 }
 
-func probeSample(sample []byte) (domain.MediaInfo, error) {
-	out, err := cli.RunWithStdin(context.Background(), bytes.NewReader(sample),
+func probeSample(ctx context.Context, sample []byte) (domain.MediaInfo, error) {
+	out, err := cli.RunWithStdin(ctx, bytes.NewReader(sample),
 		"ffprobe", "-v", "error",
 		"-of", "json", "-show_streams", "-i", "pipe:0",
 	)

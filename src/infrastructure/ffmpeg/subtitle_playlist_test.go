@@ -1,6 +1,7 @@
 package ffmpeg
 
 import (
+	"cinemator/domain"
 	"context"
 	"errors"
 	"math"
@@ -40,15 +41,170 @@ func TestBuildNormalizedSubtitlePlaylistKeepsCueTimelineGaps(t *testing.T) {
 	if !ended {
 		t.Fatal("normalized playlist does not include ENDLIST")
 	}
+	if len(segments) != 15 {
+		t.Fatalf("len(segments) = %d, want 15", len(segments))
+	}
+
+	for i := 0; i < 11; i++ {
+		if segments[i].URI != subtitlePrerollFilename {
+			t.Fatalf("segments[%d].URI = %q, want %q", i, segments[i].URI, subtitlePrerollFilename)
+		}
+		assertDuration(t, segments[i].Duration, 4)
+	}
+	assertDuration(t, segments[11].Duration, 0.628)
+	for i, want := range []string{"subs_00000.vtt", "subs_00001.vtt", "subs_00002.vtt"} {
+		if segments[12+i].URI != want {
+			t.Fatalf("segments[%d].URI = %q, want %q", 12+i, segments[12+i].URI, want)
+		}
+	}
+	assertDuration(t, segments[12].Duration, 8.050)
+	assertDuration(t, segments[13].Duration, 220.762)
+	assertDuration(t, segments[14].Duration, 26.560)
+	if !strings.Contains(got, "#EXT-X-TARGETDURATION:221\n") {
+		t.Fatalf("normalized playlist target duration does not cover the largest gap:\n%s", got)
+	}
+}
+
+func TestBuildNormalizedSubtitlePlaylistPublishesPrerollBeforeFirstCue(t *testing.T) {
+	got, ok, complete, err := buildNormalizedSubtitlePlaylist(nil, false, 9.5, false, t.TempDir())
+	if err != nil {
+		t.Fatalf("buildNormalizedSubtitlePlaylist() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("buildNormalizedSubtitlePlaylist() reported no segments")
+	}
+	if !complete {
+		t.Fatal("buildNormalizedSubtitlePlaylist() reported incomplete inputs")
+	}
+
+	segments, ended, err := parseMediaPlaylist([]byte(got))
+	if err != nil {
+		t.Fatalf("parseMediaPlaylist() error = %v", err)
+	}
+	if ended {
+		t.Fatal("preroll playlist unexpectedly includes ENDLIST")
+	}
 	if len(segments) != 3 {
 		t.Fatalf("len(segments) = %d, want 3", len(segments))
 	}
+	for i, want := range []float64{4, 4, 1.5} {
+		if segments[i].URI != subtitlePrerollFilename {
+			t.Fatalf("segments[%d].URI = %q, want %q", i, segments[i].URI, subtitlePrerollFilename)
+		}
+		assertDuration(t, segments[i].Duration, want)
+	}
+	if !strings.Contains(got, "#EXT-X-TARGETDURATION:4\n") {
+		t.Fatalf("preroll playlist target duration is not bounded:\n%s", got)
+	}
+}
 
-	assertDuration(t, segments[0].Duration, 52.678)
-	assertDuration(t, segments[1].Duration, 220.762)
-	assertDuration(t, segments[2].Duration, 26.560)
-	if !strings.Contains(got, "#EXT-X-TARGETDURATION:221\n") {
-		t.Fatalf("normalized playlist target duration does not cover the largest gap:\n%s", got)
+func TestAppendSubtitlePrerollAvoidsSubMillisecondTail(t *testing.T) {
+	segments := appendSubtitlePreroll(nil, 8.0001)
+	if len(segments) != 2 {
+		t.Fatalf("len(segments) = %d, want 2", len(segments))
+	}
+	assertDuration(t, segments[0].Duration, 4)
+	assertDuration(t, segments[1].Duration, 4)
+}
+
+func TestAppendSubtitlePrerollDoesNotInventTimeAtZero(t *testing.T) {
+	segments := appendSubtitlePreroll(nil, 0)
+	if len(segments) != 0 {
+		t.Fatalf("len(segments) = %d, want 0", len(segments))
+	}
+}
+
+func TestSubtitlePlaylistNormalizerPublishesPrerollBeforeRawPlaylist(t *testing.T) {
+	dir := t.TempDir()
+	videoList := filepath.Join(dir, "index.m3u8")
+	outPlaylist := filepath.Join(dir, "subs.m3u8")
+	if err := os.WriteFile(videoList, []byte("#EXTM3U\n#EXTINF:3.5,\nchunk_00000.ts\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	normalizer := subtitlePlaylistNormalizer{
+		ctx:         context.Background(),
+		rawPlaylist: filepath.Join(dir, "missing.raw.m3u8"),
+		outPlaylist: outPlaylist,
+		videoList:   videoList,
+		segmentDir:  dir,
+	}
+	done, err := normalizer.refreshOnce()
+	if err != nil {
+		t.Fatalf("refreshOnce() error = %v", err)
+	}
+	if done {
+		t.Fatal("refreshOnce() completed before subtitle extraction")
+	}
+	data, err := os.ReadFile(outPlaylist)
+	if err != nil {
+		t.Fatalf("read preroll playlist: %v", err)
+	}
+	if !strings.Contains(string(data), subtitlePrerollFilename) {
+		t.Fatalf("preroll playlist does not reference %s:\n%s", subtitlePrerollFilename, data)
+	}
+}
+
+func TestSubtitlePrerollMakesMasterReadyBeforeFirstCue(t *testing.T) {
+	dir := t.TempDir()
+	videoList := filepath.Join(dir, "index.m3u8")
+	subtitleList := filepath.Join(dir, "subs.m3u8")
+	master := filepath.Join(dir, "master.m3u8")
+	if err := os.WriteFile(videoList, []byte("#EXTM3U\n#EXTINF:3.5,\nchunk_00000.ts\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	normalizer := subtitlePlaylistNormalizer{
+		ctx:         context.Background(),
+		rawPlaylist: filepath.Join(dir, "missing.raw.m3u8"),
+		outPlaylist: subtitleList,
+		videoList:   videoList,
+		segmentDir:  dir,
+	}
+	if _, err := normalizer.refreshOnce(); err != nil {
+		t.Fatalf("refreshOnce() error = %v", err)
+	}
+
+	converter := Converter{
+		ctx:       context.Background(),
+		videoList: videoList,
+		subList:   subtitleList,
+		master:    master,
+	}
+	if err := converter.writeMasterAfterRenditionsReady(domain.MediaInfo{}, true); err != nil {
+		t.Fatalf("writeMasterAfterRenditionsReady() error = %v", err)
+	}
+	data, err := os.ReadFile(master)
+	if err != nil {
+		t.Fatalf("read master playlist: %v", err)
+	}
+	if !strings.Contains(string(data), "SUBTITLES=\"subs\"") {
+		t.Fatalf("master playlist does not include subtitle rendition:\n%s", data)
+	}
+}
+
+func TestConverterCreatesSubtitlePrerollFileBeforeNormalization(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	converter := Converter{
+		ctx:        ctx,
+		builder:    ArgsBuilder{OutDir: dir},
+		rawSubList: filepath.Join(dir, "missing.raw.m3u8"),
+		subList:    filepath.Join(dir, "subs.m3u8"),
+		videoList:  filepath.Join(dir, "index.m3u8"),
+	}
+
+	err := converter.writeNormalizedSubtitlePlaylist(nil)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("writeNormalizedSubtitlePlaylist() error = %v, want %v", err, context.Canceled)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, subtitlePrerollFilename))
+	if err != nil {
+		t.Fatalf("read subtitle preroll: %v", err)
+	}
+	if string(data) != "WEBVTT\n\n" {
+		t.Fatalf("subtitle preroll = %q", data)
 	}
 }
 

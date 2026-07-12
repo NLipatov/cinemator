@@ -9,7 +9,7 @@ import (
 
 // StreamSelection specifies which audio/subtitle tracks to include.
 type StreamSelection struct {
-	AudioTrackIndex    int // -1 or out of range = default (first)
+	AudioTrackIndex    int // -1 = default (first)
 	SubtitleTrackIndex int // -1 = none
 }
 
@@ -104,8 +104,11 @@ func (b ArgsBuilder) hls() []string {
 		"-hls_init_time", "0",
 		"-hls_time", "2",
 		"-hls_list_size", "0",
+		"-hls_playlist_type", "event",
 		"-hls_flags", "independent_segments",
 		"-hls_segment_filename", filepath.Join(b.OutDir, "chunk_%05d.ts"),
+		// Keep MPEG-TS aligned with zero-based WebVTT cue timestamps.
+		"-muxdelay", "0",
 		b.Playlist,
 	}
 }
