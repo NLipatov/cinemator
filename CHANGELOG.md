@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1](https://github.com/NLipatov/cinemator/compare/0.2.0...0.2.1) (2026-07-13)
+
+
+### Bug Fixes
+
+* clean up abandoned stream preparations ([21b7216](https://github.com/NLipatov/cinemator/commit/21b721634b73c8b67e8dabdc90945c0c35fb1f49))
+* correct HLS playback and subtitle synchronization ([a4299ef](https://github.com/NLipatov/cinemator/commit/a4299efc1ee91c5643e38c0047a6d08702e40a0e))
+
 ## [0.2.0](https://github.com/NLipatov/cinemator/compare/0.1.20...0.2.0) (2026-07-09)
 
 
