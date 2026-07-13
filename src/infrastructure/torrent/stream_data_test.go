@@ -3,6 +3,7 @@ package torrent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -65,49 +66,49 @@ func TestParseStreamDirRejectsMalformedNames(t *testing.T) {
 	}
 }
 
-func TestStreamInfoWaitReadyReturnsSignalError(t *testing.T) {
+func TestStreamInfoWaitPlayableReturnsSignalError(t *testing.T) {
 	want := errors.New("probe failed")
 	s := &streamInfo{}
 	runID := s.beginRun()
-	s.signalReady(runID, want)
+	s.signalPlayable(runID, want)
 
-	if got := s.waitReady(context.Background()); !errors.Is(got, want) {
-		t.Fatalf("waitReady() = %v, want %v", got, want)
+	if got := s.waitPlayable(context.Background()); !errors.Is(got, want) {
+		t.Fatalf("waitPlayable() = %v, want %v", got, want)
 	}
 }
 
-func TestStreamInfoWaitReadyHonorsContext(t *testing.T) {
+func TestStreamInfoWaitPlayableHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
 
 	s := &streamInfo{}
 	s.beginRun()
 
-	if err := s.waitReady(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waitReady() = %v, want deadline exceeded", err)
+	if err := s.waitPlayable(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitPlayable() = %v, want deadline exceeded", err)
 	}
 }
 
-func TestStreamInfoIgnoresStaleRunReadySignal(t *testing.T) {
+func TestStreamInfoIgnoresStaleRunPlayableSignal(t *testing.T) {
 	s := &streamInfo{}
 	staleRunID := s.beginRun()
 	currentRunID := s.beginRun()
 
-	if ok := s.signalReady(staleRunID, errors.New("stale failure")); ok {
-		t.Fatal("signalReady() accepted stale run")
+	if ok := s.signalPlayable(staleRunID, errors.New("stale failure")); ok {
+		t.Fatal("signalPlayable() accepted stale run")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
-	if err := s.waitReady(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waitReady() = %v, want current run to remain pending", err)
+	if err := s.waitPlayable(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitPlayable() = %v, want current run to remain pending", err)
 	}
 
-	if ok := s.signalReady(currentRunID, nil); !ok {
-		t.Fatal("signalReady() rejected current run")
+	if ok := s.signalPlayable(currentRunID, nil); !ok {
+		t.Fatal("signalPlayable() rejected current run")
 	}
-	if err := s.waitReady(context.Background()); err != nil {
-		t.Fatalf("waitReady() = %v, want nil", err)
+	if err := s.waitPlayable(context.Background()); err != nil {
+		t.Fatalf("waitPlayable() = %v, want nil", err)
 	}
 }
 
@@ -161,6 +162,25 @@ func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
 	}
 }
 
+func TestFinishConversionTreatsWrappedCancellationAsPause(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	s := &streamInfo{running: true}
+	runID := s.beginRun()
+	m := &manager{active: map[streamKey]*streamInfo{key: s}}
+
+	m.finishConversion(key, s, runID, fmt.Errorf("ffmpeg canceled: %w", context.Canceled))
+
+	if s.running {
+		t.Fatal("finishConversion() left canceled run marked as running")
+	}
+	if !s.paused {
+		t.Fatal("finishConversion() did not mark canceled run as paused")
+	}
+	if m.active[key] != s {
+		t.Fatal("finishConversion() removed resumable stream after cancellation")
+	}
+}
+
 func TestCompletedStreamIsNotPausedOrReset(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	paths := key.paths(t.TempDir())
@@ -193,6 +213,112 @@ func TestCompletedStreamIsNotPausedOrReset(t *testing.T) {
 	m.startConversionLocked(key, s)
 	if _, err := os.Stat(sentinel); err != nil {
 		t.Fatalf("startConversionLocked() removed completed HLS cache: %v", err)
+	}
+}
+
+func TestGetOrResumeStreamReturnsResetFailure(t *testing.T) {
+	root := t.TempDir()
+	blocker := filepath.Join(root, "blocker")
+	if err := os.WriteFile(blocker, []byte("not a directory"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	s := &streamInfo{
+		paused: true,
+		paths: streamPaths{
+			outDir: filepath.Join(blocker, "stream"),
+		},
+	}
+	m := &manager{active: map[streamKey]*streamInfo{key: s}}
+
+	got, _, resumed, exists, err := m.getOrResumeStream(key)
+	if !exists || got != s {
+		t.Fatalf("getOrResumeStream() stream = %p, exists = %v", got, exists)
+	}
+	if resumed {
+		t.Fatal("getOrResumeStream() reported a failed resume as successful")
+	}
+	if err == nil {
+		t.Fatal("getOrResumeStream() error = nil, want reset failure")
+	}
+}
+
+func TestCanceledLastStartupWaiterCleansAbandonedStream(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	paths := key.paths(t.TempDir())
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	canceled := false
+	s := &streamInfo{
+		cancel:  func() { canceled = true },
+		paths:   paths,
+		running: true,
+	}
+	runID := s.beginRun()
+	s.registerStartupWaiter()
+	m := &manager{active: map[streamKey]*streamInfo{key: s}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := m.waitForPlayableStream(ctx, key, s, runID)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForPlayableStream() error = %v, want %v", err, context.Canceled)
+	}
+	if !canceled {
+		t.Fatal("waitForPlayableStream() did not cancel abandoned conversion")
+	}
+	if _, ok := m.active[key]; ok {
+		t.Fatal("waitForPlayableStream() left abandoned stream active")
+	}
+	if _, err := os.Stat(paths.outDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("abandoned HLS directory still exists: %v", err)
+	}
+}
+
+func TestCanceledStartupWaiterKeepsStreamForAnotherWaiter(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	s := &streamInfo{paths: key.paths(t.TempDir()), running: true}
+	runID := s.beginRun()
+	s.registerStartupWaiter()
+	s.registerStartupWaiter()
+	m := &manager{active: map[streamKey]*streamInfo{key: s}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := m.waitForPlayableStream(ctx, key, s, runID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("first waitForPlayableStream() error = %v, want %v", err, context.Canceled)
+	}
+	if m.active[key] != s {
+		t.Fatal("canceled waiter removed stream owned by another waiter")
+	}
+
+	s.signalPlayable(runID, nil)
+	if _, err := m.waitForPlayableStream(context.Background(), key, s, runID); err != nil {
+		t.Fatalf("second waitForPlayableStream() error = %v", err)
+	}
+	if m.active[key] != s {
+		t.Fatal("successful waiter removed shared stream")
+	}
+}
+
+func TestCanceledStartupWaiterKeepsViewerOwnedStream(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	s := &streamInfo{paths: key.paths(t.TempDir()), running: true}
+	runID := s.beginRun()
+	s.registerStartupWaiter()
+	m := &manager{active: map[streamKey]*streamInfo{key: s}}
+	m.TouchStream(context.Background(), key.dirName())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := m.waitForPlayableStream(ctx, key, s, runID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForPlayableStream() error = %v, want %v", err, context.Canceled)
+	}
+	if m.active[key] != s {
+		t.Fatal("canceled waiter removed viewer-owned stream")
 	}
 }
 

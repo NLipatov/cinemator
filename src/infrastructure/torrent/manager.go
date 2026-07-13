@@ -122,21 +122,21 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	return source.Probe(ctx)
 }
 
-func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (string, string, context.CancelFunc, error) {
+func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (string, error) {
 	t, err := addMagnet(m.client, magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
-		return "", "", nil, err
+		return "", err
 	}
 	select {
 	case <-t.GotInfo():
 	case <-ctx.Done():
-		return "", "", nil, ctx.Err()
+		return "", ctx.Err()
 	}
 	files := t.Files()
 	if fileIndex < 0 || fileIndex >= len(files) {
 		log.Printf("PrepareHlsStream: bad file index: %d", fileIndex)
-		return "", "", nil, fmt.Errorf("bad file index")
+		return "", fmt.Errorf("bad file index")
 	}
 	file := files[fileIndex]
 	hash := t.InfoHash().HexString()
@@ -144,64 +144,41 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack}
 	paths := key.paths(m.settings.HlsPath())
 
-	m.mu.Lock()
-	s, exists := m.active[key]
-	if exists {
-		resumed := false
-		s.mtx.Lock()
-		s.lastView = time.Now()
-		needResume := !s.completed && (s.paused || s.cancel == nil)
-		s.mtx.Unlock()
-		if needResume {
-			m.startConversionLocked(key, s)
-			resumed = true
+	if s, runID, resumed, exists, err := m.getOrResumeStream(key); exists {
+		if err != nil {
+			return "", err
 		}
-		m.mu.Unlock()
 		if resumed {
 			m.notifyDownloadsChanged()
 		}
-		if err := s.waitReady(ctx); err != nil {
-			return "", "", nil, err
-		}
-		return s.paths.masterPlaylist, s.paths.outDir, s.cancel, nil
+		return m.waitForPlayableStream(ctx, key, s, runID)
 	}
-	m.mu.Unlock()
 
 	source, err := newTorrentSource(file, m.sources)
 	if err != nil {
-		return "", "", nil, err
+		return "", err
 	}
 
 	m.mu.Lock()
-	s, exists = m.active[key]
-	if exists {
-		source.Close()
-		resumed := false
-		s.mtx.Lock()
-		s.lastView = time.Now()
-		needResume := !s.completed && (s.paused || s.cancel == nil)
-		s.mtx.Unlock()
-		if needResume {
-			m.startConversionLocked(key, s)
-			resumed = true
-		}
+	if s, runID, resumed, exists, resumeErr := m.getOrResumeStreamLocked(key); exists {
 		m.mu.Unlock()
+		source.Close()
+		if resumeErr != nil {
+			return "", resumeErr
+		}
 		if resumed {
 			m.notifyDownloadsChanged()
 		}
-		if err := s.waitReady(ctx); err != nil {
-			return "", "", nil, err
-		}
-		return s.paths.masterPlaylist, s.paths.outDir, s.cancel, nil
+		return m.waitForPlayableStream(ctx, key, s, runID)
 	}
 	if err := resetStreamOutput(paths); err != nil {
 		source.Close()
 		m.mu.Unlock()
-		return "", "", nil, fmt.Errorf("reset stream output %s: %w", paths.outDir, err)
+		return "", fmt.Errorf("reset stream output %s: %w", paths.outDir, err)
 	}
 
 	streamCtx, cancel := context.WithCancel(context.Background())
-	s = &streamInfo{
+	s := &streamInfo{
 		cancel:    cancel,
 		torrent:   t,
 		file:      file,
@@ -212,6 +189,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		running:   true,
 	}
 	runID := s.beginRun()
+	s.registerStartupWaiter()
 	m.active[key] = s
 	m.torrents[hash]++
 	m.mu.Unlock()
@@ -222,12 +200,46 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	source.PrefetchRange(0, initialProbeBytes)
 
 	m.launchConversion(streamCtx, key, s, runID)
-	if err := s.waitReady(ctx); err != nil {
-		m.cleanupIfCurrentRun(key, s, runID)
-		return "", "", nil, err
+	playlist, err := m.waitForPlayableStream(ctx, key, s, runID)
+	if err != nil {
+		return "", err
 	}
 	log.Printf("Stream ready: key=%v, playlist=%s", key, paths.masterPlaylist)
-	return paths.masterPlaylist, paths.outDir, cancel, nil
+	return playlist, nil
+}
+
+func (m *manager) getOrResumeStream(key streamKey) (*streamInfo, uint64, bool, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.getOrResumeStreamLocked(key)
+}
+
+func (m *manager) getOrResumeStreamLocked(key streamKey) (*streamInfo, uint64, bool, bool, error) {
+	s, exists := m.active[key]
+	if !exists {
+		return nil, 0, false, false, nil
+	}
+	s.mtx.Lock()
+	s.lastView = time.Now()
+	needResume := !s.completed && (s.paused || s.cancel == nil)
+	s.mtx.Unlock()
+	if needResume {
+		if err := m.startConversionLocked(key, s); err != nil {
+			return s, 0, false, true, err
+		}
+	}
+	runID := s.registerStartupWaiter()
+	return s, runID, needResume, true, nil
+}
+
+func (m *manager) waitForPlayableStream(ctx context.Context, key streamKey, s *streamInfo, runID uint64) (string, error) {
+	err := s.waitPlayable(ctx)
+	requestCanceled := ctx != nil && ctx.Err() != nil
+	m.releaseStartupWaiter(key, s, runID, requestCanceled)
+	if err != nil {
+		return "", err
+	}
+	return s.paths.masterPlaylist, nil
 }
 
 func (m *manager) ListDownloads(ctx context.Context) ([]domain.Download, error) {
@@ -408,7 +420,7 @@ func (m *manager) runConversion(
 	runID uint64,
 ) error {
 	if err := s.source.WaitRange(streamCtx, 0, initialProbeBytes); err != nil {
-		s.signalReady(runID, err)
+		s.signalPlayable(runID, err)
 		return err
 	}
 
@@ -431,30 +443,30 @@ func (m *manager) runConversion(
 
 	streamDone := streamCtx.Done()
 	playlistReadyCh := playlistReady
-	readySent := false
+	playableSent := false
 
 	for {
 		select {
 		case err := <-errCh:
-			if !readySent {
-				s.signalReady(runID, err)
+			if !playableSent {
+				s.signalPlayable(runID, err)
 			}
 			return err
 		case <-streamDone:
 			err := streamCtx.Err()
-			if !readySent {
-				s.signalReady(runID, err)
+			if !playableSent {
+				s.signalPlayable(runID, err)
 			}
 			return err
 		case err := <-playlistReadyCh:
 			if err != nil {
-				if !readySent {
-					s.signalReady(runID, err)
+				if !playableSent {
+					s.signalPlayable(runID, err)
 				}
 				return err
 			}
-			s.signalReady(runID, nil)
-			readySent = true
+			s.signalPlayable(runID, nil)
+			playableSent = true
 			streamDone = nil
 			playlistReadyCh = nil
 		}

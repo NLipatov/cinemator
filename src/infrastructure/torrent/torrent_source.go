@@ -67,8 +67,10 @@ func (s *torrentSource) Probe(ctx context.Context) (domain.MediaInfo, error) {
 	reader.SetContext(ctx)
 	reader.SetReadahead(maxProbeBytes)
 	defer reader.Close()
-	if info, err := (ffmpeg.SampleAnalyzer{}).Analyze(reader); err == nil {
+	if info, err := (ffmpeg.SampleAnalyzer{}).Analyze(ctx, reader); err == nil {
 		return info, nil
+	} else if ctx.Err() != nil {
+		return domain.MediaInfo{}, ctx.Err()
 	}
 
 	if tailOffset := s.file.Length() - probeTailBytes; tailOffset > 0 {

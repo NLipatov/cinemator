@@ -43,9 +43,9 @@ func RunWithStdin(ctx context.Context, stdin io.Reader, name string, args ...str
 	if runErr == nil {
 		if ctx.Err() != nil {
 			if suffix == "" {
-				return outBuf.Bytes(), fmt.Errorf("%s canceled: %v", name, ctx.Err())
+				return outBuf.Bytes(), fmt.Errorf("%s canceled: %w", name, ctx.Err())
 			}
-			return outBuf.Bytes(), fmt.Errorf("%s canceled: %v\n%s", name, ctx.Err(), suffix)
+			return outBuf.Bytes(), fmt.Errorf("%s canceled: %w\n%s", name, ctx.Err(), suffix)
 		}
 		return outBuf.Bytes(), nil
 	}
@@ -53,9 +53,9 @@ func RunWithStdin(ctx context.Context, stdin io.Reader, name string, args ...str
 	// Context canceled/timeout takes precedence.
 	if ctx.Err() != nil {
 		if suffix == "" {
-			return outBuf.Bytes(), fmt.Errorf("%s canceled: %v", name, ctx.Err())
+			return outBuf.Bytes(), fmt.Errorf("%s canceled: %w", name, ctx.Err())
 		}
-		return outBuf.Bytes(), fmt.Errorf("%s canceled: %v\n%s", name, ctx.Err(), suffix)
+		return outBuf.Bytes(), fmt.Errorf("%s canceled: %w\n%s", name, ctx.Err(), suffix)
 	}
 
 	// Non-zero exit? include exit code if available.

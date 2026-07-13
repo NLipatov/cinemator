@@ -26,6 +26,16 @@ type Converter struct {
 	master     string
 }
 
+type conversionTask struct {
+	name string
+	run  func() error
+}
+
+type conversionTaskResult struct {
+	name string
+	err  error
+}
+
 func NewURLConverter(ctx context.Context,
 	inputURL string,
 	outDir, videoPlaylist, subtitlePlaylist, masterPlaylist string,
@@ -51,6 +61,9 @@ func (c *Converter) ConvertToHLS() error {
 	if err != nil {
 		return err
 	}
+	if err := validateSelection(info, c.selection); err != nil {
+		return err
+	}
 
 	// --- 2. decide subtitle strategy ---------------------------------
 	hasSubtitle := c.selection.SubtitleTrackIndex >= 0 && c.selection.SubtitleTrackIndex < len(info.Subtitles)
@@ -64,82 +77,90 @@ func (c *Converter) ConvertToHLS() error {
 	args := c.builder.Build(info, videoSel)
 	log.Println("ffmpeg", strings.Join(args, " "))
 
-	// --- 4. run ffmpeg ------------------------------------------------
-	videoErrCh := make(chan error, 1)
-	go func() {
-		err := c.runFFmpeg(args)
-		videoErrCh <- err
-	}()
+	// --- 4. run conversion tasks --------------------------------------
+	runCtx, cancel := context.WithCancel(c.ctx)
+	defer cancel()
+	runner := *c
+	runner.ctx = runCtx
 
-	var subtitleErrCh chan error
-	var subtitlePlaylistErrCh chan error
+	tasks := []conversionTask{
+		{name: "video ffmpeg", run: func() error { return runner.runFFmpeg(args) }},
+	}
 	if textSubtitle {
-		subtitleErrCh = make(chan error, 1)
 		subtitleCompleted := make(chan struct{})
-		go func() {
-			subArgs := c.subtitleArgs(c.selection.SubtitleTrackIndex)
-			log.Println("ffmpeg (subtitle)", strings.Join(subArgs, " "))
-			err := c.runFFmpeg(subArgs)
-			if err == nil {
-				close(subtitleCompleted)
-			}
-			subtitleErrCh <- err
-		}()
+		tasks = append(tasks, conversionTask{
+			name: "subtitle ffmpeg",
+			run: func() error {
+				subArgs := runner.subtitleArgs(runner.selection.SubtitleTrackIndex)
+				log.Println("ffmpeg (subtitle)", strings.Join(subArgs, " "))
+				err := runner.runFFmpeg(subArgs)
+				if err == nil {
+					close(subtitleCompleted)
+				}
+				return err
+			},
+		}, conversionTask{
+			name: "subtitle playlist",
+			run: func() error {
+				return runner.writeNormalizedSubtitlePlaylist(subtitleCompleted)
+			},
+		})
+	}
+	tasks = append(tasks, conversionTask{
+		name: "master playlist",
+		run: func() error {
+			return runner.writeMasterAfterRenditionsReady(info, textSubtitle)
+		},
+	})
 
-		subtitlePlaylistErrCh = make(chan error, 1)
+	return runConversionTasks(runCtx, cancel, tasks)
+}
+
+func validateSelection(info domain.MediaInfo, selection StreamSelection) error {
+	if selection.AudioTrackIndex < -1 {
+		return fmt.Errorf("invalid audio track index: %d", selection.AudioTrackIndex)
+	}
+	if len(info.AudioTracks) > 0 && selection.AudioTrackIndex >= len(info.AudioTracks) {
+		return fmt.Errorf("audio track index %d out of range (tracks: %d)", selection.AudioTrackIndex, len(info.AudioTracks))
+	}
+	if len(info.AudioTracks) == 0 && selection.AudioTrackIndex > 0 {
+		return fmt.Errorf("audio track index %d out of range (no audio tracks)", selection.AudioTrackIndex)
+	}
+	if selection.SubtitleTrackIndex < -1 || selection.SubtitleTrackIndex >= len(info.Subtitles) {
+		return fmt.Errorf("subtitle track index %d out of range (tracks: %d)", selection.SubtitleTrackIndex, len(info.Subtitles))
+	}
+	return nil
+}
+
+func runConversionTasks(ctx context.Context, cancel context.CancelFunc, tasks []conversionTask) error {
+	results := make(chan conversionTaskResult, len(tasks))
+	for _, task := range tasks {
+		task := task
 		go func() {
-			err := c.writeNormalizedSubtitlePlaylist(subtitleCompleted)
-			subtitlePlaylistErrCh <- err
+			results <- conversionTaskResult{name: task.name, err: task.run()}
 		}()
 	}
 
-	masterReady := make(chan error, 1)
-	go func() { masterReady <- c.writeMasterAfterRenditionsReady(info, textSubtitle) }()
-
-	subtitleDone := subtitleErrCh == nil
-	subtitlePlaylistDone := subtitlePlaylistErrCh == nil
-	videoDone := false
-	masterDone := false
-
-	for {
+	remaining := len(tasks)
+	var firstErr error
+	done := ctx.Done()
+	for remaining > 0 {
 		select {
-		case <-c.ctx.Done():
-			return c.ctx.Err()
-		case err := <-videoErrCh:
-			videoDone = true
-			if err != nil {
-				return err
+		case result := <-results:
+			remaining--
+			if result.err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("%s: %w", result.name, result.err)
+				cancel()
 			}
-			if videoDone && subtitleDone && subtitlePlaylistDone && masterDone {
-				return nil
+		case <-done:
+			if firstErr == nil {
+				firstErr = ctx.Err()
 			}
-		case err := <-masterReady:
-			masterDone = true
-			if err != nil {
-				return err
-			}
-			if videoDone && subtitleDone && subtitlePlaylistDone && masterDone {
-				return nil
-			}
-		case err := <-subtitleErrCh:
-			subtitleDone = true
-			if err != nil {
-				log.Printf("Subtitle stream error: %v", err)
-				return err
-			}
-			if videoDone && subtitleDone && subtitlePlaylistDone && masterDone {
-				return nil
-			}
-		case err := <-subtitlePlaylistErrCh:
-			subtitlePlaylistDone = true
-			if err != nil {
-				return err
-			}
-			if videoDone && subtitleDone && subtitlePlaylistDone && masterDone {
-				return nil
-			}
+			cancel()
+			done = nil
 		}
 	}
+	return firstErr
 }
 
 func (c *Converter) runFFmpeg(args []string) error {
@@ -164,6 +185,10 @@ func (c *Converter) subtitleArgs(subIdx int) []string {
 }
 
 func (c *Converter) writeNormalizedSubtitlePlaylist(subtitleCompleted <-chan struct{}) error {
+	preroll := filepath.Join(c.builder.OutDir, subtitlePrerollFilename)
+	if err := writeFileAtomic(preroll, []byte("WEBVTT\n\n"), 0644); err != nil {
+		return err
+	}
 	normalizer := subtitlePlaylistNormalizer{
 		ctx:               c.ctx,
 		rawPlaylist:       c.rawSubList,
@@ -191,7 +216,7 @@ func (c *Converter) writeMasterAfterRenditionsReady(info domain.MediaInfo, withS
 		lang = info.Subtitles[c.selection.SubtitleTrackIndex].Language
 	}
 	masterData := buildMasterPlaylist(filepath.Base(c.videoList), filepath.Base(c.subList), withSubs, lang)
-	return os.WriteFile(c.master, []byte(masterData), 0644)
+	return writeFileAtomic(c.master, []byte(masterData), 0644)
 }
 
 func waitForPlaylistSegment(ctx context.Context, path string, timeout time.Duration) error {

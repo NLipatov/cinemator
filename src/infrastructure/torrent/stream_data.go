@@ -21,21 +21,23 @@ type streamKey struct {
 }
 
 type streamInfo struct {
-	ready     chan struct{}
-	cancel    context.CancelFunc
-	torrent   *torrent.Torrent
-	file      *torrent.File
-	lastView  time.Time
-	mtx       sync.Mutex
-	selection ffmpeg.StreamSelection
-	paths     streamPaths
-	source    *torrentSource
-	runID     uint64
-	readyErr  error
-	readySent bool
-	paused    bool
-	running   bool
-	completed bool
+	playable       chan struct{}
+	cancel         context.CancelFunc
+	torrent        *torrent.Torrent
+	file           *torrent.File
+	lastView       time.Time
+	mtx            sync.Mutex
+	selection      ffmpeg.StreamSelection
+	paths          streamPaths
+	source         *torrentSource
+	runID          uint64
+	playableErr    error
+	playableSent   bool
+	startupWaiters int
+	viewerSeen     bool
+	paused         bool
+	running        bool
+	completed      bool
 }
 
 type streamPaths struct {
@@ -48,25 +50,33 @@ type streamPaths struct {
 func (s *streamInfo) beginRun() uint64 {
 	s.mtx.Lock()
 	s.runID++
-	s.ready = make(chan struct{})
-	s.readyErr = nil
-	s.readySent = false
+	s.playable = make(chan struct{})
+	s.playableErr = nil
+	s.playableSent = false
+	s.viewerSeen = false
 	s.completed = false
 	runID := s.runID
 	s.mtx.Unlock()
 	return runID
 }
 
-func (s *streamInfo) signalReady(runID uint64, err error) bool {
+func (s *streamInfo) registerStartupWaiter() uint64 {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	if runID != s.runID || s.readySent {
+	s.startupWaiters++
+	return s.runID
+}
+
+func (s *streamInfo) signalPlayable(runID uint64, err error) bool {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if runID != s.runID || s.playableSent {
 		return false
 	}
-	s.readyErr = err
-	s.readySent = true
-	if s.ready != nil {
-		close(s.ready)
+	s.playableErr = err
+	s.playableSent = true
+	if s.playable != nil {
+		close(s.playable)
 	}
 	return true
 }
@@ -77,33 +87,33 @@ func (s *streamInfo) isCurrentRun(runID uint64) bool {
 	return runID == s.runID
 }
 
-func (s *streamInfo) waitReady(ctx context.Context) error {
+func (s *streamInfo) waitPlayable(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	s.mtx.Lock()
-	ready := s.ready
-	readyErr := s.readyErr
-	readySent := s.readySent
+	playable := s.playable
+	playableErr := s.playableErr
+	playableSent := s.playableSent
 	s.mtx.Unlock()
 
-	if ready == nil || readySent {
-		return readyErr
+	if playable == nil || playableSent {
+		return playableErr
 	}
 
 	select {
-	case <-ready:
-		return s.readyError()
+	case <-playable:
+		return s.playableError()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (s *streamInfo) readyError() error {
+func (s *streamInfo) playableError() error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
-	return s.readyErr
+	return s.playableErr
 }
 
 func (k streamKey) dirName() string {

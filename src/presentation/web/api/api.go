@@ -63,6 +63,11 @@ func (s *HttpServer) Run() error {
 }
 
 func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	magnet := r.URL.Query().Get("magnet")
 	if magnet == "" {
 		http.Error(w, "magnet required", 400)
@@ -79,6 +84,11 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *HttpServer) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	magnet, fileIndex, err := parseMagnetAndFile(r)
 	if err != nil {
 		http.Error(w, err.Error(), 400)
@@ -205,27 +215,29 @@ func (s *HttpServer) handleDownloadAction(w http.ResponseWriter, r *http.Request
 }
 
 func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	magnet, fileIndex, err := parseMagnetAndFile(r)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	audioTrack := 0
-	if a := r.URL.Query().Get("audio"); a != "" {
-		if parsed, err := strconv.Atoi(a); err == nil {
-			audioTrack = parsed
-		}
+	audioTrack, err := parseTrackIndex(r, "audio", 0, -1)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	subtitleTrack, err := parseTrackIndex(r, "subtitle", -1, -1)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 
-	subtitleTrack := -1
-	if sub := r.URL.Query().Get("subtitle"); sub != "" {
-		if parsed, err := strconv.Atoi(sub); err == nil {
-			subtitleTrack = parsed
-		}
-	}
-
-	playlist, _, _, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack)
+	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -385,8 +397,20 @@ func parseMagnetAndFile(r *http.Request) (string, int, error) {
 		return "", 0, errors.New("magnet and file required")
 	}
 	fileIndex, err := strconv.Atoi(idx)
-	if err != nil {
+	if err != nil || fileIndex < 0 {
 		return "", 0, errors.New("bad file index")
 	}
 	return magnet, fileIndex, nil
+}
+
+func parseTrackIndex(r *http.Request, name string, defaultValue, minimum int) (int, error) {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return defaultValue, nil
+	}
+	index, err := strconv.Atoi(raw)
+	if err != nil || index < minimum {
+		return 0, fmt.Errorf("bad %s track index", name)
+	}
+	return index, nil
 }
