@@ -21,21 +21,23 @@ type streamKey struct {
 }
 
 type streamInfo struct {
-	playable     chan struct{}
-	cancel       context.CancelFunc
-	torrent      *torrent.Torrent
-	file         *torrent.File
-	lastView     time.Time
-	mtx          sync.Mutex
-	selection    ffmpeg.StreamSelection
-	paths        streamPaths
-	source       *torrentSource
-	runID        uint64
-	playableErr  error
-	playableSent bool
-	paused       bool
-	running      bool
-	completed    bool
+	playable       chan struct{}
+	cancel         context.CancelFunc
+	torrent        *torrent.Torrent
+	file           *torrent.File
+	lastView       time.Time
+	mtx            sync.Mutex
+	selection      ffmpeg.StreamSelection
+	paths          streamPaths
+	source         *torrentSource
+	runID          uint64
+	playableErr    error
+	playableSent   bool
+	startupWaiters int
+	viewerSeen     bool
+	paused         bool
+	running        bool
+	completed      bool
 }
 
 type streamPaths struct {
@@ -51,10 +53,18 @@ func (s *streamInfo) beginRun() uint64 {
 	s.playable = make(chan struct{})
 	s.playableErr = nil
 	s.playableSent = false
+	s.viewerSeen = false
 	s.completed = false
 	runID := s.runID
 	s.mtx.Unlock()
 	return runID
+}
+
+func (s *streamInfo) registerStartupWaiter() uint64 {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	s.startupWaiters++
+	return s.runID
 }
 
 func (s *streamInfo) signalPlayable(runID uint64, err error) bool {

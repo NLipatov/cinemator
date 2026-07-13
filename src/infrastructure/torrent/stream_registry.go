@@ -42,21 +42,27 @@ func (m *manager) cleanupIfCurrentRun(key streamKey, expected *streamInfo, runID
 
 func (m *manager) cleanupMatching(key streamKey, expected *streamInfo, runID uint64, checkRun bool) {
 	m.mu.Lock()
+	s, shouldDrop, cleaned := m.cleanupMatchingLocked(key, expected, runID, checkRun)
+	m.mu.Unlock()
+	if !cleaned {
+		return
+	}
+	m.finishStreamCleanup(key, s, shouldDrop)
+}
+
+func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, runID uint64, checkRun bool) (*streamInfo, bool, bool) {
 	s, ok := m.active[key]
 	if !ok {
 		if expected == nil {
 			log.Printf("cleanup called, but no active stream found: key=%v", key)
 		}
-		m.mu.Unlock()
-		return
+		return nil, false, false
 	}
 	if expected != nil && s != expected {
-		m.mu.Unlock()
-		return
+		return nil, false, false
 	}
 	if checkRun && !s.isCurrentRun(runID) {
-		m.mu.Unlock()
-		return
+		return nil, false, false
 	}
 	if s.cancel != nil {
 		s.cancel()
@@ -80,13 +86,42 @@ func (m *manager) cleanupMatching(key streamKey, expected *streamInfo, runID uin
 		s.file.SetPriority(0)
 	}
 	delete(m.active, key)
-	m.mu.Unlock()
+	return s, shouldDrop, true
+}
+
+func (m *manager) finishStreamCleanup(key streamKey, s *streamInfo, shouldDrop bool) {
 	m.notifyDownloadsChanged()
 	log.Printf("Stream cleaned up: key=%v", key)
-	if shouldDrop {
+	if shouldDrop && s.torrent != nil {
 		log.Printf("Dropping torrent: %s", key.InfoHash)
 		s.torrent.Drop()
 	}
+}
+
+func (m *manager) releaseStartupWaiter(key streamKey, s *streamInfo, runID uint64, requestCanceled bool) bool {
+	m.mu.Lock()
+	current, active := m.active[key]
+	s.mtx.Lock()
+	registered := s.startupWaiters > 0
+	if registered {
+		s.startupWaiters--
+	}
+	abandoned := registered && requestCanceled &&
+		active && current == s && runID == s.runID &&
+		s.startupWaiters == 0 && !s.viewerSeen
+	s.mtx.Unlock()
+
+	cleaned := false
+	var cleanedStream *streamInfo
+	var shouldDrop bool
+	if abandoned {
+		cleanedStream, shouldDrop, cleaned = m.cleanupMatchingLocked(key, s, runID, true)
+	}
+	m.mu.Unlock()
+	if cleaned {
+		m.finishStreamCleanup(key, cleanedStream, shouldDrop)
+	}
+	return cleaned
 }
 
 func (m *manager) pauseStream(key streamKey) {
@@ -145,6 +180,7 @@ func (m *manager) TouchStream(_ context.Context, dirName string) {
 	if s, ok := m.active[key]; ok {
 		s.mtx.Lock()
 		s.lastView = time.Now()
+		s.viewerSeen = true
 		s.mtx.Unlock()
 	}
 	m.mu.Unlock()
