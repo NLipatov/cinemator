@@ -131,6 +131,24 @@ body {
   gap: 0.45rem;
 }
 
+.auth-logout {
+  min-height: 2.2rem;
+  padding: 0.4rem 0.7rem;
+  color: var(--color-muted);
+  background: transparent;
+  border-color: var(--color-border);
+  border-radius: 999rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+.auth-logout:hover,
+.auth-logout:focus-visible {
+  color: var(--color-fg);
+  border-color: var(--color-border-strong);
+  background: var(--color-card-subtle);
+}
+
 .theme-toggle {
   position: relative;
   width: 2.2rem;
@@ -180,6 +198,71 @@ body {
   align-items: start;
   justify-items: center;
   gap: 0.85rem;
+}
+
+.login-body {
+  display: grid;
+  place-items: center;
+  padding-top: calc(var(--header-height) + 1.4rem);
+}
+
+.login-shell {
+  width: min(100%, 24rem);
+}
+
+.login-card {
+  display: grid;
+  gap: 1rem;
+  padding: clamp(1rem, 4vw, 1.5rem);
+  color: var(--color-fg);
+  background: var(--color-card);
+  border: var(--line) solid var(--color-border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-soft), var(--shadow-inset);
+}
+
+.login-copy {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.login-copy h1,
+.login-copy p {
+  margin: 0;
+}
+
+.login-copy h1 {
+  font-size: 1.15rem;
+}
+
+.login-copy p {
+  color: var(--color-muted);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.login-form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.login-form label {
+  color: var(--color-muted);
+  font-size: 0.86rem;
+  font-weight: 640;
+}
+
+.login-form button {
+  color: var(--color-button-fg);
+  background: var(--color-button-bg);
+  border-color: transparent;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.login-form button:hover,
+.login-form button:focus-visible {
+  background: var(--color-button-hover);
 }
 
 body.has-player .app-shell {

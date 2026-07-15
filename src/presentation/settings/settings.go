@@ -22,6 +22,7 @@ type Settings struct {
 	maxCacheBytes int64
 	httpPort      int
 	torrentPort   int
+	passwordHash  string
 }
 
 func NewSettings() Settings {
@@ -32,6 +33,7 @@ func NewSettings() Settings {
 		maxCacheBytes: int64Env("CINEMATOR_MAX_CACHE_BYTES", defaultMaxCacheBytes),
 		httpPort:      intEnv("CINEMATOR_HTTP_PORT", defaultHTTPPort),
 		torrentPort:   intEnv("CINEMATOR_TORRENT_PORT", defaultTorrentPort),
+		passwordHash:  stringEnv("CINEMATOR_PASSWORD_HASH", ""),
 	}
 }
 
@@ -57,6 +59,10 @@ func (s Settings) HttpPort() int {
 
 func (s Settings) TorrentPort() int {
 	return s.torrentPort
+}
+
+func (s Settings) PasswordHash() string {
+	return s.passwordHash
 }
 
 func stringEnv(key, fallback string) string {

@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Sign in · Cinemator</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="/index.css">
+  <link rel="icon" href="/favicon.ico">
+</head>
+<body class="login-body">
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-name">cinemator</span>
+      </div>
+      <div class="top-actions">
+        <button class="theme-toggle" id="themeToggle" type="button" title="Switch theme" aria-label="Switch theme">
+          <span class="icon" id="icon-moon" style="display:none;">☾</span>
+          <span class="icon" id="icon-sun" style="display:none;">☼</span>
+        </button>
+      </div>
+    </div>
+  </header>
+  <main class="login-shell">
+    <section class="login-card">
+      <div class="login-copy">
+        <h1>Sign in</h1>
+        <p>Enter the password configured by the server owner.</p>
+      </div>
+      <form class="login-form" id="loginForm">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+        <button id="loginButton" type="submit">Continue</button>
+        <div class="msg" id="loginMessage" role="alert" aria-live="polite"></div>
+      </form>
+    </section>
+  </main>
+  <script src="/login.js"></script>
+</body>
+</html>

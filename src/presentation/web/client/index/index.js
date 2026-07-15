@@ -22,6 +22,35 @@
 
     // Main logic
     const $ = id => document.getElementById(id);
+    async function apiFetch(input, init) {
+      const response = await window.fetch(input, init);
+      if (response.status === 401) {
+        window.location.replace('/login');
+        throw new Error('Session expired');
+      }
+      return response;
+    }
+
+    const logoutBtn = $('logoutBtn');
+    if (logoutBtn) {
+      window.fetch('/api/auth/status', { cache: 'no-store' })
+        .then(response => response.ok ? response.json() : null)
+        .then(status => {
+          logoutBtn.hidden = !status?.enabled;
+        })
+        .catch(() => {});
+      logoutBtn.addEventListener('click', async () => {
+        logoutBtn.disabled = true;
+        try {
+          const response = await apiFetch('/api/auth/logout', { method: 'POST' });
+          if (!response.ok) throw new Error('Could not sign out');
+          window.location.replace('/login');
+        } catch (error) {
+          if (window.location.pathname !== '/login') logoutBtn.disabled = false;
+        }
+      });
+    }
+
     let hls = null;
     let subtitleDelay = parseFloat(localStorage.getItem('subtitle-delay') || '0');
     let msgTimeout = null;
@@ -312,7 +341,7 @@
       downloadsLoading = true;
       if (!quiet) showMsg('downloadsMsg', 'Loading downloads...', false, true);
       try {
-        const res = await fetch('/api/downloads');
+        const res = await apiFetch('/api/downloads');
         if (!res.ok) throw new Error('Could not load downloads');
         downloadCatalog = await res.json();
         renderDownloads(downloadCatalog);
@@ -356,7 +385,7 @@
     async function extendDownload(id, days) {
       showMsg('downloadsMsg', 'Extending download...', false, true);
       try {
-        const res = await fetch(`/api/downloads/${encodeURIComponent(id)}/extend`, {
+        const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}/extend`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ days }),
@@ -374,7 +403,7 @@
       if (!download || !window.confirm(`Delete ${download.title || id}?`)) return;
       showMsg('downloadsMsg', 'Deleting download...', false, true);
       try {
-        const res = await fetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('Could not delete download');
         if ($('magnet').value.trim() === download.magnet) {
           cancelFlowRequest();
@@ -497,7 +526,7 @@
       $('player-block').style.display = 'none';
       removeWarning();
       try {
-        const res = await fetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: request.signal });
+        const res = await apiFetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: request.signal });
         if (!res.ok) throw new Error((await res.text()).trim() || 'Server error');
         const files = await res.json();
         if (isStale(requestId)) return;
@@ -536,7 +565,7 @@
       showMsg('fileMsg', 'Loading track info…', false, true);
       $('step-tracks').style.display = 'none';
       try {
-        const res = await fetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal });
+        const res = await apiFetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal });
         if (!res.ok) throw new Error((await res.text()).trim() || 'Could not load media info');
         const info = await res.json();
         if (isStale(requestId)) return;
@@ -631,7 +660,7 @@
         }, 8000);
       }
       try {
-        const resp = await fetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}`, {
+        const resp = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}`, {
           redirect: 'follow',
           signal: request.signal,
         });

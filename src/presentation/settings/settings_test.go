@@ -10,6 +10,7 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	t.Setenv("CINEMATOR_HTTP_PORT", "18080")
 	t.Setenv("CINEMATOR_TORRENT_PORT", "0")
 	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "12345")
+	t.Setenv("CINEMATOR_PASSWORD_HASH", "$2a$04$test")
 
 	settings := NewSettings()
 	if settings.HlsPath() != "/tmp/cinemator-test-hls" {
@@ -26,6 +27,9 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	}
 	if settings.MaxCacheBytes() != 12345 {
 		t.Fatalf("MaxCacheBytes() = %d", settings.MaxCacheBytes())
+	}
+	if settings.PasswordHash() != "$2a$04$test" {
+		t.Fatalf("PasswordHash() = %q", settings.PasswordHash())
 	}
 }
 

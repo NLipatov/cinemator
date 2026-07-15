@@ -1,0 +1,33 @@
+services:
+  cinemator:
+    image: nlipatov/cinemator:${CINEMATOR_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      CINEMATOR_PASSWORD_HASH: ${CINEMATOR_PASSWORD_HASH:-}
+    expose:
+      - "8000"
+    ports:
+      - "42069:42069/tcp"
+      - "42069:42069/udp"
+    volumes:
+      - /var/tmp/cinemator:/var/tmp/cinemator
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - cinemator
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,3 @@
+{$DOMAIN} {
+	reverse_proxy cinemator:8000
+}
