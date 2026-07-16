@@ -1,13 +1,15 @@
 package api
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -15,26 +17,31 @@ import (
 
 const (
 	sessionCookieName = "__Host-cinemator_session"
-	sessionTTL        = 30 * 24 * time.Hour
+	sessionTTL        = 7 * 24 * time.Hour
 	maxLoginBodyBytes = 4 << 10
+	minSessionSecret  = 32
+	sessionNonceBytes = 32
+	sessionVersion    = "v1"
 )
 
 type authenticator struct {
 	passwordHash []byte
-	mu           sync.Mutex
-	sessions     map[string]time.Time
+	sessionKey   []byte
 }
 
-func newAuthenticator(passwordHash string) (*authenticator, error) {
+func newAuthenticator(passwordHash, sessionSecret string) (*authenticator, error) {
 	if passwordHash == "" {
 		return nil, nil
 	}
 	if _, err := bcrypt.Cost([]byte(passwordHash)); err != nil {
 		return nil, errors.New("CINEMATOR_PASSWORD_HASH must contain a valid bcrypt hash")
 	}
+	if len(sessionSecret) < minSessionSecret {
+		return nil, errors.New("CINEMATOR_SESSION_SECRET must contain at least 32 bytes when authentication is enabled")
+	}
 	return &authenticator{
 		passwordHash: []byte(passwordHash),
-		sessions:     make(map[string]time.Time),
+		sessionKey:   []byte(sessionSecret),
 	}, nil
 }
 
@@ -130,26 +137,17 @@ func (s *HttpServer) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if cookie, err := r.Cookie(sessionCookieName); err == nil {
-		s.auth.deleteSession(cookie.Value)
-	}
 	http.SetCookie(w, sessionCookie("", time.Unix(1, 0), -1))
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *authenticator) createSession() (string, time.Time, error) {
-	var randomBytes [32]byte
-	if _, err := rand.Read(randomBytes[:]); err != nil {
+	expiresAt := time.Now().Add(sessionTTL)
+	token, err := a.newSessionToken(expiresAt)
+	if err != nil {
 		return "", time.Time{}, err
 	}
-	token := base64.RawURLEncoding.EncodeToString(randomBytes[:])
-	expiresAt := time.Now().Add(sessionTTL)
-
-	a.mu.Lock()
-	a.deleteExpiredSessionsLocked(time.Now())
-	a.sessions[token] = expiresAt
-	a.mu.Unlock()
 	return token, expiresAt, nil
 }
 
@@ -158,30 +156,44 @@ func (a *authenticator) authenticated(r *http.Request) bool {
 	if err != nil || cookie.Value == "" {
 		return false
 	}
-
-	now := time.Now()
-	a.mu.Lock()
-	expiresAt, exists := a.sessions[cookie.Value]
-	if exists && !expiresAt.After(now) {
-		delete(a.sessions, cookie.Value)
-		exists = false
+	parts := strings.Split(cookie.Value, ".")
+	if len(parts) != 4 || parts[0] != sessionVersion {
+		return false
 	}
-	a.mu.Unlock()
-	return exists
+	nonce, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || len(nonce) != sessionNonceBytes {
+		return false
+	}
+	providedSignature, err := base64.RawURLEncoding.DecodeString(parts[3])
+	if err != nil {
+		return false
+	}
+	payload := strings.Join(parts[:3], ".")
+	if !hmac.Equal(providedSignature, a.sign(payload)) {
+		return false
+	}
+	expiresAt, err := strconv.ParseInt(parts[1], 10, 64)
+	return err == nil && time.Unix(expiresAt, 0).After(time.Now())
 }
 
-func (a *authenticator) deleteSession(token string) {
-	a.mu.Lock()
-	delete(a.sessions, token)
-	a.mu.Unlock()
+func (a *authenticator) newSessionToken(expiresAt time.Time) (string, error) {
+	nonce := make([]byte, sessionNonceBytes)
+	if _, err := rand.Read(nonce); err != nil {
+		return "", err
+	}
+	payload := strings.Join([]string{
+		sessionVersion,
+		strconv.FormatInt(expiresAt.Unix(), 10),
+		base64.RawURLEncoding.EncodeToString(nonce),
+	}, ".")
+	signature := base64.RawURLEncoding.EncodeToString(a.sign(payload))
+	return payload + "." + signature, nil
 }
 
-func (a *authenticator) deleteExpiredSessionsLocked(now time.Time) {
-	for token, expiresAt := range a.sessions {
-		if !expiresAt.After(now) {
-			delete(a.sessions, token)
-		}
-	}
+func (a *authenticator) sign(payload string) []byte {
+	mac := hmac.New(sha256.New, a.sessionKey)
+	_, _ = mac.Write([]byte(payload))
+	return mac.Sum(nil)
 }
 
 func sessionCookie(value string, expiresAt time.Time, maxAge int) *http.Cookie {

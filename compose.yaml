@@ -4,6 +4,7 @@ services:
     restart: unless-stopped
     environment:
       CINEMATOR_PASSWORD_HASH: ${CINEMATOR_PASSWORD_HASH:-}
+      CINEMATOR_SESSION_SECRET: ${CINEMATOR_SESSION_SECRET:-}
     expose:
       - "8000"
     ports:

@@ -5,14 +5,17 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"cinemator/presentation/settings"
 
 	"golang.org/x/crypto/bcrypt"
 )
 
-func TestNewAuthenticatorIsOptionalAndValidatesHash(t *testing.T) {
-	auth, err := newAuthenticator("")
+const testSessionSecret = "0123456789abcdef0123456789abcdef"
+
+func TestNewAuthenticatorIsOptionalAndValidatesConfiguration(t *testing.T) {
+	auth, err := newAuthenticator("", "")
 	if err != nil {
 		t.Fatalf("newAuthenticator(empty) error = %v", err)
 	}
@@ -20,8 +23,16 @@ func TestNewAuthenticatorIsOptionalAndValidatesHash(t *testing.T) {
 		t.Fatal("newAuthenticator(empty) did not disable authentication")
 	}
 
-	if _, err := newAuthenticator("not-a-bcrypt-hash"); err == nil {
+	if _, err := newAuthenticator("not-a-bcrypt-hash", testSessionSecret); err == nil {
 		t.Fatal("newAuthenticator(invalid) error = nil, want error")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte("password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	if _, err := newAuthenticator(string(hash), "too-short"); err == nil {
+		t.Fatal("newAuthenticator(short secret) error = nil, want error")
 	}
 }
 
@@ -30,7 +41,7 @@ func TestAuthenticationFlowProtectsApplication(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateFromPassword() error = %v", err)
 	}
-	auth, err := newAuthenticator(string(hash))
+	auth, err := newAuthenticator(string(hash), testSessionSecret)
 	if err != nil {
 		t.Fatalf("newAuthenticator() error = %v", err)
 	}
@@ -96,6 +107,60 @@ func TestAuthenticationFlowProtectsApplication(t *testing.T) {
 		}
 	})
 
+	t.Run("another instance accepts session signed with the same secret", func(t *testing.T) {
+		peerAuth, err := newAuthenticator(string(hash), testSessionSecret)
+		if err != nil {
+			t.Fatalf("newAuthenticator() error = %v", err)
+		}
+		peer := HttpServer{
+			mgr:      fakeTorrentManager{},
+			settings: settings.NewSettings(),
+			auth:     peerAuth,
+		}
+		rec := serveRequest(peer.handler(), httptest.NewRequest(http.MethodGet, "/api/downloads", nil), session)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusOK, rec.Body.String())
+		}
+	})
+
+	t.Run("different secret rejects session", func(t *testing.T) {
+		peerAuth, err := newAuthenticator(string(hash), "abcdef0123456789abcdef0123456789")
+		if err != nil {
+			t.Fatalf("newAuthenticator() error = %v", err)
+		}
+		peer := HttpServer{mgr: fakeTorrentManager{}, settings: settings.NewSettings(), auth: peerAuth}
+		rec := serveRequest(peer.handler(), httptest.NewRequest(http.MethodGet, "/api/downloads", nil), session)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("tampered session is rejected", func(t *testing.T) {
+		tampered := *session
+		signatureStart := strings.LastIndex(tampered.Value, ".") + 1
+		replacement := byte('A')
+		if tampered.Value[signatureStart] == replacement {
+			replacement = 'B'
+		}
+		tampered.Value = tampered.Value[:signatureStart] + string(replacement) + tampered.Value[signatureStart+1:]
+		rec := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/api/downloads", nil), &tampered)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
+	t.Run("expired session is rejected", func(t *testing.T) {
+		token, err := auth.newSessionToken(time.Now().Add(-time.Minute))
+		if err != nil {
+			t.Fatalf("newSessionToken() error = %v", err)
+		}
+		expired := &http.Cookie{Name: sessionCookieName, Value: token}
+		rec := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/api/downloads", nil), expired)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
+		}
+	})
+
 	t.Run("authenticated login page redirects home", func(t *testing.T) {
 		rec := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/login", nil), session)
 		if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/" {
@@ -116,10 +181,6 @@ func TestAuthenticationFlowProtectsApplication(t *testing.T) {
 		t.Fatalf("logout cookie = %#v, want expired cookie", logoutCookies)
 	}
 
-	reusedSession := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/api/downloads", nil), session)
-	if reusedSession.Code != http.StatusUnauthorized {
-		t.Fatalf("reused session status = %d, want %d", reusedSession.Code, http.StatusUnauthorized)
-	}
 }
 
 func TestMissingPasswordHashLeavesApplicationPublic(t *testing.T) {

@@ -28,7 +28,7 @@ type HttpServer struct {
 }
 
 func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
-	auth, err := newAuthenticator(settings.PasswordHash())
+	auth, err := newAuthenticator(settings.PasswordHash(), settings.SessionSecret())
 	if err != nil {
 		return nil, fmt.Errorf("configure authentication: %w", err)
 	}

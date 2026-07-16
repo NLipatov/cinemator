@@ -23,6 +23,7 @@ type Settings struct {
 	httpPort      int
 	torrentPort   int
 	passwordHash  string
+	sessionSecret string
 }
 
 func NewSettings() Settings {
@@ -34,6 +35,7 @@ func NewSettings() Settings {
 		httpPort:      intEnv("CINEMATOR_HTTP_PORT", defaultHTTPPort),
 		torrentPort:   intEnv("CINEMATOR_TORRENT_PORT", defaultTorrentPort),
 		passwordHash:  stringEnv("CINEMATOR_PASSWORD_HASH", ""),
+		sessionSecret: stringEnv("CINEMATOR_SESSION_SECRET", ""),
 	}
 }
 
@@ -63,6 +65,10 @@ func (s Settings) TorrentPort() int {
 
 func (s Settings) PasswordHash() string {
 	return s.passwordHash
+}
+
+func (s Settings) SessionSecret() string {
+	return s.sessionSecret
 }
 
 func stringEnv(key, fallback string) string {

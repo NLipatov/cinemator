@@ -77,7 +77,19 @@ Store the result in single quotes so Compose preserves the `$` characters:
 CINEMATOR_PASSWORD_HASH='$2a$14$...'
 ```
 
-Leave `CINEMATOR_PASSWORD_HASH` empty to keep Cinemator public. Authenticated sessions are kept in memory, so restarting Cinemator signs everyone out. Password authentication is intended to be used over HTTPS.
+Generate a session-signing secret:
+
+```bash
+openssl rand -base64 32
+```
+
+Store it alongside the password hash:
+
+```dotenv
+CINEMATOR_SESSION_SECRET='...'
+```
+
+Leave `CINEMATOR_PASSWORD_HASH` empty to keep Cinemator public. When password protection is enabled, `CINEMATOR_SESSION_SECRET` must contain at least 32 bytes. Sessions are stateless and remain valid for seven days, so use the same password hash and session secret on every Cinemator instance behind the domain. Rotating the session secret signs everyone out. Password authentication is intended to be used over HTTPS.
 
 ### 3) Start the services
 
