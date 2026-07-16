@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/NLipatov/cinemator/compare/0.2.1...0.3.0) (2026-07-16)
+
+
+### Features
+
+* add Caddy deployment and optional app authentication ([d3f7271](https://github.com/NLipatov/cinemator/commit/d3f72710563598cf747fa0176e51abe44b27abd8))
+
+
+### Bug Fixes
+
+* **ci:** restore Caddy release metadata ([ea023d7](https://github.com/NLipatov/cinemator/commit/ea023d7f671c2fa458e14ed8ffa09eacd8b668fc))
+
 ## [0.2.1](https://github.com/NLipatov/cinemator/compare/0.2.0...0.2.1) (2026-07-13)
 
 
