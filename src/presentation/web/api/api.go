@@ -24,9 +24,14 @@ import (
 type HttpServer struct {
 	mgr      application.TorrentManager
 	settings settings.Settings
+	auth     *authenticator
 }
 
 func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
+	auth, err := newAuthenticator(settings.PasswordHash(), settings.SessionSecret())
+	if err != nil {
+		return nil, fmt.Errorf("configure authentication: %w", err)
+	}
 	mgr, err := torrent.NewManager(settings)
 	if err != nil {
 		return nil, err
@@ -34,6 +39,7 @@ func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
 	return &HttpServer{
 		mgr:      mgr,
 		settings: settings,
+		auth:     auth,
 	}, nil
 }
 
@@ -43,23 +49,37 @@ func (s *HttpServer) Run() error {
 		return errors.New("invalid port")
 	}
 
-	// http-web client endpoints
-	http.Handle("/", http.FileServer(http.Dir("presentation/web/client/index")))
-	http.Handle("/favicon.ico", http.FileServer(http.Dir("presentation/web/client/static")))
-	http.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir("presentation/web/client/static/assets"))))
-
-	// http-api endpoints
-	http.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
-	http.HandleFunc("/api/media/info", s.handleGetMediaInfo)
-	http.HandleFunc("/api/downloads", s.handleListDownloads)
-	http.HandleFunc("/api/downloads/events", s.handleDownloadEvents)
-	http.HandleFunc("/api/downloads/", s.handleDownloadAction)
-	http.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
-	http.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
-
 	listenPort := fmt.Sprintf(":%d", port)
 	log.Printf("Server listening on %s", listenPort)
-	return http.ListenAndServe(listenPort, nil)
+	return http.ListenAndServe(listenPort, s.handler())
+}
+
+func (s *HttpServer) handler() http.Handler {
+	clientDir := "presentation/web/client/index"
+	staticDir := "presentation/web/client/static"
+
+	app := http.NewServeMux()
+	app.Handle("/", http.FileServer(http.Dir(clientDir)))
+	app.Handle("/favicon.ico", http.FileServer(http.Dir(staticDir)))
+	app.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir(filepath.Join(staticDir, "assets")))))
+	app.HandleFunc("/api/auth/logout", s.handleAuthLogout)
+	app.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
+	app.HandleFunc("/api/media/info", s.handleGetMediaInfo)
+	app.HandleFunc("/api/downloads", s.handleListDownloads)
+	app.HandleFunc("/api/downloads/events", s.handleDownloadEvents)
+	app.HandleFunc("/api/downloads/", s.handleDownloadAction)
+	app.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
+	app.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
+
+	root := http.NewServeMux()
+	root.Handle("/favicon.ico", http.FileServer(http.Dir(staticDir)))
+	root.Handle("/index.css", http.FileServer(http.Dir(clientDir)))
+	root.Handle("/login.js", http.FileServer(http.Dir(clientDir)))
+	root.HandleFunc("/login", s.handleLoginPage)
+	root.HandleFunc("/api/auth/status", s.handleAuthStatus)
+	root.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	root.Handle("/", s.requireAuthentication(app))
+	return root
 }
 
 func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Request) {
