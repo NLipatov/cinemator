@@ -338,24 +338,38 @@ body.has-player .downloads-panel {
   gap: 0.7rem;
   padding: 0.7rem 0;
   border-bottom: var(--line) solid var(--color-border);
-  cursor: pointer;
-  outline: none;
   transition: color var(--transition), background var(--transition);
 }
 
-.download-row:hover .download-title,
-.download-row:focus-visible .download-title {
+.download-open:hover .download-title,
+.download-open:focus-visible .download-title {
   color: var(--color-button-hover);
-}
-
-.download-row:focus-visible {
-  box-shadow: 0 0 0 0.1875rem var(--color-focus-ring);
 }
 
 .download-main {
   min-width: 0;
   display: grid;
   gap: 0.25rem;
+}
+
+.download-open {
+  width: 100%;
+  min-height: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  text-align: left;
+  font-weight: inherit;
+  box-shadow: none;
+}
+
+.download-open:hover,
+.download-open:focus-visible {
+  background: transparent;
+  transform: none;
+  box-shadow: 0 0 0 0.1875rem var(--color-focus-ring);
 }
 
 .download-title-row {
@@ -434,10 +448,10 @@ body.has-player .downloads-panel {
 }
 
 .download-expiry-extend {
-  width: 1.45rem;
-  min-width: 1.45rem;
-  height: 1.45rem;
-  min-height: 1.45rem;
+  width: 1.5rem;
+  min-width: 1.5rem;
+  height: 1.5rem;
+  min-height: 1.5rem;
   padding: 0;
   display: inline-flex;
   align-items: center;
@@ -790,7 +804,8 @@ button:focus-visible {
   gap: 0.6rem;
 }
 
-.track-row label {
+.track-row label,
+.track-row .track-label {
   color: var(--color-muted);
   font-size: 0.86rem;
   font-weight: 560;

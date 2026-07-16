@@ -477,12 +477,12 @@
         const row = document.createElement('div');
         row.className = 'download-row';
         row.dataset.id = download.id;
-        row.tabIndex = 0;
-        row.setAttribute('role', 'button');
-        row.setAttribute('aria-label', `Open ${download.title || download.id}`);
 
-        const main = document.createElement('div');
-        main.className = 'download-main';
+        const main = document.createElement('button');
+        main.type = 'button';
+        main.className = 'download-main download-open';
+        main.dataset.action = 'open';
+        main.dataset.id = download.id;
         const titleRow = document.createElement('div');
         titleRow.className = 'download-title-row';
         const title = document.createElement('div');
@@ -662,23 +662,13 @@
       }
       const btn = e.target.closest('button[data-action][data-id]');
       if (btn) {
+        if (btn.dataset.action === 'open') openDownload(findDownload(btn.dataset.id));
         if (btn.dataset.action === 'extend') {
           closeExtendMenus();
           extendDownload(btn.dataset.id, parseInt(btn.dataset.days || '7', 10));
         }
         if (btn.dataset.action === 'delete') deleteDownload(btn.dataset.id);
         return;
-      }
-
-      const row = e.target.closest('.download-row[data-id]');
-      if (row) openDownload(findDownload(row.dataset.id));
-    });
-    $('downloadsList').addEventListener('keydown', e => {
-      const row = e.target.closest('.download-row[data-id]');
-      if (!row || e.target !== row) return;
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        openDownload(findDownload(row.dataset.id));
       }
     });
     document.addEventListener('click', e => {
@@ -1042,24 +1032,44 @@
         watchSubtitleUpdates(video, reapplySubtitleDelay);
       }
 
-      let fragLoaded = false;
+      let mainFragBuffered = false;
       let subtitleFragLoaded = !enableSubtitles;
+      function currentPositionBuffered() {
+        const position = video.currentTime;
+        for (let index = 0; index < video.buffered.length; index++) {
+          if (position >= video.buffered.start(index) - 0.05 && position < video.buffered.end(index) + 0.05) {
+            return true;
+          }
+        }
+        return false;
+      }
+      function fragmentCoversCurrentPosition(fragment) {
+        const start = Number(fragment?.start);
+        const duration = Number(fragment?.duration);
+        if (!Number.isFinite(start) || !Number.isFinite(duration)) return false;
+        return video.currentTime >= start - 0.25 && video.currentTime < start + duration + 0.25;
+      }
       function hideWarningOnce() {
-        if (fragLoaded && subtitleFragLoaded) {
+        if (mainFragBuffered && subtitleFragLoaded) {
           removeWarning();
         }
       }
       function markStreamActive() {
+        mainFragBuffered = currentPositionBuffered();
+        if (!mainFragBuffered) return;
         lastStreamActivityAt = Date.now();
         forcedRecoveryAttempts = 0;
         showPlaybackNotice();
-        fragLoaded = true;
         hideWarningOnce();
       }
       function markPlaybackProgress() {
         lastStreamActivityAt = Date.now();
         forcedRecoveryAttempts = 0;
       }
+      video.addEventListener('seeking', () => {
+        mainFragBuffered = currentPositionBuffered();
+        if (!mainFragBuffered && enableSubtitles) subtitleFragLoaded = false;
+      });
 
       if (window.Hls && Hls.isSupported()) {
         hls = new Hls({
@@ -1113,13 +1123,18 @@
         }
         hls.on(Hls.Events.FRAG_LOADED, (evt, data) => {
           if (!data?.frag || data.frag.type === 'main') {
-            markStreamActive();
+            markPlaybackProgress();
           } else {
-            if (data.frag.type === 'subtitle') {
+            if (data.frag.type === 'subtitle' && fragmentCoversCurrentPosition(data.frag)) {
               subtitleFragLoaded = true;
               hideWarningOnce();
             }
             markPlaybackProgress();
+          }
+        });
+        hls.on(Hls.Events.FRAG_BUFFERED, (evt, data) => {
+          if (!data?.frag || data.frag.type === 'main') {
+            markStreamActive();
           }
         });
         hls.on(Hls.Events.ERROR, (evt, data) => {
@@ -1130,7 +1145,7 @@
           }
           const levelEmpty = data.details === 'levelEmptyError' ||
             (Hls.ErrorDetails && data.details === Hls.ErrorDetails.LEVEL_EMPTY_ERROR);
-          if (levelEmpty && (fragLoaded || Date.now() - lastStreamActivityAt < 8000)) {
+          if (levelEmpty && (mainFragBuffered || Date.now() - lastStreamActivityAt < 8000)) {
             return;
           }
           if (data.fatal) {

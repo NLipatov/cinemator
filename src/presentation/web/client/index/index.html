@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <title>Cinemator</title>
+  <meta name="description" content="Stream video from BitTorrent sources with on-demand HLS playback.">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <link rel="stylesheet" href="index.css">
   <link rel="icon" href="/favicon.ico">
@@ -45,7 +46,10 @@
     <section class="workspace" aria-live="polite">
       <div class="control-stack">
         <div class="step panel" id="step-files" style="display:none">
-          <select id="filelist" class="input-style"></select>
+          <div class="track-row">
+            <label for="filelist">File:</label>
+            <select id="filelist" class="input-style"></select>
+          </div>
           <button id="selectTracks" type="button" class="input-style">Select tracks</button>
           <div class="msg" id="fileMsg"></div>
         </div>
@@ -60,7 +64,7 @@
             <select id="subtitleSelect" class="input-style"></select>
           </div>
           <div class="track-row" id="subtitleDelayRow" style="display:none">
-            <label>Sub delay:</label>
+            <span class="track-label">Sub delay:</span>
             <div class="delay-controls">
               <button type="button" id="subDelayMinus" class="input-style small-btn">-0.5s</button>
               <div id="subDelayValue" class="delay-value">0.0s</div>
