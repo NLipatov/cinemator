@@ -13,20 +13,26 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"golang.org/x/time/rate"
 )
 
 const (
-	sessionCookieName = "__Host-cinemator_session"
-	sessionTTL        = 7 * 24 * time.Hour
-	maxLoginBodyBytes = 4 << 10
-	minSessionSecret  = 32
-	sessionNonceBytes = 32
-	sessionVersion    = "v1"
+	sessionCookieName        = "__Host-cinemator_session"
+	sessionTTL               = 7 * 24 * time.Hour
+	maxLoginBodyBytes        = 4 << 10
+	loginAttemptInterval     = 10 * time.Second
+	loginAttemptBurst        = 5
+	maxConcurrentLoginChecks = 2
+	minSessionSecret         = 32
+	sessionNonceBytes        = 32
+	sessionVersion           = "v1"
 )
 
 type authenticator struct {
-	passwordHash []byte
-	sessionKey   []byte
+	passwordHash  []byte
+	sessionKey    []byte
+	loginAttempts *rate.Limiter
+	loginChecks   chan struct{}
 }
 
 func newAuthenticator(passwordHash, sessionSecret string) (*authenticator, error) {
@@ -40,8 +46,10 @@ func newAuthenticator(passwordHash, sessionSecret string) (*authenticator, error
 		return nil, errors.New("CINEMATOR_SESSION_SECRET must contain at least 32 bytes when authentication is enabled")
 	}
 	return &authenticator{
-		passwordHash: []byte(passwordHash),
-		sessionKey:   []byte(sessionSecret),
+		passwordHash:  []byte(passwordHash),
+		sessionKey:    []byte(sessionSecret),
+		loginAttempts: rate.NewLimiter(rate.Every(loginAttemptInterval), loginAttemptBurst),
+		loginChecks:   make(chan struct{}, maxConcurrentLoginChecks),
 	}, nil
 }
 
@@ -50,11 +58,11 @@ func (s *HttpServer) requireAuthentication(next http.Handler) http.Handler {
 		return next
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
 		if s.auth.authenticated(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		w.Header().Set("Cache-Control", "no-store")
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			http.Error(w, "authentication required", http.StatusUnauthorized)
 			return
@@ -103,6 +111,7 @@ func (s *HttpServer) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxLoginBodyBytes)
 	var request struct {
@@ -112,7 +121,19 @@ func (s *HttpServer) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad login request", http.StatusBadRequest)
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store")
+	if !s.auth.loginAttempts.Allow() {
+		w.Header().Set("Retry-After", strconv.Itoa(int(loginAttemptInterval/time.Second)))
+		http.Error(w, "too many login attempts", http.StatusTooManyRequests)
+		return
+	}
+	select {
+	case s.auth.loginChecks <- struct{}{}:
+		defer func() { <-s.auth.loginChecks }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "too many login attempts", http.StatusTooManyRequests)
+		return
+	}
 	if bcrypt.CompareHashAndPassword(s.auth.passwordHash, []byte(request.Password)) != nil {
 		http.Error(w, "invalid password", http.StatusUnauthorized)
 		return
