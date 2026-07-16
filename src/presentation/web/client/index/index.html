@@ -76,9 +76,9 @@
             <div class="warning-inner">
               <span class="warning-icon" aria-hidden="true">!</span>
               <div class="warning-text">
-                <span>Server is downloading and preparing the video.</span>
-                <span>This may take several minutes for large torrents.</span>
-                <strong>Please stay on this page until playback begins.</strong>
+                <strong id="warn-title">Preparing video</strong>
+                <span id="warn-detail">The server is downloading and transcoding the requested part.</span>
+                <span id="warn-status">Please stay on this page until playback begins.</span>
                 <span id="warn-extra" hidden></span>
               </div>
             </div>
@@ -92,7 +92,7 @@
       </div>
     </section>
   </main>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.5"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.13"></script>
   <script src="index.js"></script>
 </body>
 </html>

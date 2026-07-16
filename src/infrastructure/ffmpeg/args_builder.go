@@ -3,19 +3,21 @@ package ffmpeg
 import (
 	"cinemator/domain"
 	"fmt"
-	"path/filepath"
+	"math"
 	"strings"
+)
+
+const (
+	maxVideoWidth   = 1920
+	maxVideoHeight  = 1080
+	videoBitrate    = "4000k"
+	videoMaxBitrate = "5000k"
 )
 
 // StreamSelection specifies which audio/subtitle tracks to include.
 type StreamSelection struct {
 	AudioTrackIndex    int // -1 = default (first)
 	SubtitleTrackIndex int // -1 = none
-}
-
-type ArgsBuilder struct {
-	OutDir, Playlist string
-	Input            string
 }
 
 // isBitmapSubtitle returns true for image-based subtitle formats
@@ -27,10 +29,24 @@ func isBitmapSubtitle(codec string) bool {
 	return false
 }
 
-func (b ArgsBuilder) Build(info domain.MediaInfo, sel StreamSelection) []string {
+func buildStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 	hasSubtitle := sel.SubtitleTrackIndex >= 0 && sel.SubtitleTrackIndex < len(info.Subtitles)
-
-	args := []string{"-fflags", "+genpts", "-i", b.Input}
+	bitmapSubtitle := hasSubtitle && isBitmapSubtitle(info.Subtitles[sel.SubtitleTrackIndex].Codec)
+	var args []string
+	var videoFilters []string
+	if width, height, resize := boundedVideoSize(info.Width, info.Height); resize {
+		videoFilters = append(videoFilters, fmt.Sprintf("scale=%d:%d", width, height))
+	}
+	if info.HDR {
+		videoFilters = append(videoFilters,
+			"zscale=t=linear:npl=100",
+			"format=gbrpf32le",
+			"zscale=p=bt709",
+			"tonemap=tonemap=hable:desat=0",
+			"zscale=t=bt709:m=bt709:r=tv",
+		)
+	}
+	videoFilters = append(videoFilters, "format=yuv420p")
 
 	hasAudio := len(info.AudioTracks) > 0
 	audioIdx := sel.AudioTrackIndex
@@ -40,21 +56,13 @@ func (b ArgsBuilder) Build(info domain.MediaInfo, sel StreamSelection) []string 
 		audioIdx = 0
 	}
 
-	// -- determine audio codec for selected track
-	audioCodec := ""
-	if hasAudio {
-		audioCodec = info.AudioTracks[audioIdx].Codec
-	}
-
-	// -- video/audio encoding decisions
-	needVideoEncode := info.VideoCodec != "h264" || info.NeedFilter || hasSubtitle
-	needAudioEncode := audioCodec != "aac"
-
 	// -- handle subtitles: bitmap vs text require different approaches
-	if hasSubtitle && isBitmapSubtitle(info.Subtitles[sel.SubtitleTrackIndex].Codec) {
-		// Bitmap subtitles: use filter_complex with overlay
+	if bitmapSubtitle {
+		// Tone-map the source before overlaying SDR bitmap subtitles.
+		filter := fmt.Sprintf("[0:v]%s[base];[base][0:s:%d]overlay,format=yuv420p[v]",
+			strings.Join(videoFilters, ","), sel.SubtitleTrackIndex)
 		args = append(args,
-			"-filter_complex", fmt.Sprintf("[0:v][0:s:%d]overlay[v]", sel.SubtitleTrackIndex),
+			"-filter_complex", filter,
 			"-map", "[v]",
 		)
 	} else if hasSubtitle {
@@ -72,43 +80,35 @@ func (b ArgsBuilder) Build(info domain.MediaInfo, sel StreamSelection) []string 
 		args = append(args, "-map", fmt.Sprintf("0:a:%d", audioIdx))
 	}
 
-	if needVideoEncode {
-		args = append(args, "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency")
-		var vfParts []string
-		if info.NeedFilter {
-			vfParts = append(vfParts, "format=yuv420p")
-		}
-		if len(vfParts) > 0 {
-			args = append(args, "-vf", strings.Join(vfParts, ","))
-		}
-	} else {
-		args = append(args, "-c:v", "copy")
+	// Each requested HLS window starts at an exact virtual segment boundary.
+	// Re-encoding discards frames before that boundary and creates independent
+	// keyframes; stream-copy would start at an earlier source keyframe instead.
+	args = append(args,
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-tune", "zerolatency",
+		"-b:v", videoBitrate,
+		"-maxrate", videoMaxBitrate,
+		"-bufsize", "10000k",
+	)
+	if !bitmapSubtitle && len(videoFilters) > 0 {
+		args = append(args, "-vf", strings.Join(videoFilters, ","))
 	}
 
-	// -- audio encoding
+	// Audio is encoded as well so its timestamps begin at the same exact boundary.
 	if hasAudio {
-		if needAudioEncode {
-			args = append(args, "-c:a", "aac", "-b:a", "128k", "-ac", "2")
-		} else {
-			args = append(args, "-c:a", "copy")
-		}
+		args = append(args, "-c:a", "aac", "-b:a", "128k", "-ac", "2")
 	}
 
-	return append(args, b.hls()...)
+	return args
 }
 
-// hls returns the HLS-muxing arguments.
-func (b ArgsBuilder) hls() []string {
-	return []string{
-		"-f", "hls",
-		"-hls_init_time", "0",
-		"-hls_time", "2",
-		"-hls_list_size", "0",
-		"-hls_playlist_type", "event",
-		"-hls_flags", "independent_segments",
-		"-hls_segment_filename", filepath.Join(b.OutDir, "chunk_%05d.ts"),
-		// Keep MPEG-TS aligned with zero-based WebVTT cue timestamps.
-		"-muxdelay", "0",
-		b.Playlist,
+func boundedVideoSize(width, height int) (int, int, bool) {
+	if width <= 0 || height <= 0 || width <= maxVideoWidth && height <= maxVideoHeight {
+		return width, height, false
 	}
+	scale := math.Min(float64(maxVideoWidth)/float64(width), float64(maxVideoHeight)/float64(height))
+	targetWidth := max(2, int(float64(width)*scale)/2*2)
+	targetHeight := max(2, int(float64(height)*scale)/2*2)
+	return targetWidth, targetHeight, true
 }

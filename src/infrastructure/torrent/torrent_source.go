@@ -3,6 +3,8 @@ package torrent
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"time"
 
 	"cinemator/domain"
@@ -15,6 +17,7 @@ const (
 	initialProbeBytes = 1 << 20
 	maxProbeBytes     = 16 << 20
 	probeTailBytes    = 1 << 20
+	urlProbeTimeout   = 20 * time.Second
 )
 
 type torrentSource struct {
@@ -23,6 +26,7 @@ type torrentSource struct {
 	token     string
 	url       string
 	readahead int64
+	onRead    func(int64)
 }
 
 type filePieceWindow struct {
@@ -30,9 +34,9 @@ type filePieceWindow struct {
 	state torrent.FilePieceState
 }
 
-func newTorrentSource(file *torrent.File, registry *rangeServer) (*torrentSource, error) {
-	readahead := targetReadaheadBytes(file)
-	token, sourceURL, err := registry.register(file, readahead)
+func newTorrentSource(file *torrent.File, registry *rangeServer, readaheadLimit int64, onRead func(int64), onError func(error)) (*torrentSource, error) {
+	readahead := targetReadaheadBytes(file, readaheadLimit)
+	token, sourceURL, err := registry.register(file, readahead, onRead, onError)
 	if err != nil {
 		return nil, err
 	}
@@ -42,6 +46,7 @@ func newTorrentSource(file *torrent.File, registry *rangeServer) (*torrentSource
 		token:     token,
 		url:       sourceURL,
 		readahead: readahead,
+		onRead:    onRead,
 	}, nil
 }
 
@@ -57,26 +62,73 @@ func (s *torrentSource) Close() {
 	s.registry = nil
 }
 
-func (s *torrentSource) Probe(ctx context.Context) (domain.MediaInfo, error) {
-	s.PrefetchRange(0, initialProbeBytes)
-	if err := s.WaitRange(ctx, 0, initialProbeBytes); err != nil {
+func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			info = domain.MediaInfo{}
+			err = fmt.Errorf("torrent probe panic: %v", recovered)
+		}
+	}()
+	probeBytes := min(int64(initialProbeBytes), s.readahead)
+	s.PrefetchRange(0, probeBytes)
+	if err := s.WaitRange(ctx, 0, probeBytes); err != nil {
 		return domain.MediaInfo{}, err
 	}
 
 	reader := s.file.NewReader()
 	reader.SetContext(ctx)
-	reader.SetReadahead(maxProbeBytes)
-	defer reader.Close()
-	if info, err := (ffmpeg.SampleAnalyzer{}).Analyze(ctx, reader); err == nil {
-		return info, nil
-	} else if ctx.Err() != nil {
+	reader.SetReadahead(min(int64(maxProbeBytes), s.readahead))
+	sampleInfo, sampleErr := (ffmpeg.SampleAnalyzer{}).Analyze(ctx, sourceProgressReader{Reader: reader, onRead: s.onRead})
+	if closeErr := closeTorrentReader(reader); closeErr != nil {
+		log.Printf("torrent probe recovered reader close failure: %v", closeErr)
+	}
+	if sampleErr == nil && sampleInfo.Duration > 0 {
+		return sampleInfo, nil
+	}
+	if ctx.Err() != nil {
 		return domain.MediaInfo{}, ctx.Err()
 	}
 
-	if tailOffset := s.file.Length() - probeTailBytes; tailOffset > 0 {
-		s.PrefetchRange(tailOffset, probeTailBytes)
+	tailBytes := min(int64(probeTailBytes), s.readahead)
+	if tailOffset := s.file.Length() - tailBytes; tailOffset > 0 {
+		s.PrefetchRange(tailOffset, tailBytes)
 	}
-	return (ffmpeg.SampleAnalyzer{}).AnalyzeURL(ctx, s.url)
+	probeCtx, cancel := context.WithTimeout(ctx, urlProbeTimeout)
+	defer cancel()
+	info, urlErr := (ffmpeg.SampleAnalyzer{}).AnalyzeURL(probeCtx, s.url)
+	if urlErr == nil {
+		return info, nil
+	}
+	// A valid head sample is enough for progressive HLS even when the container
+	// cannot expose a duration without an expensive scan to EOF.
+	if sampleErr == nil && sampleInfo.VideoCodec != "" {
+		sampleInfo.Duration = 0
+		sampleInfo.Seekable = false
+		return sampleInfo, nil
+	}
+	return domain.MediaInfo{}, urlErr
+}
+
+type sourceProgressReader struct {
+	io.Reader
+	onRead func(int64)
+}
+
+func (r sourceProgressReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if n > 0 && r.onRead != nil {
+		r.onRead(int64(n))
+	}
+	return n, err
+}
+
+func closeTorrentReader(reader torrent.Reader) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("torrent reader panic: %v", recovered)
+		}
+	}()
+	return reader.Close()
 }
 
 func (s *torrentSource) PrefetchRange(offset, length int64) {
@@ -191,14 +243,10 @@ func clampRange(offset, length, fileLength int64) (int64, int64) {
 	return offset, length
 }
 
-func targetReadaheadBytes(f *torrent.File) int64 {
-	const (
-		targetBufferBytes = int64(1 << 30)
-		minAheadBytes     = int64(128 << 20)
-	)
-	ahead := targetBufferBytes
-	if ahead < minAheadBytes {
-		ahead = minAheadBytes
+func targetReadaheadBytes(f *torrent.File, configured int64) int64 {
+	ahead := configured
+	if ahead <= 0 {
+		ahead = 128 << 20
 	}
 	if l := f.Length(); l > 0 && l < ahead {
 		ahead = l

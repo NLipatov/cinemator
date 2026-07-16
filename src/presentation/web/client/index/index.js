@@ -22,13 +22,45 @@
 
     // Main logic
     const $ = id => document.getElementById(id);
-    async function apiFetch(input, init) {
-      const response = await window.fetch(input, init);
-      if (response.status === 401) {
-        window.location.replace('/login');
-        throw new Error('Session expired');
+    async function apiFetch(input, init = {}, timeoutMs = 0) {
+      let timer = null;
+      let timedOut = false;
+      let abortFromCaller = null;
+      const callerSignal = init.signal;
+      const controller = timeoutMs > 0 ? new AbortController() : null;
+      if (controller && callerSignal) {
+        if (callerSignal.aborted) {
+          controller.abort();
+        } else {
+          abortFromCaller = () => controller.abort();
+          callerSignal.addEventListener('abort', abortFromCaller, { once: true });
+        }
       }
-      return response;
+      if (controller) {
+        timer = setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, timeoutMs);
+        init = { ...init, signal: controller.signal };
+      }
+      try {
+        const response = await window.fetch(input, init);
+        if (response.status === 401) {
+          window.location.replace('/login');
+          throw new Error('Session expired');
+        }
+        return response;
+      } catch (error) {
+        if (timedOut) {
+          throw new Error(`Server did not respond within ${Math.ceil(timeoutMs / 1000)} seconds`);
+        }
+        throw error;
+      } finally {
+        if (timer) clearTimeout(timer);
+        if (abortFromCaller && callerSignal) {
+          callerSignal.removeEventListener('abort', abortFromCaller);
+        }
+      }
     }
 
     const logoutBtn = $('logoutBtn');
@@ -69,6 +101,12 @@
     let openExtendDownloadID = null;
     let requestSeq = 0;
     let flowRequestController = null;
+    let activeStreamDir = null;
+    let currentMediaSeekable = true;
+    let playbackNotice = '';
+    let hlsStatusTimer = null;
+    let hlsStatusController = null;
+    let hlsStatusSeq = 0;
     const idleRecoveryMs = 12 * 60 * 1000;
     const recoveryThrottleMs = 5000;
     const stallRecoveryDelayMs = 3500;
@@ -105,6 +143,8 @@
     }
     function destroyVideoAndHls({ resetLayout = true } = {}) {
       if (hls) { hls.destroy(); hls = null; }
+      stopHlsStatusPolling();
+      activeStreamDir = null;
       if (playbackRecoveryTimer) {
         clearTimeout(playbackRecoveryTimer);
         playbackRecoveryTimer = null;
@@ -140,8 +180,11 @@
         msgTimeout = setTimeout(() => { el.textContent = ''; }, 2200);
       }
     }
-    function showWarning() {
+    function showWarning(title = 'Preparing video', detail = 'The server is downloading and transcoding the requested part.', status = 'Please stay on this page until playback begins.') {
       clearSubtitleWait();
+      $('warn-title').textContent = title;
+      $('warn-detail').textContent = detail;
+      $('warn-status').textContent = status;
       $('warnMsg').hidden = false;
     }
     function setWarningExtra(msg) {
@@ -158,8 +201,158 @@
       setWarningExtra('');
     }
     function removeWarning() {
+      stopHlsStatusPolling();
       clearSubtitleWait();
       $('warnMsg').hidden = true;
+    }
+
+    function stopHlsStatusPolling() {
+      hlsStatusSeq++;
+      if (hlsStatusTimer) {
+        clearTimeout(hlsStatusTimer);
+        hlsStatusTimer = null;
+      }
+      if (hlsStatusController) {
+        hlsStatusController.abort();
+        hlsStatusController = null;
+      }
+    }
+
+    function formatElapsed(startedAt) {
+      const started = new Date(startedAt).getTime();
+      if (!Number.isFinite(started)) return '';
+      const seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+      if (seconds < 60) return `${seconds}s`;
+      return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+    }
+
+    function formatPlaybackTime(seconds) {
+      if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+      const whole = Math.floor(seconds);
+      const hours = Math.floor(whole / 3600);
+      const minutes = Math.floor((whole % 3600) / 60);
+      const rest = whole % 60;
+      return hours > 0
+        ? `${hours}:${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`
+        : `${minutes}:${String(rest).padStart(2, '0')}`;
+    }
+
+    function renderHlsStatus(status, fallbackTarget) {
+      const reportedTarget = Number.isFinite(status.targetSeconds) ? status.targetSeconds : fallbackTarget;
+      const staleReady = status.phase === 'ready' && Math.abs(reportedTarget - fallbackTarget) >= 1;
+      const target = staleReady ? fallbackTarget : reportedTarget;
+      const elapsed = formatElapsed(status.startedAt);
+      const peerText = `${status.activePeers || 0} active / ${status.totalPeers || 0} known peers`;
+      const suffix = elapsed ? ` · ${elapsed}` : '';
+      if (staleReady) {
+        showWarning(
+          `Requesting ${formatPlaybackTime(target)}`,
+          'The player is selecting the HLS segment for the new position.',
+          peerText,
+        );
+        return;
+      }
+      if (status.phase === 'no_peers') {
+        showWarning(
+          `Waiting for peers at ${formatPlaybackTime(target)}`,
+          'There are no active peers for the required torrent pieces. Peer discovery is still running.',
+          `${peerText}${suffix}`,
+        );
+        return;
+      }
+      if (status.phase === 'stalled') {
+        showWarning(
+          `Stalled at ${formatPlaybackTime(target)}`,
+          status.message || 'Connected peers and the transcoder have not produced data recently.',
+          `${peerText}${suffix} · still retrying`,
+        );
+        return;
+      }
+      if (status.phase === 'error') {
+        showWarning(
+          `Stream failed at ${formatPlaybackTime(target)}`,
+          status.message || 'The server could not generate the requested segment.',
+          `Preparation stopped · ${peerText}${suffix}`,
+        );
+        return;
+      }
+      if (status.phase === 'ready') {
+        showWarning(
+          `Position ${formatPlaybackTime(target)} is ready`,
+          'The prepared segment is being sent to the player.',
+          `${formatBytes(status.bytesRead || 0)} read · ${peerText}${suffix}`,
+        );
+        return;
+      }
+      if (status.phase === 'waiting') {
+        showWarning(
+          `Starting ${formatPlaybackTime(target)}`,
+          'Media information is ready. Waiting for the player to request its first HLS segment.',
+          `${peerText}${suffix}`,
+        );
+        return;
+      }
+      showWarning(
+        `Preparing ${formatPlaybackTime(target)}`,
+        'Downloading the required torrent pieces and transcoding only the requested window.',
+        `${formatBytes(status.bytesRead || 0)} read · ${peerText}${suffix}`,
+      );
+    }
+
+    function beginHlsStatusPolling(targetSeconds) {
+      if (!activeStreamDir) return;
+      stopHlsStatusPolling();
+      const seq = hlsStatusSeq;
+      showWarning(
+        `Preparing ${formatPlaybackTime(targetSeconds)}`,
+        'Checking the cache and requesting the required torrent pieces.',
+        'Waiting for server status…',
+      );
+      let consecutiveFailures = 0;
+      const poll = async () => {
+        if (seq !== hlsStatusSeq || !activeStreamDir) return;
+        const controller = new AbortController();
+        hlsStatusController = controller;
+        try {
+          const statusURL = `/api/hls/status/${encodeURIComponent(activeStreamDir)}?target=${encodeURIComponent(targetSeconds)}`;
+          const response = await apiFetch(statusURL, {
+            cache: 'no-store',
+            signal: controller.signal,
+          }, 10000);
+          if (seq !== hlsStatusSeq) return;
+          if (!response.ok) {
+            throw new Error((await response.text()).trim() || `Status request failed (${response.status})`);
+          }
+          consecutiveFailures = 0;
+          renderHlsStatus(await response.json(), targetSeconds);
+        } catch (error) {
+          if (error.name !== 'AbortError' && seq === hlsStatusSeq) {
+            consecutiveFailures++;
+            if (consecutiveFailures >= 3) {
+              showWarning(
+                'Cannot reach the stream worker',
+                error.message || 'The server stopped reporting preparation progress.',
+                'Playback may have failed. Retrying status…',
+              );
+            } else {
+              $('warn-status').textContent = 'Stream status is temporarily unavailable; retrying…';
+            }
+          }
+        } finally {
+          if (hlsStatusController === controller) hlsStatusController = null;
+          if (seq === hlsStatusSeq) {
+            hlsStatusTimer = setTimeout(poll, 1000);
+          }
+        }
+      };
+      poll();
+    }
+
+    function showPlaybackNotice() {
+      showMsg('playerMsg', playbackNotice);
+      if (playbackNotice) {
+        clearTimeout(msgTimeout);
+      }
     }
 
     function formatBytes(bytes) {
@@ -191,8 +384,7 @@
     }
 
     function formatDownloadSize(download) {
-      const diskSize = Number.isFinite(download.diskSize) ? download.diskSize : 0;
-      return `${formatBytes(diskSize)} / ${formatBytes(download.size)}`;
+      return `${formatBytes(download.size)} torrent · shared cache`;
     }
 
     function closeExtendMenus(except = null) {
@@ -526,7 +718,7 @@
       $('player-block').style.display = 'none';
       removeWarning();
       try {
-        const res = await apiFetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: request.signal });
+        const res = await apiFetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: request.signal }, 60000);
         if (!res.ok) throw new Error((await res.text()).trim() || 'Server error');
         const files = await res.json();
         if (isStale(requestId)) return;
@@ -565,10 +757,12 @@
       showMsg('fileMsg', 'Loading track info…', false, true);
       $('step-tracks').style.display = 'none';
       try {
-        const res = await apiFetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal });
+        const res = await apiFetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal }, 60000);
         if (!res.ok) throw new Error((await res.text()).trim() || 'Could not load media info');
         const info = await res.json();
         if (isStale(requestId)) return;
+        currentMediaSeekable = info.seekable === true;
+        playbackNotice = currentMediaSeekable ? '' : 'Duration is unavailable for this format. Playback is progressive; seeking is limited to the discovered part.';
         loadDownloads({ quiet: true });
 
         const audioCount = info.audioTracks ? info.audioTracks.length : 0;
@@ -660,16 +854,23 @@
         }, 8000);
       }
       try {
-        const resp = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}`, {
-          redirect: 'follow',
+        const start = currentMediaSeekable && Number.isFinite(resumeTime) && resumeTime > 0 ? resumeTime : 0;
+        const resp = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}&start=${encodeURIComponent(start)}`, {
+          headers: { Accept: 'application/json' },
           signal: request.signal,
-        });
+        }, 60000);
         if (!resp.ok) throw new Error((await resp.text()).trim() || 'Stream error');
         if (isStale(requestId)) return;
-        const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
+        const prepared = await resp.json();
+        if (!prepared.playlist || !prepared.stream) throw new Error('Server returned an invalid stream descriptor');
+        const playlistURL = new URL(prepared.playlist, window.location.href);
+        activeStreamDir = prepared.stream;
+        const m3u8 = playlistURL.pathname + '?t=' + Date.now();
         $('player-block').style.display = '';
         document.body.classList.add('has-player');
-        playHls(m3u8, subtitleSelected, resumeTime);
+        showPlaybackNotice();
+        beginHlsStatusPolling(start);
+        playHls(m3u8, subtitleSelected, start);
         loadDownloads({ quiet: true });
       } catch (e) {
         if (e.name === 'AbortError') return;
@@ -788,13 +989,45 @@
 
     function attachPlaybackRecovery(video) {
       video.addEventListener('play', () => requestPlaybackRecovery('play'));
-      video.addEventListener('seeking', () => requestPlaybackRecovery('seeking'));
-      video.addEventListener('waiting', () => schedulePlaybackRecovery('waiting'));
-      video.addEventListener('stalled', () => schedulePlaybackRecovery('stalled'));
+      video.addEventListener('seeking', () => beginHlsStatusPolling(video.currentTime));
+      video.addEventListener('seeked', () => {
+        if (video.readyState >= 3) {
+          removeWarning();
+        } else {
+          beginHlsStatusPolling(video.currentTime);
+        }
+      });
+      video.addEventListener('waiting', () => {
+        beginHlsStatusPolling(video.currentTime);
+        schedulePlaybackRecovery('waiting');
+      });
+      video.addEventListener('stalled', () => {
+        beginHlsStatusPolling(video.currentTime);
+        schedulePlaybackRecovery('stalled');
+      });
       video.addEventListener('error', () => {
         if (requestPlaybackRecovery('native-error', true)) return;
         showPlaybackError('Native media error');
       });
+    }
+
+    function longHlsLoadPolicy() {
+      return {
+        default: {
+          maxTimeToFirstByteMs: 10 * 60 * 1000,
+          maxLoadTimeMs: 10 * 60 * 1000,
+          timeoutRetry: {
+            maxNumRetry: 2,
+            retryDelayMs: 1000,
+            maxRetryDelayMs: 4000,
+          },
+          errorRetry: {
+            maxNumRetry: 6,
+            retryDelayMs: 1000,
+            maxRetryDelayMs: 8000,
+          },
+        },
+      };
     }
 
     function playHls(src, enableSubtitles, resumeTime = 0) {
@@ -810,16 +1043,17 @@
       }
 
       let fragLoaded = false;
+      let subtitleFragLoaded = !enableSubtitles;
       function hideWarningOnce() {
-        if (!fragLoaded) {
-          fragLoaded = true;
+        if (fragLoaded && subtitleFragLoaded) {
           removeWarning();
         }
       }
       function markStreamActive() {
         lastStreamActivityAt = Date.now();
         forcedRecoveryAttempts = 0;
-        showMsg('playerMsg', '');
+        showPlaybackNotice();
+        fragLoaded = true;
         hideWarningOnce();
       }
       function markPlaybackProgress() {
@@ -827,8 +1061,31 @@
         forcedRecoveryAttempts = 0;
       }
 
-      if (Hls.isSupported()) {
-        hls = new Hls({ startPosition: resumeTime });
+      if (window.Hls && Hls.isSupported()) {
+        hls = new Hls({
+          startPosition: resumeTime,
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+          backBufferLength: 60,
+          fragLoadPolicy: {
+            default: {
+              maxTimeToFirstByteMs: 10 * 60 * 1000,
+              maxLoadTimeMs: 10 * 60 * 1000,
+              timeoutRetry: {
+                maxNumRetry: 2,
+                retryDelayMs: 0,
+                maxRetryDelayMs: 0,
+              },
+              errorRetry: {
+                maxNumRetry: 6,
+                retryDelayMs: 1000,
+                maxRetryDelayMs: 8000,
+              },
+            },
+          },
+          manifestLoadPolicy: longHlsLoadPolicy(),
+          playlistLoadPolicy: longHlsLoadPolicy(),
+        });
         hls.loadSource(src);
         hls.attachMedia(video);
 
@@ -854,8 +1111,23 @@
             reapplySubtitleDelay();
           });
         }
-        hls.on(Hls.Events.FRAG_LOADED, markStreamActive);
+        hls.on(Hls.Events.FRAG_LOADED, (evt, data) => {
+          if (!data?.frag || data.frag.type === 'main') {
+            markStreamActive();
+          } else {
+            if (data.frag.type === 'subtitle') {
+              subtitleFragLoaded = true;
+              hideWarningOnce();
+            }
+            markPlaybackProgress();
+          }
+        });
         hls.on(Hls.Events.ERROR, (evt, data) => {
+          if (enableSubtitles && data?.frag?.type === 'subtitle') {
+            showMsg('playerMsg', `Subtitle error: ${data.details || 'could not load subtitles'}`, true);
+            beginHlsStatusPolling(video.currentTime);
+            return;
+          }
           const levelEmpty = data.details === 'levelEmptyError' ||
             (Hls.ErrorDetails && data.details === Hls.ErrorDetails.LEVEL_EMPTY_ERROR);
           if (levelEmpty && (fragLoaded || Date.now() - lastStreamActivityAt < 8000)) {

@@ -3,6 +3,7 @@ module cinemator
 go 1.25.0
 
 require (
+	github.com/anacrolix/missinggo/v2 v2.10.0
 	github.com/anacrolix/torrent v1.61.0
 	golang.org/x/crypto v0.54.0
 	golang.org/x/time v0.15.0
@@ -20,7 +21,6 @@ require (
 	github.com/anacrolix/log v0.17.1-0.20251118025802-918f1157b7bb // indirect
 	github.com/anacrolix/missinggo v1.3.0 // indirect
 	github.com/anacrolix/missinggo/perf v1.0.0 // indirect
-	github.com/anacrolix/missinggo/v2 v2.10.0 // indirect
 	github.com/anacrolix/mmsg v1.1.1 // indirect
 	github.com/anacrolix/multiless v0.4.0 // indirect
 	github.com/anacrolix/stm v0.5.0 // indirect
@@ -75,6 +75,7 @@ require (
 	github.com/protolambda/ctxlock v0.1.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rs/dnscache v0.0.0-20230804202142-fc85eb664529 // indirect
+	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect

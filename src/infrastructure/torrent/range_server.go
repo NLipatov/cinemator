@@ -1,6 +1,7 @@
 package torrent
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +32,8 @@ type rangeServer struct {
 type rangeSource struct {
 	file      rangeFile
 	readahead int64
+	onRead    func(int64)
+	onError   func(error)
 }
 
 type rangeFile interface {
@@ -60,7 +64,7 @@ func newRangeServer() (*rangeServer, error) {
 	return rs, nil
 }
 
-func (rs *rangeServer) register(file *torrent.File, readahead int64) (token, sourceURL string, err error) {
+func (rs *rangeServer) register(file *torrent.File, readahead int64, onRead func(int64), onError func(error)) (token, sourceURL string, err error) {
 	for {
 		token, err = randomToken()
 		if err != nil {
@@ -69,7 +73,7 @@ func (rs *rangeServer) register(file *torrent.File, readahead int64) (token, sou
 
 		rs.mu.Lock()
 		if _, exists := rs.sources[token]; !exists {
-			rs.sources[token] = rangeSource{file: file, readahead: readahead}
+			rs.sources[token] = rangeSource{file: file, readahead: readahead, onRead: onRead, onError: onError}
 			rs.mu.Unlock()
 			name := url.PathEscape(filepath.Base(file.DisplayPath()))
 			return token, rs.baseURL + "/source/" + token + "/" + name, nil
@@ -107,8 +111,20 @@ func (rs *rangeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err := fmt.Errorf("torrent source panic: %v", recovered)
+			if src.onError != nil {
+				src.onError(err)
+			}
+			log.Printf("range server panic: %v\n%s", err, debug.Stack())
+		}
+	}()
 
 	if err := serveTorrentRange(w, r, src); err != nil && !isClientDisconnect(err) {
+		if src.onError != nil {
+			src.onError(err)
+		}
 		log.Printf("range server: %v", err)
 	}
 }
@@ -142,15 +158,87 @@ func serveTorrentRange(w http.ResponseWriter, r *http.Request, src rangeSource) 
 		return nil
 	}
 
-	reader := src.file.NewReader()
-	reader.SetContext(r.Context())
-	reader.SetReadahead(src.readahead)
-	defer reader.Close()
-	if _, err := reader.Seek(start, io.SeekStart); err != nil {
-		return err
+	return copyTorrentRange(r.Context(), w, src, start, length)
+}
+
+const maxRangeReadAttempts = 16
+
+type torrentReadPanicError struct {
+	value any
+}
+
+func (e torrentReadPanicError) Error() string {
+	return fmt.Sprintf("torrent reader panic: %v", e.value)
+}
+
+// A bounded file cache can evict a piece that the torrent client previously
+// marked complete. The first read detects that stale completion and returns an
+// unexpected EOF after correcting it. Reopening the reader lets the client
+// request the missing piece without changing its storage strategy at runtime.
+func copyTorrentRange(ctx context.Context, dst io.Writer, src rangeSource, start, length int64) error {
+	var written int64
+	for attempt := 1; attempt <= maxRangeReadAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, readErr := readTorrentRangeAttempt(ctx, dst, src, start+written, length-written)
+		written += n
+		if written == length {
+			if _, recovered := readErr.(torrentReadPanicError); recovered {
+				log.Printf("range server recovered reader panic after completing response: %v", readErr)
+				return nil
+			}
+			return readErr
+		}
+		_, recoveredPanic := readErr.(torrentReadPanicError)
+		if !recoveredPanic && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+			return readErr
+		}
+		if attempt == maxRangeReadAttempts {
+			return fmt.Errorf("torrent range remained unavailable after %d attempts: %w", attempt, readErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	_, err = io.CopyN(w, reader, length)
-	return err
+	return nil
+}
+
+func readTorrentRangeAttempt(ctx context.Context, dst io.Writer, src rangeSource, start, length int64) (n int64, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = torrentReadPanicError{value: recovered}
+		}
+	}()
+
+	reader := src.file.NewReader()
+	reader.SetContext(ctx)
+	reader.SetReadahead(src.readahead)
+	if _, err := reader.Seek(start, io.SeekStart); err != nil {
+		_ = reader.Close()
+		return 0, err
+	}
+	n, readErr := io.CopyN(progressWriter{Writer: dst, onWrite: src.onRead}, reader, length)
+	closeErr := reader.Close()
+	if readErr != nil {
+		return n, readErr
+	}
+	return n, closeErr
+}
+
+type progressWriter struct {
+	io.Writer
+	onWrite func(int64)
+}
+
+func (w progressWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if n > 0 && w.onWrite != nil {
+		w.onWrite(int64(n))
+	}
+	return n, err
 }
 
 func parseByteRange(value string, size int64) (start, end int64, partial bool, err error) {
@@ -211,7 +299,8 @@ func randomToken() (string, error) {
 }
 
 func isClientDisconnect(err error) bool {
-	return errors.Is(err, syscall.EPIPE) ||
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, syscall.EPIPE) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		strings.Contains(strings.ToLower(err.Error()), "broken pipe") ||
 		strings.Contains(strings.ToLower(err.Error()), "connection reset by peer")

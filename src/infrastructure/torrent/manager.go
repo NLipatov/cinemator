@@ -18,25 +18,34 @@ import (
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
-	"github.com/anacrolix/torrent/storage"
 )
 
 type manager struct {
-	client    *torrent.Client
-	active    map[streamKey]*streamInfo
-	torrents  map[string]int
-	sources   *rangeServer
-	downloads *downloadStore
-	events    *downloadEventBroadcaster
-	mu        sync.Mutex
-	settings  settings.Settings
+	client      *torrent.Client
+	active      map[streamKey]*streamInfo
+	torrents    map[string]int
+	sources     *rangeServer
+	downloads   *downloadStore
+	events      *downloadEventBroadcaster
+	mu          sync.Mutex
+	cacheMu     sync.Mutex
+	hlsReserved int64
+	transcodes  chan struct{}
+	settings    settings.Settings
 }
 
 func NewManager(settings settings.Settings) (application.TorrentManager, error) {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = settings.DownloadPath()
 	cfg.ListenPort = settings.TorrentPort()
-	cfg.DefaultStorage = storage.NewFileByInfoHash(settings.DownloadPath())
+	// A capped cache can evict a piece after the torrent was briefly complete.
+	// Keep seed connections so a later seek can fetch that piece again.
+	cfg.DropMutuallyCompletePeers = false
+	pieceCache, err := newPieceCache(settings.DownloadPath(), settings.MaxTorrentCacheBytes())
+	if err != nil {
+		return nil, err
+	}
+	cfg.DefaultStorage = pieceCache
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
 		return nil, err
@@ -55,14 +64,18 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	if err != nil {
 		return nil, err
 	}
+	if err := downloads.discardLegacyPayloads(); err != nil {
+		return nil, fmt.Errorf("discard legacy torrent cache: %w", err)
+	}
 	m := &manager{
-		client:    client,
-		active:    make(map[streamKey]*streamInfo),
-		torrents:  make(map[string]int),
-		sources:   sources,
-		downloads: downloads,
-		events:    newDownloadEventBroadcaster(),
-		settings:  settings,
+		client:     client,
+		active:     make(map[streamKey]*streamInfo),
+		torrents:   make(map[string]int),
+		sources:    sources,
+		downloads:  downloads,
+		events:     newDownloadEventBroadcaster(),
+		transcodes: make(chan struct{}, settings.MaxTranscodes()),
+		settings:   settings,
 	}
 	go m.viewerWatcher()
 	return m, nil
@@ -107,22 +120,24 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	if fileIndex < 0 || fileIndex >= len(files) {
 		return domain.MediaInfo{}, fmt.Errorf("bad file index")
 	}
+	if err := validatePieceCacheCapacity(t.Info().PieceLength, m.settings.MaxTorrentCacheBytes()); err != nil {
+		return domain.MediaInfo{}, err
+	}
 	m.touchDownload(ctx, t.InfoHash().HexString())
 	file := files[fileIndex]
-	origPrio := file.Priority()
-	file.SetPriority(torrent.PiecePriorityHigh)
-	defer file.SetPriority(origPrio)
-	file.Download()
-
-	source, err := newTorrentSource(file, m.sources)
+	source, err := newTorrentSource(file, m.sources, m.settings.TorrentReadaheadBytes(), nil, nil)
 	if err != nil {
 		return domain.MediaInfo{}, err
 	}
 	defer source.Close()
-	return source.Probe(ctx)
+	info, err := source.Probe(ctx)
+	if err == nil && info.VideoCodec == "" {
+		return domain.MediaInfo{}, errors.New("selected file has no video stream")
+	}
+	return info, err
 }
 
-func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (string, error) {
+func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int, startSeconds float64) (string, error) {
 	t, err := addMagnet(m.client, magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
@@ -138,108 +153,86 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		log.Printf("PrepareHlsStream: bad file index: %d", fileIndex)
 		return "", fmt.Errorf("bad file index")
 	}
+	if err := validatePieceCacheCapacity(t.Info().PieceLength, m.settings.MaxTorrentCacheBytes()); err != nil {
+		return "", err
+	}
 	file := files[fileIndex]
 	hash := t.InfoHash().HexString()
 	m.touchDownload(ctx, hash)
 	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack}
 	paths := key.paths(m.settings.HlsPath())
 
-	if s, runID, resumed, exists, err := m.getOrResumeStream(key); exists {
-		if err != nil {
-			return "", err
-		}
-		if resumed {
-			m.notifyDownloadsChanged()
-		}
-		return m.waitForPlayableStream(ctx, key, s, runID)
-	}
-
-	source, err := newTorrentSource(file, m.sources)
-	if err != nil {
-		return "", err
-	}
-
 	m.mu.Lock()
-	if s, runID, resumed, exists, resumeErr := m.getOrResumeStreamLocked(key); exists {
-		m.mu.Unlock()
-		source.Close()
-		if resumeErr != nil {
-			return "", resumeErr
-		}
-		if resumed {
-			m.notifyDownloadsChanged()
-		}
-		return m.waitForPlayableStream(ctx, key, s, runID)
-	}
-	if err := resetStreamOutput(paths); err != nil {
-		source.Close()
-		m.mu.Unlock()
-		return "", fmt.Errorf("reset stream output %s: %w", paths.outDir, err)
-	}
-
-	streamCtx, cancel := context.WithCancel(context.Background())
-	s := &streamInfo{
-		cancel:    cancel,
-		torrent:   t,
-		file:      file,
-		lastView:  time.Now(),
-		paths:     paths,
-		source:    source,
-		selection: ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack},
-		running:   true,
-	}
-	runID := s.beginRun()
-	s.registerStartupWaiter()
-	m.active[key] = s
-	m.torrents[hash]++
-	m.mu.Unlock()
-	m.notifyDownloadsChanged()
-
-	file.Download()
-	file.SetPriority(torrent.PiecePriorityHigh)
-	source.PrefetchRange(0, initialProbeBytes)
-
-	m.launchConversion(streamCtx, key, s, runID)
-	playlist, err := m.waitForPlayableStream(ctx, key, s, runID)
-	if err != nil {
-		return "", err
-	}
-	log.Printf("Stream ready: key=%v, playlist=%s", key, paths.masterPlaylist)
-	return playlist, nil
-}
-
-func (m *manager) getOrResumeStream(key streamKey) (*streamInfo, uint64, bool, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.getOrResumeStreamLocked(key)
-}
-
-func (m *manager) getOrResumeStreamLocked(key streamKey) (*streamInfo, uint64, bool, bool, error) {
 	s, exists := m.active[key]
-	if !exists {
-		return nil, 0, false, false, nil
+	failed := false
+	if exists {
+		s.mtx.Lock()
+		s.lastView = time.Now()
+		failed = s.fatalErr != nil || s.closing
+		s.mtx.Unlock()
 	}
-	s.mtx.Lock()
-	s.lastView = time.Now()
-	needResume := !s.completed && (s.paused || s.cancel == nil)
-	s.mtx.Unlock()
-	if needResume {
-		if err := m.startConversionLocked(key, s); err != nil {
-			return s, 0, false, true, err
+	m.mu.Unlock()
+	if failed {
+		m.cleanupIfCurrent(key, s)
+		exists = false
+	}
+
+	if !exists {
+		var candidate *streamInfo
+		source, sourceErr := newTorrentSource(file, m.sources, m.settings.TorrentReadaheadBytes(), func(n int64) {
+			if candidate != nil {
+				candidate.recordSourceBytes(n)
+			}
+		}, nil)
+		if sourceErr != nil {
+			return "", sourceErr
+		}
+
+		streamCtx, cancel := context.WithCancel(context.Background())
+		now := time.Now()
+		candidate = &streamInfo{
+			cancel:    cancel,
+			ctx:       streamCtx,
+			torrent:   t,
+			file:      file,
+			lastView:  time.Now(),
+			paths:     paths,
+			source:    source,
+			selection: ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack},
+			ready:     make(chan struct{}),
+			status: domain.HlsStatus{
+				Phase:         "probing",
+				TargetSeconds: startSeconds,
+				StartedAt:     now,
+				LastProgress:  now,
+			},
+			statusSegment: -1,
+			segmentErrors: make(map[int]segmentFailure),
+			lastTorrentBytes: func() int64 {
+				stats := t.Stats()
+				return stats.BytesReadUsefulData.Int64()
+			}(),
+			videoJobs:    make(map[*segmentJob]struct{}),
+			subtitleJobs: make(map[*segmentJob]struct{}),
+		}
+
+		m.mu.Lock()
+		if current, ok := m.active[key]; ok {
+			s = current
+			m.mu.Unlock()
+			cancel()
+			source.Close()
+		} else {
+			s = candidate
+			m.active[key] = s
+			m.torrents[hash]++
+			m.mu.Unlock()
+			go m.initializeOnDemandStream(key, s)
+			m.notifyDownloadsChanged()
 		}
 	}
-	runID := s.registerStartupWaiter()
-	return s, runID, needResume, true, nil
-}
-
-func (m *manager) waitForPlayableStream(ctx context.Context, key streamKey, s *streamInfo, runID uint64) (string, error) {
-	err := s.waitPlayable(ctx)
-	requestCanceled := ctx != nil && ctx.Err() != nil
-	m.releaseStartupWaiter(key, s, runID, requestCanceled)
-	if err != nil {
-		return "", err
-	}
-	return s.paths.masterPlaylist, nil
+	log.Printf("Stream registered: key=%v, playlist=%s", key, paths.masterPlaylist)
+	return paths.masterPlaylist, nil
 }
 
 func (m *manager) ListDownloads(ctx context.Context) ([]domain.Download, error) {
@@ -325,16 +318,8 @@ func (m *manager) downloadStatuses() map[string]domain.DownloadStatus {
 	statuses := make(map[string]domain.DownloadStatus)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for key, stream := range m.active {
+	for key := range m.active {
 		status := domain.DownloadStatusStreaming
-		stream.mtx.Lock()
-		if stream.completed {
-			status = domain.DownloadStatusReady
-		} else if stream.paused {
-			status = domain.DownloadStatusPaused
-		}
-		stream.mtx.Unlock()
-
 		current, ok := statuses[key.InfoHash]
 		if !ok || current != domain.DownloadStatusStreaming {
 			statuses[key.InfoHash] = status
@@ -400,127 +385,4 @@ func (m *manager) removeDownloadHlsDirs(id string) error {
 		}
 	}
 	return nil
-}
-
-func (m *manager) launchConversion(
-	streamCtx context.Context,
-	key streamKey,
-	s *streamInfo,
-	runID uint64,
-) {
-	go func() {
-		err := m.runConversion(streamCtx, s, runID)
-		m.finishConversion(key, s, runID, err)
-	}()
-}
-
-func (m *manager) runConversion(
-	streamCtx context.Context,
-	s *streamInfo,
-	runID uint64,
-) error {
-	if err := s.source.WaitRange(streamCtx, 0, initialProbeBytes); err != nil {
-		s.signalPlayable(runID, err)
-		return err
-	}
-
-	ffmpegHandler := ffmpeg.NewURLConverter(
-		streamCtx,
-		s.source.URL(),
-		s.paths.outDir,
-		s.paths.videoPlaylist,
-		s.paths.subtitlePlaylist,
-		s.paths.masterPlaylist,
-		s.selection,
-	)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- ffmpegHandler.ConvertToHLS()
-	}()
-
-	playlistReady := make(chan error, 1)
-	go func() { playlistReady <- waitForPlaylist(streamCtx, s.paths.masterPlaylist) }()
-
-	streamDone := streamCtx.Done()
-	playlistReadyCh := playlistReady
-	playableSent := false
-
-	for {
-		select {
-		case err := <-errCh:
-			if !playableSent {
-				s.signalPlayable(runID, err)
-			}
-			return err
-		case <-streamDone:
-			err := streamCtx.Err()
-			if !playableSent {
-				s.signalPlayable(runID, err)
-			}
-			return err
-		case err := <-playlistReadyCh:
-			if err != nil {
-				if !playableSent {
-					s.signalPlayable(runID, err)
-				}
-				return err
-			}
-			s.signalPlayable(runID, nil)
-			playableSent = true
-			streamDone = nil
-			playlistReadyCh = nil
-		}
-	}
-}
-
-func (m *manager) finishConversion(key streamKey, s *streamInfo, runID uint64, err error) {
-	m.mu.Lock()
-	if current, ok := m.active[key]; !ok || current != s || !s.isCurrentRun(runID) {
-		m.mu.Unlock()
-		return
-	}
-	if err != nil && !errors.Is(err, context.Canceled) {
-		log.Printf("Stream conversion error for key=%v: %v", key, err)
-	}
-	s.running = false
-	notifyCompleted := false
-	if err == nil {
-		s.completed = true
-		s.paused = false
-		notifyCompleted = true
-	} else if errors.Is(err, context.Canceled) {
-		s.paused = true
-	}
-	m.mu.Unlock()
-	if notifyCompleted {
-		m.notifyDownloadsChanged()
-	}
-
-	if err != nil && !errors.Is(err, context.Canceled) {
-		m.cleanupIfCurrentRun(key, s, runID)
-	}
-}
-
-// helpers
-func waitForPlaylist(ctx context.Context, path string) error {
-	const (
-		timeout = 20 * time.Minute
-		step    = 120 * time.Millisecond
-	)
-	deadline := time.Now().Add(timeout)
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-			if _, err := os.Stat(path); err == nil {
-				return nil
-			}
-			if time.Now().After(deadline) {
-				log.Printf("waitForPlaylist: %s not found after %v", path, timeout)
-				return errors.New("playlist not ready (timeout)")
-			}
-			time.Sleep(step)
-		}
-	}
 }

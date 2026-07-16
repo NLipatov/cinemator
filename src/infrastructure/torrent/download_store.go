@@ -35,6 +35,45 @@ func newDownloadStore(downloadRoot string) (*downloadStore, error) {
 	return &downloadStore{root: downloadRoot}, nil
 }
 
+// discardLegacyPayloads removes the pre-piece-cache file layout while preserving
+// saved download metadata. Torrent payload is a disposable cache and will be
+// fetched into the bounded content-addressed cache when requested again.
+func (s *downloadStore) discardLegacyPayloads() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := cleanInfoHash(entry.Name()); err != nil {
+			continue
+		}
+		if _, err := s.readLocked(entry.Name()); err != nil {
+			// A hash-shaped directory is not necessarily owned by Cinemator. Only
+			// migrate directories that contain valid Cinemator metadata.
+			continue
+		}
+		dir := s.downloadDir(entry.Name())
+		children, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			if child.Name() == downloadStoreDirName {
+				continue
+			}
+			if err := os.RemoveAll(filepath.Join(dir, child.Name())); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (s *downloadStore) upsert(ctx context.Context, id, magnet string, files []domain.FileInfo) (domain.Download, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.Download{}, err

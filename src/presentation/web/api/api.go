@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -51,7 +52,14 @@ func (s *HttpServer) Run() error {
 
 	listenPort := fmt.Sprintf(":%d", port)
 	log.Printf("Server listening on %s", listenPort)
-	return http.ListenAndServe(listenPort, s.handler())
+	server := &http.Server{
+		Addr:              listenPort,
+		Handler:           s.handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
+	return server.ListenAndServe()
 }
 
 func (s *HttpServer) handler() http.Handler {
@@ -69,6 +77,7 @@ func (s *HttpServer) handler() http.Handler {
 	app.HandleFunc("/api/downloads/events", s.handleDownloadEvents)
 	app.HandleFunc("/api/downloads/", s.handleDownloadAction)
 	app.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
+	app.HandleFunc("/api/hls/status/", s.handleGetHlsStatus)
 	app.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
 	root := http.NewServeMux()
@@ -256,16 +265,57 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	startSeconds, err := parseStartSeconds(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
-	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack)
+	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack, startSeconds)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	http.Redirect(
-		w, r,
-		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/"+filepath.Base(playlist),
-		http.StatusFound)
+	streamDir := filepath.Base(filepath.Dir(playlist))
+	playlistURL := "/api/hls/" + streamDir + "/" + filepath.Base(playlist)
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, struct {
+			Playlist string `json:"playlist"`
+			Stream   string `json:"stream"`
+		}{Playlist: playlistURL, Stream: streamDir})
+		return
+	}
+	http.Redirect(w, r, playlistURL, http.StatusFound)
+}
+
+func (s *HttpServer) handleGetHlsStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	streamDir := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/hls/status/"), "/")
+	if streamDir == "" || strings.Contains(streamDir, "/") {
+		http.Error(w, "bad stream", http.StatusBadRequest)
+		return
+	}
+	targetSeconds := -1.0
+	if raw := r.URL.Query().Get("target"); raw != "" {
+		value, parseErr := strconv.ParseFloat(raw, 64)
+		if parseErr != nil || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+			http.Error(w, "bad target", http.StatusBadRequest)
+			return
+		}
+		targetSeconds = value
+	}
+	status, err := s.mgr.GetHlsStatus(r.Context(), streamDir, targetSeconds)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, status)
 }
 
 func parseExtendDays(r *http.Request) (int, error) {
@@ -323,7 +373,7 @@ func downloadErrorStatus(err error) int {
 }
 
 func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
-	const waitTimeout = 30 * time.Second
+	const waitTimeout = 10 * time.Minute
 	clean := path.Clean("/" + r.URL.Path)
 	clean = strings.TrimPrefix(clean, "/")
 	if clean == "" || clean == "." {
@@ -337,12 +387,20 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	parts := strings.SplitN(clean, "/", 2)
+	streamDir := parts[0]
+	assetName := ""
+	if len(parts) == 2 {
+		assetName = parts[1]
+	}
+
 	// Track activity for cleanup/keepalive
-	if dir := strings.SplitN(clean, "/", 2)[0]; dir != "" {
+	if dir := streamDir; dir != "" {
 		s.mgr.TouchStream(r.Context(), dir)
 	}
 
 	if strings.HasSuffix(clean, ".m3u8") {
+		w.Header().Set("Cache-Control", "no-store")
 		var data []byte
 		var err error
 		if path.Base(clean) == "master.m3u8" {
@@ -361,11 +419,38 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if err := waitForPath(r.Context(), fullPath, waitTimeout); err != nil {
-		http.Error(w, "chunk not found", 404)
+	var file *os.File
+	var openErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := s.mgr.EnsureHlsAsset(r.Context(), streamDir, assetName); err != nil {
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("prepare HLS asset %s: %v", clean, err)
+			}
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "chunk not available", http.StatusServiceUnavailable)
+			return
+		}
+		file, openErr = os.Open(fullPath)
+		if openErr == nil {
+			break
+		}
+		if !errors.Is(openErr, os.ErrNotExist) {
+			http.Error(w, "chunk not found", http.StatusNotFound)
+			return
+		}
+	}
+	if file == nil {
+		http.Error(w, "chunk not found", http.StatusNotFound)
 		return
 	}
-	http.ServeFile(w, r, fullPath)
+	defer file.Close()
+	info, statErr := file.Stat()
+	if statErr != nil {
+		http.Error(w, "chunk not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
+	http.ServeContent(w, r, assetName, info.ModTime(), file)
 }
 
 func waitForPath(ctx context.Context, path string, timeout time.Duration) error {
@@ -433,4 +518,16 @@ func parseTrackIndex(r *http.Request, name string, defaultValue, minimum int) (i
 		return 0, fmt.Errorf("bad %s track index", name)
 	}
 	return index, nil
+}
+
+func parseStartSeconds(r *http.Request) (float64, error) {
+	raw := r.URL.Query().Get("start")
+	if raw == "" {
+		return 0, nil
+	}
+	seconds, err := strconv.ParseFloat(raw, 64)
+	if err != nil || seconds < 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		return 0, errors.New("bad start time")
+	}
+	return seconds, nil
 }

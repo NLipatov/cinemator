@@ -120,6 +120,58 @@ func TestDownloadStoreExpiredIDs(t *testing.T) {
 	}
 }
 
+func TestDiscardLegacyPayloadsPreservesDownloadMetadata(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	download, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, []domain.FileInfo{{Name: "movie.mkv", Size: 100}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(store.downloadDir(id), "movie.mkv.part")
+	if err := os.WriteFile(payload, []byte("legacy cache"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.discardLegacyPayloads(); err != nil {
+		t.Fatalf("discardLegacyPayloads() error = %v", err)
+	}
+	if _, err := os.Stat(payload); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy payload still exists: %v", err)
+	}
+	preserved, err := store.readLocked(download.ID)
+	if err != nil {
+		t.Fatalf("read preserved metadata: %v", err)
+	}
+	if preserved.Magnet != download.Magnet {
+		t.Fatalf("preserved magnet = %q, want %q", preserved.Magnet, download.Magnet)
+	}
+}
+
+func TestDiscardLegacyPayloadsPreservesForeignHashDirectory(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	foreign := filepath.Join(store.downloadDir(id), "important.bin")
+	if err := os.MkdirAll(filepath.Dir(foreign), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(foreign, []byte("keep"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.discardLegacyPayloads(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(foreign); err != nil || string(data) != "keep" {
+		t.Fatalf("foreign file was changed: data=%q err=%v", data, err)
+	}
+}
+
 func (s *downloadStore) writeLockedForTest(download domain.Download) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
