@@ -71,6 +71,8 @@ docker run --rm -it caddy:2-alpine \
   caddy hash-password --algorithm bcrypt
 ```
 
+At the prompts, enter and confirm the password you want to use. Caddy prints its bcrypt hash; store that hash, not the plaintext password, in `.env`.
+
 Store the result in single quotes so Compose preserves the `$` characters:
 
 ```dotenv
