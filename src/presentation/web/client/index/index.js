@@ -180,7 +180,7 @@
         msgTimeout = setTimeout(() => { el.textContent = ''; }, 2200);
       }
     }
-    function showWarning(title = 'Preparing video', detail = 'The server is downloading and transcoding the requested part.', status = 'Please stay on this page until playback begins.') {
+    function showWarning(title = 'Preparing video', detail = 'The server is downloading and preparing the requested part.', status = 'Please stay on this page until playback begins.') {
       clearSubtitleWait();
       $('warn-title').textContent = title;
       $('warn-detail').textContent = detail;
@@ -244,6 +244,11 @@
       const elapsed = formatElapsed(status.startedAt);
       const peerText = `${status.activePeers || 0} active / ${status.totalPeers || 0} known peers`;
       const suffix = elapsed ? ` · ${elapsed}` : '';
+      const preparation = status.mode === 'direct'
+        ? 'remuxing without video transcoding'
+        : status.mode === 'hybrid'
+          ? 'copying video and converting audio'
+          : 'transcoding';
       if (staleReady) {
         showWarning(
           `Requesting ${formatPlaybackTime(target)}`,
@@ -294,7 +299,7 @@
       }
       showWarning(
         `Preparing ${formatPlaybackTime(target)}`,
-        'Downloading the required torrent pieces and transcoding only the requested window.',
+        `Downloading the required torrent pieces and ${preparation} only for the requested window.`,
         `${formatBytes(status.bytesRead || 0)} read · ${peerText}${suffix}`,
       );
     }
@@ -321,14 +326,21 @@
           }, 10000);
           if (seq !== hlsStatusSeq) return;
           if (!response.ok) {
-            throw new Error((await response.text()).trim() || `Status request failed (${response.status})`);
+            const error = new Error((await response.text()).trim() || `Status request failed (${response.status})`);
+            error.status = response.status;
+            throw error;
           }
           consecutiveFailures = 0;
-          renderHlsStatus(await response.json(), targetSeconds);
+          const status = await response.json();
+          if (seq !== hlsStatusSeq) return;
+          renderHlsStatus(status, targetSeconds);
         } catch (error) {
           if (error.name !== 'AbortError' && seq === hlsStatusSeq) {
             consecutiveFailures++;
             if (consecutiveFailures >= 3) {
+              if (error.status === 404 && requestPlaybackRecovery('stream-worker-lost', true)) {
+                return;
+              }
               showWarning(
                 'Cannot reach the stream worker',
                 error.message || 'The server stopped reporting preparation progress.',
@@ -677,9 +689,6 @@
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape') closeExtendMenus();
     });
-    window.addEventListener('focus', () => {
-      loadDownloads({ quiet: true, suppressError: true });
-    });
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         loadDownloads({ quiet: true, suppressError: true });
@@ -688,7 +697,6 @@
     window.addEventListener('beforeunload', () => {
       if (downloadEvents) downloadEvents.close();
     });
-    loadDownloads();
     startDownloadEvents();
 
     $('form').onsubmit = async e => {
@@ -716,7 +724,6 @@
         setFileList(files);
         $('step-files').style.display = '';
         showMsg('magnetMsg', '');
-        loadDownloads({ quiet: true });
       } catch (e) {
         if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
@@ -752,8 +759,11 @@
         const info = await res.json();
         if (isStale(requestId)) return;
         currentMediaSeekable = info.seekable === true;
-        playbackNotice = currentMediaSeekable ? '' : 'Duration is unavailable for this format. Playback is progressive; seeking is limited to the discovered part.';
-        loadDownloads({ quiet: true });
+        const notices = Array.isArray(info.warnings) ? [...info.warnings] : [];
+        if (!currentMediaSeekable) {
+          notices.unshift('Duration is unavailable for this format. Playback is progressive; seeking is limited to the discovered part.');
+        }
+        playbackNotice = notices.join(' ');
 
         const audioCount = info.audioTracks ? info.audioTracks.length : 0;
         const subCount = info.subtitles ? info.subtitles.length : 0;
@@ -845,7 +855,9 @@
       }
       try {
         const start = currentMediaSeekable && Number.isFinite(resumeTime) && resumeTime > 0 ? resumeTime : 0;
-        const resp = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}&start=${encodeURIComponent(start)}`, {
+        const nativeHls = !(window.Hls && window.Hls.isSupported()) &&
+          Boolean($('video').canPlayType('application/vnd.apple.mpegurl'));
+        const resp = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}&audio=${audio}&subtitle=${subtitle}&start=${encodeURIComponent(start)}&transcode=${nativeHls ? 1 : 0}`, {
           headers: { Accept: 'application/json' },
           signal: request.signal,
         }, 60000);
@@ -860,8 +872,9 @@
         document.body.classList.add('has-player');
         showPlaybackNotice();
         beginHlsStatusPolling(start);
-        playHls(m3u8, subtitleSelected, start);
-        loadDownloads({ quiet: true });
+        const segmentSeconds = Number(prepared.segmentDurationSeconds) || 6;
+        const windowSegments = Number(prepared.windowSegments) || 5;
+        playHls(m3u8, subtitleSelected, start, { segmentSeconds, windowSegments });
       } catch (e) {
         if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
@@ -896,10 +909,12 @@
       if (!track || !track.cues) return;
       for (let i = 0; i < track.cues.length; i++) {
         const cue = track.cues[i];
+        if (cue.__appliedDelay === delaySec) continue;
         if (cue.__origStart === undefined) {
           cue.__origStart = cue.startTime;
           cue.__origEnd = cue.endTime;
         }
+        cue.__appliedDelay = delaySec;
         cue.startTime = Math.max(0, cue.__origStart + delaySec);
         cue.endTime = Math.max(cue.startTime, cue.__origEnd + delaySec);
       }
@@ -1020,7 +1035,7 @@
       };
     }
 
-    function playHls(src, enableSubtitles, resumeTime = 0) {
+    function playHls(src, enableSubtitles, resumeTime = 0, streamConfig = {}) {
       const video = $('video');
       video.style.opacity = 0;
       setTimeout(() => { video.style.opacity = 1; }, 120);
@@ -1034,6 +1049,9 @@
 
       let mainFragBuffered = false;
       let subtitleFragLoaded = !enableSubtitles;
+      let playlistReloadPosition = null;
+      let playlistReloading = false;
+      let playlistReloadAttempts = 0;
       function currentPositionBuffered() {
         const position = video.currentTime;
         for (let index = 0; index < video.buffered.length; index++) {
@@ -1059,6 +1077,7 @@
         if (!mainFragBuffered) return;
         lastStreamActivityAt = Date.now();
         forcedRecoveryAttempts = 0;
+        playlistReloadAttempts = 0;
         showPlaybackNotice();
         hideWarningOnce();
       }
@@ -1072,11 +1091,14 @@
       });
 
       if (window.Hls && Hls.isSupported()) {
+	        const segmentSeconds = Math.max(1, Number(streamConfig.segmentSeconds) || 6);
+	        const windowSegments = Math.max(1, Number(streamConfig.windowSegments) || 5);
+	        const forwardBuffer = segmentSeconds * Math.min(windowSegments, 2);
         hls = new Hls({
           startPosition: resumeTime,
-          maxBufferLength: 30,
-          maxMaxBufferLength: 60,
-          backBufferLength: 60,
+          maxBufferLength: forwardBuffer,
+          maxMaxBufferLength: forwardBuffer,
+          backBufferLength: segmentSeconds * 2,
           fragLoadPolicy: {
             default: {
               maxTimeToFirstByteMs: 10 * 60 * 1000,
@@ -1101,8 +1123,11 @@
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           lastStreamActivityAt = Date.now();
-          if (resumeTime > 0) {
-            video.currentTime = resumeTime;
+          const target = playlistReloadPosition;
+          playlistReloadPosition = null;
+          playlistReloading = false;
+          if (target !== null && target > 0) {
+            video.currentTime = target;
           }
           if (enableSubtitles && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
             hls.subtitleTrack = 0;
@@ -1143,6 +1168,22 @@
             beginHlsStatusPolling(video.currentTime);
             return;
           }
+          const responseCode = Number(data?.response?.code || data?.response?.status || 0);
+          if (responseCode === 409) {
+            if (!playlistReloading) {
+              playlistReloadAttempts++;
+              if (playlistReloadAttempts > 5) {
+                showPlaybackError('The refreshed playlist still points to an unprepared media window');
+                return;
+              }
+              playlistReloading = true;
+              playlistReloadPosition = video.currentTime;
+              const nextSource = new URL(src, window.location.href);
+              nextSource.searchParams.set('reload', String(Date.now()));
+              hls.loadSource(nextSource.href);
+            }
+            return;
+          }
           const levelEmpty = data.details === 'levelEmptyError' ||
             (Hls.ErrorDetails && data.details === Hls.ErrorDetails.LEVEL_EMPTY_ERROR);
           if (levelEmpty && (mainFragBuffered || Date.now() - lastStreamActivityAt < 8000)) {
@@ -1169,7 +1210,10 @@
         }, { once: true });
       } else {
         removeWarning();
-        showMsg('playerMsg', 'Your browser does not support HLS.', true);
+        const message = window.Hls
+          ? 'Your browser does not support HLS.'
+          : 'The HLS player library could not load. Check access to cdn.jsdelivr.net and reload the page.';
+        showMsg('playerMsg', message, true);
       }
     }
 

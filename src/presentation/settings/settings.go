@@ -9,13 +9,16 @@ import (
 const (
 	defaultHlsPath              = "/var/tmp/cinemator/hls"
 	defaultDownloadPath         = "/var/tmp/cinemator/download"
-	defaultViewerTimeout        = 2 * time.Hour
+	defaultViewerTimeout        = 30 * time.Minute
 	defaultMaxCacheBytes        = 2 << 30  // 2 GiB cap for generated HLS assets
 	defaultMaxTorrentCacheBytes = 12 << 30 // 12 GiB cap for verified torrent pieces
-	defaultTorrentReadahead     = 512 << 20
+	defaultTorrentReadahead     = 64 << 20
 	defaultHlsSegmentDuration   = 6 * time.Second
 	defaultHlsWindowSegments    = 5
 	defaultMaxTranscodes        = 1
+	defaultMaxQueuedJobs        = 4
+	defaultMaxJobsPerStream     = 3
+	defaultMaxActiveStreams     = 16
 	defaultHTTPPort             = 8000
 	defaultTorrentPort          = 42069
 )
@@ -30,6 +33,9 @@ type Settings struct {
 	hlsSegmentDuration   time.Duration
 	hlsWindowSegments    int
 	maxTranscodes        int
+	maxQueuedJobs        int
+	maxJobsPerStream     int
+	maxActiveStreams     int
 	httpPort             int
 	torrentPort          int
 	passwordHash         string
@@ -55,6 +61,9 @@ func NewSettings() Settings {
 		hlsSegmentDuration:   time.Duration(intEnv("CINEMATOR_HLS_SEGMENT_SECONDS", int(defaultHlsSegmentDuration/time.Second))) * time.Second,
 		hlsWindowSegments:    intEnv("CINEMATOR_HLS_WINDOW_SEGMENTS", defaultHlsWindowSegments),
 		maxTranscodes:        intEnv("CINEMATOR_MAX_TRANSCODES", defaultMaxTranscodes),
+		maxQueuedJobs:        intEnv("CINEMATOR_MAX_QUEUED_JOBS", defaultMaxQueuedJobs),
+		maxJobsPerStream:     intEnv("CINEMATOR_MAX_JOBS_PER_STREAM", defaultMaxJobsPerStream),
+		maxActiveStreams:     intEnv("CINEMATOR_MAX_ACTIVE_STREAMS", defaultMaxActiveStreams),
 		httpPort:             intEnv("CINEMATOR_HTTP_PORT", defaultHTTPPort),
 		torrentPort:          intEnv("CINEMATOR_TORRENT_PORT", defaultTorrentPort),
 		passwordHash:         stringEnv("CINEMATOR_PASSWORD_HASH", ""),
@@ -105,6 +114,27 @@ func (s Settings) MaxTranscodes() int {
 		return defaultMaxTranscodes
 	}
 	return s.maxTranscodes
+}
+
+func (s Settings) MaxQueuedJobs() int {
+	if s.maxQueuedJobs <= 0 {
+		return defaultMaxQueuedJobs
+	}
+	return s.maxQueuedJobs
+}
+
+func (s Settings) MaxJobsPerStream() int {
+	if s.maxJobsPerStream <= 0 {
+		return defaultMaxJobsPerStream
+	}
+	return s.maxJobsPerStream
+}
+
+func (s Settings) MaxActiveStreams() int {
+	if s.maxActiveStreams <= 0 {
+		return defaultMaxActiveStreams
+	}
+	return s.maxActiveStreams
 }
 
 func (s Settings) HttpPort() int {

@@ -18,7 +18,7 @@ func TestStreamStatusTracksRequestedSegmentProgress(t *testing.T) {
 		statusSegment: -1,
 	}
 	stream.markPreparing(7, 6*time.Second)
-	stream.recordSourceBytes(8192)
+	stream.recordSourceBytes("", 8192)
 
 	stream.mtx.Lock()
 	status := stream.status
@@ -133,6 +133,95 @@ func TestIndependentSegmentJobsDoNotCancelEachOther(t *testing.T) {
 	}
 }
 
+func TestStartedSegmentJobSurvivesDisconnectedWaiter(t *testing.T) {
+	canceled := false
+	job := &segmentJob{begin: 0, end: 5, done: make(chan struct{}), waiters: 1, started: true, cancel: func() { canceled = true }}
+	stream := &streamInfo{videoJobs: map[*segmentJob]struct{}{job: {}}}
+	(&manager{}).releaseJobWaiter(stream, job, context.Canceled)
+	if canceled {
+		t.Fatal("started bounded job was canceled after its last waiter disconnected")
+	}
+}
+
+func TestNewWindowCancelsAbandonedStartedJob(t *testing.T) {
+	canceled := false
+	job := &segmentJob{begin: 0, end: 5, done: make(chan struct{}), started: true, cancel: func() { canceled = true }}
+	cancelAbandonedJobsLocked(map[*segmentJob]struct{}{job: {}}, 10, 15)
+	if !canceled {
+		t.Fatal("abandoned old window was not canceled for a newer seek")
+	}
+}
+
+func TestNewWindowKeepsOverlappingOrObservedJob(t *testing.T) {
+	for _, job := range []*segmentJob{
+		{begin: 10, end: 15, done: make(chan struct{}), cancel: func() { t.Error("overlapping job was canceled") }},
+		{begin: 0, end: 5, done: make(chan struct{}), waiters: 1, cancel: func() { t.Error("observed job was canceled") }},
+	} {
+		cancelAbandonedJobsLocked(map[*segmentJob]struct{}{job: {}}, 10, 15)
+	}
+}
+
+func TestSourceProgressIsAttributedToMatchingJob(t *testing.T) {
+	video := &segmentJob{id: "video", done: make(chan struct{})}
+	subtitle := &segmentJob{id: "subtitle", done: make(chan struct{})}
+	stream := &streamInfo{
+		status:       domain.HlsStatus{Phase: "preparing"},
+		videoJobs:    map[*segmentJob]struct{}{video: {}},
+		subtitleJobs: map[*segmentJob]struct{}{subtitle: {}},
+	}
+	stream.recordSourceBytes("video", 4096)
+	if video.bytesRead != 4096 || subtitle.bytesRead != 0 {
+		t.Fatalf("job bytes: video=%d subtitle=%d", video.bytesRead, subtitle.bytesRead)
+	}
+	stream.recordSourceBytes("subtitle", 1024)
+	if video.bytesRead != 4096 || subtitle.bytesRead != 1024 {
+		t.Fatalf("job bytes after subtitle read: video=%d subtitle=%d", video.bytesRead, subtitle.bytesRead)
+	}
+}
+
+func TestSegmentWindowCreatesCanonicalNonOverlappingRanges(t *testing.T) {
+	for _, index := range []int{10, 11, 12, 13, 14} {
+		begin, end := segmentWindow(index, 100, 5)
+		if begin != 10 || end != 15 {
+			t.Fatalf("segmentWindow(%d) = [%d,%d), want [10,15)", index, begin, end)
+		}
+	}
+	begin, end := segmentWindow(99, 100, 5)
+	if begin != 95 || end != 100 {
+		t.Fatalf("tail window = [%d,%d), want [95,100)", begin, end)
+	}
+}
+
+func TestParseDirectSegmentOwner(t *testing.T) {
+	owner, ok := parseDirectSegmentOwner("direct_000015_0003.ts")
+	if !ok || owner != 15 {
+		t.Fatalf("parseDirectSegmentOwner() = %d, %v", owner, ok)
+	}
+	for _, name := range []string{"direct_15_0003.ts", "direct_000015.ts", "../direct_000015_0003.ts"} {
+		if _, ok := parseDirectSegmentOwner(name); ok {
+			t.Fatalf("parseDirectSegmentOwner(%q) accepted invalid name", name)
+		}
+	}
+}
+
+func TestReserveJobSlotEnforcesGlobalAndPerStreamLimits(t *testing.T) {
+	manager := &manager{jobs: make(chan struct{}, 1)}
+	stream := &streamInfo{videoJobs: make(map[*segmentJob]struct{}), subtitleJobs: make(map[*segmentJob]struct{})}
+	if err := manager.reserveJobSlotLocked(stream); err != nil {
+		t.Fatalf("first reservation: %v", err)
+	}
+	if err := manager.reserveJobSlotLocked(stream); !errors.Is(err, errStreamJobQueueFull) {
+		t.Fatalf("second reservation = %v, want queue full", err)
+	}
+	<-manager.jobs
+	for index := 0; index < manager.settings.MaxJobsPerStream(); index++ {
+		stream.videoJobs[&segmentJob{}] = struct{}{}
+	}
+	if err := manager.reserveJobSlotLocked(stream); !errors.Is(err, errStreamJobLimit) {
+		t.Fatalf("per-stream reservation = %v, want stream limit", err)
+	}
+}
+
 func TestSubtitleJobFailureBecomesVisible(t *testing.T) {
 	job := &segmentJob{begin: 0, end: 1, done: make(chan struct{})}
 	stream := &streamInfo{
@@ -142,6 +231,17 @@ func TestSubtitleJobFailureBecomesVisible(t *testing.T) {
 	stream.markJobError(job, errors.New("ffmpeg failed"))
 
 	if stream.status.Phase != "error" || !strings.Contains(stream.status.Message, "FFmpeg") {
+		t.Fatalf("status = %+v", stream.status)
+	}
+}
+
+func TestImmediateQueueFailureBecomesVisible(t *testing.T) {
+	stream := &streamInfo{
+		status:        domain.HlsStatus{Phase: "preparing"},
+		statusSegment: 7,
+	}
+	stream.markSegmentError(7, errStreamJobQueueFull)
+	if stream.status.Phase != "error" || !strings.Contains(stream.status.Message, "capacity") {
 		t.Fatalf("status = %+v", stream.status)
 	}
 }

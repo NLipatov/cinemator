@@ -36,7 +36,7 @@ func (m fakeTorrentManager) GetMediaInfo(context.Context, string, int) (domain.M
 	return domain.MediaInfo{}, nil
 }
 
-func (m fakeTorrentManager) PrepareHlsStream(_ context.Context, _ string, _, _, _ int, start float64) (string, error) {
+func (m fakeTorrentManager) PrepareHlsStream(_ context.Context, _ string, _, _, _ int, start float64, _ bool) (string, error) {
 	return m.prepare, nil
 }
 
@@ -186,6 +186,12 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			name:       "malformed transcode mode",
+			method:     http.MethodGet,
+			target:     "/api/hls/prepare?magnet=magnet&file=0&transcode=yes",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
 			name:       "invalid subtitle",
 			method:     http.MethodGet,
 			target:     "/api/hls/prepare?magnet=magnet&file=0&subtitle=-2",
@@ -226,7 +232,7 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 			if got := rec.Header().Get("Allow"); got != tt.wantAllow {
 				t.Fatalf("Allow = %q, want %q", got, tt.wantAllow)
 			}
-			if tt.accept == "application/json" && (!strings.Contains(rec.Body.String(), `"playlist":"/api/hls/stream/master.m3u8"`) || !strings.Contains(rec.Body.String(), `"stream":"stream"`)) {
+			if tt.accept == "application/json" && (!strings.Contains(rec.Body.String(), `"playlist":"/api/hls/stream/master.m3u8"`) || !strings.Contains(rec.Body.String(), `"stream":"stream"`) || !strings.Contains(rec.Body.String(), `"segmentDurationSeconds":6`) || !strings.Contains(rec.Body.String(), `"windowSegments":5`)) {
 				t.Fatalf("body = %q", rec.Body.String())
 			}
 		})
@@ -484,6 +490,29 @@ func TestHandleGetHlsChunkRetriesWhenCacheEvictsAssetBeforeOpen(t *testing.T) {
 	}
 	if ensureCalls != 2 {
 		t.Fatalf("EnsureHlsAsset() calls = %d, want 2", ensureCalls)
+	}
+}
+
+func TestHandleGetHlsChunkSignalsPlaylistReload(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CINEMATOR_HLS_PATH", root)
+	dir := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0_a0_s-1"
+	server := HttpServer{
+		mgr: fakeTorrentManager{ensure: func(_, _ string) error {
+			return domain.ErrHlsPlaylistChanged
+		}},
+		settings: settings.NewSettings(),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/"+dir+"/seek_000003.ts", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleGetHlsChunk(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusConflict)
+	}
+	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q", got)
 	}
 }
 

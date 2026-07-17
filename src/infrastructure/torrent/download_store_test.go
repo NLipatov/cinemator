@@ -120,6 +120,29 @@ func TestDownloadStoreExpiredIDs(t *testing.T) {
 	}
 }
 
+func TestDownloadStoreCoalescesFrequentTouches(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("d", 40)
+	download, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := store.touch(context.Background(), id); err != nil || changed {
+		t.Fatalf("fresh touch = %t, %v; want false, nil", changed, err)
+	}
+
+	download.LastAccessedAt = time.Now().Add(-2 * downloadTouchInterval)
+	if err := store.writeLockedForTest(download); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := store.touch(context.Background(), id); err != nil || !changed {
+		t.Fatalf("stale touch = %t, %v; want true, nil", changed, err)
+	}
+}
+
 func TestDiscardLegacyPayloadsPreservesDownloadMetadata(t *testing.T) {
 	store, err := newDownloadStore(t.TempDir())
 	if err != nil {
@@ -134,12 +157,19 @@ func TestDiscardLegacyPayloadsPreservesDownloadMetadata(t *testing.T) {
 	if err := os.WriteFile(payload, []byte("legacy cache"), 0644); err != nil {
 		t.Fatal(err)
 	}
+	foreign := filepath.Join(store.downloadDir(id), "keep-me.txt")
+	if err := os.WriteFile(foreign, []byte("user data"), 0644); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := store.discardLegacyPayloads(); err != nil {
 		t.Fatalf("discardLegacyPayloads() error = %v", err)
 	}
 	if _, err := os.Stat(payload); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("legacy payload still exists: %v", err)
+	}
+	if data, err := os.ReadFile(foreign); err != nil || string(data) != "user data" {
+		t.Fatalf("unrelated file was changed: data=%q err=%v", data, err)
 	}
 	preserved, err := store.readLocked(download.ID)
 	if err != nil {
@@ -169,6 +199,33 @@ func TestDiscardLegacyPayloadsPreservesForeignHashDirectory(t *testing.T) {
 	}
 	if data, err := os.ReadFile(foreign); err != nil || string(data) != "keep" {
 		t.Fatalf("foreign file was changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestDiscardLegacyPayloadsDoesNotFollowParentSymlink(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "cccccccccccccccccccccccccccccccccccccccc"
+	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, []domain.FileInfo{{Name: "nested/movie.mkv", Size: 100}}); err != nil {
+		t.Fatal(err)
+	}
+	external := t.TempDir()
+	payload := filepath.Join(external, "movie.mkv")
+	if err := os.WriteFile(payload, []byte("outside"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(store.downloadDir(id), "nested")
+	if err := os.Symlink(external, link); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+
+	if err := store.discardLegacyPayloads(); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(payload); err != nil || string(data) != "outside" {
+		t.Fatalf("external file was changed: data=%q err=%v", data, err)
 	}
 }
 

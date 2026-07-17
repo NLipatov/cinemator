@@ -32,7 +32,8 @@ type rangeServer struct {
 type rangeSource struct {
 	file      rangeFile
 	readahead int64
-	onRead    func(int64)
+	jobID     string
+	onRead    func(string, int64)
 	onError   func(error)
 }
 
@@ -64,7 +65,7 @@ func newRangeServer() (*rangeServer, error) {
 	return rs, nil
 }
 
-func (rs *rangeServer) register(file *torrent.File, readahead int64, onRead func(int64), onError func(error)) (token, sourceURL string, err error) {
+func (rs *rangeServer) register(file *torrent.File, readahead int64, onRead func(string, int64), onError func(error)) (token, sourceURL string, err error) {
 	for {
 		token, err = randomToken()
 		if err != nil {
@@ -130,6 +131,10 @@ func (rs *rangeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveTorrentRange(w http.ResponseWriter, r *http.Request, src rangeSource) error {
+	src.jobID = r.URL.Query().Get("job")
+	if len(src.jobID) > 128 {
+		src.jobID = ""
+	}
 	size := src.file.Length()
 	start, end, partial, err := parseByteRange(r.Header.Get("Range"), size)
 	if err != nil {
@@ -162,6 +167,7 @@ func serveTorrentRange(w http.ResponseWriter, r *http.Request, src rangeSource) 
 }
 
 const maxRangeReadAttempts = 16
+const progressReportBytes = 256 << 10
 
 type torrentReadPanicError struct {
 	value any
@@ -207,38 +213,69 @@ func copyTorrentRange(ctx context.Context, dst io.Writer, src rangeSource, start
 }
 
 func readTorrentRangeAttempt(ctx context.Context, dst io.Writer, src rangeSource, start, length int64) (n int64, err error) {
+	var reader torrent.Reader
+	var writer *progressWriter
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = torrentReadPanicError{value: recovered}
+		}
+		if writer != nil {
+			n = writer.total
+			writer.Flush()
+		}
+		if reader != nil {
+			if closeErr := closeRangeReader(reader); err == nil {
+				err = closeErr
+			}
+		}
+	}()
+
+	reader = src.file.NewReader()
+	reader.SetContext(ctx)
+	reader.SetReadahead(src.readahead)
+	if _, err := reader.Seek(start, io.SeekStart); err != nil {
+		return 0, err
+	}
+	writer = &progressWriter{Writer: dst, onWrite: func(written int64) {
+		if src.onRead != nil {
+			src.onRead(src.jobID, written)
+		}
+	}}
+	_, err = io.CopyN(writer, reader, length)
+	return n, err
+}
+
+func closeRangeReader(reader torrent.Reader) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = torrentReadPanicError{value: recovered}
 		}
 	}()
-
-	reader := src.file.NewReader()
-	reader.SetContext(ctx)
-	reader.SetReadahead(src.readahead)
-	if _, err := reader.Seek(start, io.SeekStart); err != nil {
-		_ = reader.Close()
-		return 0, err
-	}
-	n, readErr := io.CopyN(progressWriter{Writer: dst, onWrite: src.onRead}, reader, length)
-	closeErr := reader.Close()
-	if readErr != nil {
-		return n, readErr
-	}
-	return n, closeErr
+	return reader.Close()
 }
 
 type progressWriter struct {
 	io.Writer
 	onWrite func(int64)
+	pending int64
+	total   int64
 }
 
-func (w progressWriter) Write(p []byte) (int, error) {
+func (w *progressWriter) Write(p []byte) (int, error) {
 	n, err := w.Writer.Write(p)
-	if n > 0 && w.onWrite != nil {
-		w.onWrite(int64(n))
+	w.pending += int64(n)
+	w.total += int64(n)
+	if w.pending >= progressReportBytes {
+		w.Flush()
 	}
 	return n, err
+}
+
+func (w *progressWriter) Flush() {
+	if w.pending > 0 && w.onWrite != nil {
+		w.onWrite(w.pending)
+	}
+	w.pending = 0
 }
 
 func parseByteRange(value string, size int64) (start, end int64, partial bool, err error) {

@@ -16,6 +16,9 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	t.Setenv("CINEMATOR_HLS_SEGMENT_SECONDS", "12")
 	t.Setenv("CINEMATOR_HLS_WINDOW_SEGMENTS", "7")
 	t.Setenv("CINEMATOR_MAX_TRANSCODES", "3")
+	t.Setenv("CINEMATOR_MAX_QUEUED_JOBS", "12")
+	t.Setenv("CINEMATOR_MAX_JOBS_PER_STREAM", "5")
+	t.Setenv("CINEMATOR_MAX_ACTIVE_STREAMS", "9")
 	t.Setenv("CINEMATOR_PASSWORD_HASH", "$2a$04$test")
 	t.Setenv("CINEMATOR_SESSION_SECRET", "test-session-secret")
 
@@ -49,6 +52,9 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	}
 	if settings.MaxTranscodes() != 3 {
 		t.Fatalf("MaxTranscodes() = %d", settings.MaxTranscodes())
+	}
+	if settings.MaxQueuedJobs() != 12 || settings.MaxJobsPerStream() != 5 || settings.MaxActiveStreams() != 9 {
+		t.Fatalf("job limits = queued %d per-stream %d streams %d", settings.MaxQueuedJobs(), settings.MaxJobsPerStream(), settings.MaxActiveStreams())
 	}
 	if settings.PasswordHash() != "$2a$04$test" {
 		t.Fatalf("PasswordHash() = %q", settings.PasswordHash())
@@ -84,6 +90,9 @@ func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	t.Setenv("CINEMATOR_HLS_SEGMENT_SECONDS", "bad")
 	t.Setenv("CINEMATOR_HLS_WINDOW_SEGMENTS", "bad")
 	t.Setenv("CINEMATOR_MAX_TRANSCODES", "bad")
+	t.Setenv("CINEMATOR_MAX_QUEUED_JOBS", "bad")
+	t.Setenv("CINEMATOR_MAX_JOBS_PER_STREAM", "bad")
+	t.Setenv("CINEMATOR_MAX_ACTIVE_STREAMS", "bad")
 
 	settings := NewSettings()
 	if settings.HttpPort() != defaultHTTPPort {
@@ -109,5 +118,8 @@ func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	}
 	if settings.MaxTranscodes() != defaultMaxTranscodes {
 		t.Fatalf("MaxTranscodes() = %d, want %d", settings.MaxTranscodes(), defaultMaxTranscodes)
+	}
+	if settings.MaxQueuedJobs() != defaultMaxQueuedJobs || settings.MaxJobsPerStream() != defaultMaxJobsPerStream || settings.MaxActiveStreams() != defaultMaxActiveStreams {
+		t.Fatalf("bad numeric job limits did not fall back")
 	}
 }

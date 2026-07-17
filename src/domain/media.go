@@ -1,12 +1,20 @@
 package domain
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var ErrHlsPlaylistChanged = errors.New("HLS playlist changed")
 
 type AudioTrack struct {
-	Index    int    `json:"index"`
-	Codec    string `json:"codec"`
-	Language string `json:"language"`
-	Title    string `json:"title"`
+	Index      int    `json:"index"`
+	Codec      string `json:"codec"`
+	Profile    string `json:"-"`
+	Channels   int    `json:"-"`
+	SampleRate int    `json:"-"`
+	Language   string `json:"language"`
+	Title      string `json:"title"`
 }
 
 type SubtitleTrack struct {
@@ -17,20 +25,27 @@ type SubtitleTrack struct {
 }
 
 type MediaInfo struct {
-	VideoCodec  string          `json:"-"`
-	Width       int             `json:"-"`
-	Height      int             `json:"-"`
-	HDR         bool            `json:"-"`
-	NeedFilter  bool            `json:"-"`
-	Duration    float64         `json:"duration"`
-	Seekable    bool            `json:"seekable"`
-	Bitrate     int64           `json:"-"`
-	AudioTracks []AudioTrack    `json:"audioTracks"`
-	Subtitles   []SubtitleTrack `json:"subtitles"`
+	VideoCodec      string          `json:"-"`
+	VideoProfile    string          `json:"-"`
+	VideoLevel      int             `json:"-"`
+	VideoTrackIndex int             `json:"-"`
+	Width           int             `json:"-"`
+	Height          int             `json:"-"`
+	Rotated         bool            `json:"-"`
+	HDR             bool            `json:"-"`
+	NeedFilter      bool            `json:"-"`
+	Deinterlace     bool            `json:"-"`
+	Duration        float64         `json:"duration"`
+	Seekable        bool            `json:"seekable"`
+	Bitrate         int64           `json:"-"`
+	AudioTracks     []AudioTrack    `json:"audioTracks"`
+	Subtitles       []SubtitleTrack `json:"subtitles"`
+	Warnings        []string        `json:"warnings,omitempty"`
 }
 
 type HlsStatus struct {
 	Phase         string    `json:"phase"`
+	Mode          string    `json:"mode,omitempty"`
 	TargetSeconds float64   `json:"targetSeconds"`
 	StartedAt     time.Time `json:"startedAt"`
 	LastProgress  time.Time `json:"lastProgress"`

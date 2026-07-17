@@ -270,8 +270,13 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	forceTranscode := r.URL.Query().Get("transcode") == "1"
+	if value := r.URL.Query().Get("transcode"); value != "" && value != "0" && value != "1" {
+		http.Error(w, "bad transcode mode", http.StatusBadRequest)
+		return
+	}
 
-	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack, startSeconds)
+	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack, startSeconds, forceTranscode)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
 		return
@@ -281,9 +286,16 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 	if strings.Contains(r.Header.Get("Accept"), "application/json") {
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, struct {
-			Playlist string `json:"playlist"`
-			Stream   string `json:"stream"`
-		}{Playlist: playlistURL, Stream: streamDir})
+			Playlist               string  `json:"playlist"`
+			Stream                 string  `json:"stream"`
+			SegmentDurationSeconds float64 `json:"segmentDurationSeconds"`
+			WindowSegments         int     `json:"windowSegments"`
+		}{
+			Playlist:               playlistURL,
+			Stream:                 streamDir,
+			SegmentDurationSeconds: s.settings.HlsSegmentDuration().Seconds(),
+			WindowSegments:         s.settings.HlsWindowSegments(),
+		})
 		return
 	}
 	http.Redirect(w, r, playlistURL, http.StatusFound)
@@ -394,12 +406,8 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		assetName = parts[1]
 	}
 
-	// Track activity for cleanup/keepalive
-	if dir := streamDir; dir != "" {
-		s.mgr.TouchStream(r.Context(), dir)
-	}
-
 	if strings.HasSuffix(clean, ".m3u8") {
+		s.mgr.TouchStream(r.Context(), streamDir)
 		w.Header().Set("Cache-Control", "no-store")
 		var data []byte
 		var err error
@@ -423,6 +431,11 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 	var openErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := s.mgr.EnsureHlsAsset(r.Context(), streamDir, assetName); err != nil {
+			if errors.Is(err, domain.ErrHlsPlaylistChanged) {
+				w.Header().Set("Cache-Control", "no-store")
+				http.Error(w, "playlist changed", http.StatusConflict)
+				return
+			}
 			if !errors.Is(err, context.Canceled) {
 				log.Printf("prepare HLS asset %s: %v", clean, err)
 			}
@@ -455,6 +468,8 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 
 func waitForPath(ctx context.Context, path string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		if _, err := os.Stat(path); err == nil {
 			return nil
@@ -465,7 +480,7 @@ func waitForPath(ctx context.Context, path string, timeout time.Duration) error 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(120 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 }
@@ -479,6 +494,8 @@ func readWithWait(ctx context.Context, path string, timeout time.Duration) ([]by
 
 func readMediaPlaylistWithWait(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
 	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(120 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		data, err := os.ReadFile(path)
 		if err == nil && hls.HasSegment(string(data)) {
@@ -490,7 +507,7 @@ func readMediaPlaylistWithWait(ctx context.Context, path string, timeout time.Du
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(120 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 }

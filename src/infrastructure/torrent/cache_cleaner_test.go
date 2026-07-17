@@ -27,8 +27,12 @@ func TestEnforceCacheLimitEvictsActiveGeneratedAssetsButProtectsManifestsAndWork
 		filepath.Join(paths.outDir, "chunk_000000.ts"),
 		filepath.Join(paths.outDir, "chunk_000001.ts"),
 		filepath.Join(workDir, "chunk_000002.ts"),
+		filepath.Join(paths.outDir, ".remuxing-test", "part_000000.ts"),
 	}
 	for index, path := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(path, make([]byte, 100), 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -47,7 +51,7 @@ func TestEnforceCacheLimitEvictsActiveGeneratedAssetsButProtectsManifestsAndWork
 	if _, err := os.Stat(filepath.Join(paths.outDir, "chunk_000000.ts")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("old generated segment was not evicted: %v", err)
 	}
-	for _, path := range []string{paths.masterPlaylist, paths.videoPlaylist, filepath.Join(workDir, "chunk_000002.ts")} {
+	for _, path := range []string{paths.masterPlaylist, paths.videoPlaylist, filepath.Join(workDir, "chunk_000002.ts"), filepath.Join(paths.outDir, ".remuxing-test", "part_000000.ts")} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("protected cache file %s was removed: %v", path, err)
 		}
@@ -70,7 +74,7 @@ func TestReserveHlsGenerationCreatesAndReleasesHardHeadroom(t *testing.T) {
 	}
 	m := &manager{active: make(map[streamKey]*streamInfo), settings: settings.NewSettings()}
 
-	release, err := m.reserveHlsGeneration(1)
+	release, err := m.reserveHlsGeneration(6*time.Second, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,5 +87,33 @@ func TestReserveHlsGenerationCreatesAndReleasesHardHeadroom(t *testing.T) {
 	release()
 	if m.hlsReserved != 0 {
 		t.Fatalf("reserved bytes after release = %d", m.hlsReserved)
+	}
+}
+
+func TestEstimatedHlsWindowBytesUsesSourceBitrate(t *testing.T) {
+	low := estimatedHlsWindowBytes(30*time.Second, 0)
+	high := estimatedHlsWindowBytes(30*time.Second, 20_000_000)
+	if high <= low {
+		t.Fatalf("high-bitrate reservation = %d, want more than %d", high, low)
+	}
+}
+
+func TestCacheDoesNotEvictJustRequestedActiveSegment(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CINEMATOR_HLS_PATH", root)
+	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "1")
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
+	paths := key.paths(root)
+	segment := filepath.Join(paths.outDir, "chunk_000000.ts")
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(segment, []byte("recent"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m := &manager{active: map[streamKey]*streamInfo{key: {paths: paths}}, settings: settings.NewSettings()}
+	m.enforceCacheLimit()
+	if _, err := os.Stat(segment); err != nil {
+		t.Fatalf("recent active segment was evicted: %v", err)
 	}
 }

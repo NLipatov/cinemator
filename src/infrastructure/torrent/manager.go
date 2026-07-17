@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,7 @@ import (
 type manager struct {
 	client      *torrent.Client
 	active      map[streamKey]*streamInfo
+	mediaInfo   map[mediaKey]domain.MediaInfo
 	torrents    map[string]int
 	sources     *rangeServer
 	downloads   *downloadStore
@@ -31,6 +33,7 @@ type manager struct {
 	cacheMu     sync.Mutex
 	hlsReserved int64
 	transcodes  chan struct{}
+	jobs        chan struct{}
 	settings    settings.Settings
 }
 
@@ -38,6 +41,10 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = settings.DownloadPath()
 	cfg.ListenPort = settings.TorrentPort()
+	// The bounded store routinely makes readers retry evicted pieces, and a
+	// completed direct window cancels its source read. The dependency logs both
+	// as errors even though Cinemator handles them, so keep only critical events.
+	cfg.Slogger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError + 1}))
 	// A capped cache can evict a piece after the torrent was briefly complete.
 	// Keep seed connections so a later seek can fetch that piece again.
 	cfg.DropMutuallyCompletePeers = false
@@ -70,11 +77,13 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	m := &manager{
 		client:     client,
 		active:     make(map[streamKey]*streamInfo),
+		mediaInfo:  make(map[mediaKey]domain.MediaInfo),
 		torrents:   make(map[string]int),
 		sources:    sources,
 		downloads:  downloads,
 		events:     newDownloadEventBroadcaster(),
 		transcodes: make(chan struct{}, settings.MaxTranscodes()),
+		jobs:       make(chan struct{}, settings.MaxQueuedJobs()),
 		settings:   settings,
 	}
 	go m.viewerWatcher()
@@ -111,6 +120,17 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	if err != nil {
 		return domain.MediaInfo{}, err
 	}
+	key := mediaKey{InfoHash: t.InfoHash().HexString(), Index: fileIndex}
+	m.mu.Lock()
+	cached, ok := m.mediaInfo[key]
+	m.mu.Unlock()
+	if ok {
+		if err := ctx.Err(); err != nil {
+			return domain.MediaInfo{}, err
+		}
+		m.touchDownload(ctx, key.InfoHash)
+		return cached, nil
+	}
 	select {
 	case <-t.GotInfo():
 	case <-ctx.Done():
@@ -134,10 +154,15 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	if err == nil && info.VideoCodec == "" {
 		return domain.MediaInfo{}, errors.New("selected file has no video stream")
 	}
+	if err == nil {
+		m.mu.Lock()
+		m.mediaInfo[key] = info
+		m.mu.Unlock()
+	}
 	return info, err
 }
 
-func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int, startSeconds float64) (string, error) {
+func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int, startSeconds float64, forceTranscode bool) (string, error) {
 	t, err := addMagnet(m.client, magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
@@ -159,7 +184,8 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	file := files[fileIndex]
 	hash := t.InfoHash().HexString()
 	m.touchDownload(ctx, hash)
-	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack}
+	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack, Transcode: forceTranscode}
+	probeKey := mediaKey{InfoHash: hash, Index: fileIndex}
 	paths := key.paths(m.settings.HlsPath())
 
 	m.mu.Lock()
@@ -179,9 +205,12 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 
 	if !exists {
 		var candidate *streamInfo
-		source, sourceErr := newTorrentSource(file, m.sources, m.settings.TorrentReadaheadBytes(), func(n int64) {
+		m.mu.Lock()
+		cachedInfo, hasCachedInfo := m.mediaInfo[probeKey]
+		m.mu.Unlock()
+		source, sourceErr := newTorrentSource(file, m.sources, m.settings.TorrentReadaheadBytes(), func(jobID string, n int64) {
 			if candidate != nil {
-				candidate.recordSourceBytes(n)
+				candidate.recordSourceBytes(jobID, n)
 			}
 		}, nil)
 		if sourceErr != nil {
@@ -191,15 +220,18 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		streamCtx, cancel := context.WithCancel(context.Background())
 		now := time.Now()
 		candidate = &streamInfo{
-			cancel:    cancel,
-			ctx:       streamCtx,
-			torrent:   t,
-			file:      file,
-			lastView:  time.Now(),
-			paths:     paths,
-			source:    source,
-			selection: ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack},
-			ready:     make(chan struct{}),
+			cancel:         cancel,
+			ctx:            streamCtx,
+			torrent:        t,
+			file:           file,
+			lastView:       time.Now(),
+			paths:          paths,
+			assetVersion:   fmt.Sprintf("%x", now.UnixNano()),
+			source:         source,
+			selection:      ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack, ForceTranscode: forceTranscode},
+			mediaInfo:      cachedInfo,
+			mediaInfoReady: hasCachedInfo,
+			ready:          make(chan struct{}),
 			status: domain.HlsStatus{
 				Phase:         "probing",
 				TargetSeconds: startSeconds,
@@ -212,8 +244,9 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 				stats := t.Stats()
 				return stats.BytesReadUsefulData.Int64()
 			}(),
-			videoJobs:    make(map[*segmentJob]struct{}),
-			subtitleJobs: make(map[*segmentJob]struct{}),
+			videoJobs:     make(map[*segmentJob]struct{}),
+			subtitleJobs:  make(map[*segmentJob]struct{}),
+			directWindows: make(map[int][]ffmpeg.HLSFragment),
 		}
 
 		m.mu.Lock()
@@ -222,7 +255,21 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			m.mu.Unlock()
 			cancel()
 			source.Close()
+		} else if len(m.active) >= m.settings.MaxActiveStreams() {
+			m.mu.Unlock()
+			cancel()
+			source.Close()
+			return "", fmt.Errorf("active stream limit reached (%d)", m.settings.MaxActiveStreams())
 		} else {
+			// Remove playlists from an earlier process before publishing the
+			// stream. Otherwise a recovering player can read a stale master
+			// while initialization is still probing the torrent.
+			if resetErr := resetStreamOutput(paths); resetErr != nil {
+				m.mu.Unlock()
+				cancel()
+				source.Close()
+				return "", resetErr
+			}
 			s = candidate
 			m.active[key] = s
 			m.torrents[hash]++
@@ -283,6 +330,11 @@ func (m *manager) DeleteDownload(ctx context.Context, id string) error {
 
 	m.mu.Lock()
 	delete(m.torrents, id)
+	for key := range m.mediaInfo {
+		if key.InfoHash == id {
+			delete(m.mediaInfo, key)
+		}
+	}
 	m.mu.Unlock()
 
 	if err := m.removeDownloadHlsDirs(id); err != nil {
@@ -296,9 +348,10 @@ func (m *manager) DeleteDownload(ctx context.Context, id string) error {
 }
 
 func (m *manager) touchDownload(ctx context.Context, id string) {
-	if err := m.downloads.touch(ctx, id); err != nil && !errors.Is(err, domain.ErrDownloadNotFound) {
+	changed, err := m.downloads.touch(ctx, id)
+	if err != nil && !errors.Is(err, domain.ErrDownloadNotFound) {
 		log.Printf("failed to touch download metadata: %v", err)
-	} else if err == nil {
+	} else if changed {
 		m.notifyDownloadsChanged()
 	}
 }

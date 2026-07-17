@@ -12,21 +12,18 @@ import (
 )
 
 func TestBuildOnDemandMediaPlaylistCoversWholeDuration(t *testing.T) {
-	got := buildOnDemandMediaPlaylist(25.5, 10, "chunk_", ".ts")
+	got := buildOnDemandMediaPlaylist(25.5, 10, 2, "chunk_", ".ts", "")
 
 	for _, want := range []string{
 		"#EXT-X-PLAYLIST-TYPE:VOD\n",
 		"#EXTINF:10.000,\nchunk_000000.ts\n",
 		"#EXTINF:10.000,\nchunk_000001.ts\n",
-		"#EXTINF:5.500,\nchunk_000002.ts\n",
+		"#EXT-X-DISCONTINUITY\n#EXTINF:5.500,\nchunk_000002.ts\n",
 		"#EXT-X-ENDLIST\n",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("playlist missing %q:\n%s", want, got)
 		}
-	}
-	if strings.Contains(got, "#EXT-X-DISCONTINUITY") {
-		t.Fatalf("absolute-timestamp segments must not force decoder discontinuities:\n%s", got)
 	}
 }
 
@@ -46,13 +43,67 @@ func TestPrepareOnDemandHLSWritesStaticManifests(t *testing.T) {
 		info,
 		selection,
 		10*time.Second,
+		2,
+		"v1",
 	)
 	if err != nil {
 		t.Fatalf("PrepareOnDemandHLS() error = %v", err)
 	}
 	assertFileContains(t, dir+"/master.m3u8", "SUBTITLES=\"subs\"")
 	assertFileContains(t, dir+"/index.m3u8", "chunk_000002.ts")
+	assertFileContains(t, dir+"/index.m3u8", "chunk_000002.ts?v=v1")
+	assertFileContains(t, dir+"/master.m3u8", "index.m3u8?v=v1")
 	assertFileContains(t, dir+"/subs.m3u8", "subs_000002.vtt")
+}
+
+func TestBuildSparseMediaPlaylistReplacesGapWithGOPs(t *testing.T) {
+	got := buildSparseMediaPlaylist(40, 6, 2, "v1", []HLSFragment{
+		{Start: 10, Duration: 10, Name: "direct_000003_0000.ts"},
+		{Start: 20, Duration: 10, Name: "direct_000003_0001.ts"},
+		{Start: 30, Duration: 10, Name: "direct_000003_0002.ts"},
+	})
+	for _, want := range []string{
+		"#EXT-X-TARGETDURATION:12\n",
+		"#EXTINF:10.000,\nseek_000000.ts?v=v1\n",
+		"#EXTINF:10.000,\ndirect_000003_0000.ts?v=v1\n",
+		"#EXT-X-ENDLIST\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("sparse playlist missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "direct_000003_0000.ts") != 1 {
+		t.Fatalf("sparse playlist duplicated prepared GOP:\n%s", got)
+	}
+}
+
+func TestPrepareOnDemandHLSUsesSeekTriggersForDirectPlay(t *testing.T) {
+	dir := t.TempDir()
+	err := PrepareOnDemandHLS(
+		dir,
+		dir+"/index.m3u8",
+		dir+"/subs.m3u8",
+		dir+"/master.m3u8",
+		domain.MediaInfo{Duration: 30, VideoCodec: "h264", Width: 1280, Height: 720},
+		StreamSelection{SubtitleTrackIndex: -1},
+		6*time.Second,
+		3,
+		"v1",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFileContains(t, dir+"/index.m3u8", "#EXTINF:18.000,\nseek_000000.ts?v=v1")
+	data, err := os.ReadFile(dir + "/index.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "chunk_000000.ts") {
+		t.Fatalf("direct playlist uses transcoded placeholder:\n%s", data)
+	}
+	if got := strings.Count(string(data), "seek_"); got != 2 {
+		t.Fatalf("direct playlist has %d seek windows, want 2:\n%s", got, data)
+	}
 }
 
 func TestUsesTextSubtitlesRejectsBitmapTracks(t *testing.T) {
@@ -75,6 +126,8 @@ func TestPrepareOnDemandHLSWritesProgressiveManifestWithoutDuration(t *testing.T
 		domain.MediaInfo{},
 		StreamSelection{SubtitleTrackIndex: -1},
 		6*time.Second,
+		3,
+		"v1",
 	)
 	if err != nil {
 		t.Fatalf("PrepareOnDemandHLS() error = %v", err)
@@ -95,10 +148,11 @@ func TestPrepareOnDemandHLSWritesProgressiveManifestWithoutDuration(t *testing.T
 func TestUpdateProgressiveHLSFinalizesDiscoveredDuration(t *testing.T) {
 	dir := t.TempDir()
 	path := dir + "/index.m3u8"
-	if err := UpdateProgressiveHLS(path, "", false, 6*time.Second, 3, 2.5, true); err != nil {
+	if err := UpdateProgressiveHLS(path, "", false, 6*time.Second, 2, "v1", 3, 2.5, true); err != nil {
 		t.Fatalf("UpdateProgressiveHLS() error = %v", err)
 	}
 	assertFileContains(t, path, "#EXTINF:2.500,\nchunk_000002.ts")
+	assertFileContains(t, path, "#EXT-X-DISCONTINUITY\n#EXTINF:2.500,")
 	assertFileContains(t, path, "#EXT-X-ENDLIST")
 }
 

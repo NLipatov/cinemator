@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	downloadStoreDirName = ".cinemator"
-	downloadDefaultTTL   = 7 * 24 * time.Hour
+	downloadStoreDirName  = ".cinemator"
+	downloadDefaultTTL    = 7 * 24 * time.Hour
+	downloadTouchInterval = time.Minute
 )
 
 type downloadStore struct {
@@ -52,26 +53,85 @@ func (s *downloadStore) discardLegacyPayloads() error {
 		if _, err := cleanInfoHash(entry.Name()); err != nil {
 			continue
 		}
-		if _, err := s.readLocked(entry.Name()); err != nil {
+		download, err := s.readLocked(entry.Name())
+		if err != nil {
 			// A hash-shaped directory is not necessarily owned by Cinemator. Only
 			// migrate directories that contain valid Cinemator metadata.
 			continue
 		}
 		dir := s.downloadDir(entry.Name())
-		children, err := os.ReadDir(dir)
+		root, err := os.OpenRoot(dir)
 		if err != nil {
 			return err
 		}
-		for _, child := range children {
-			if child.Name() == downloadStoreDirName {
-				continue
+		removeErr := func() error {
+			defer root.Close()
+			for _, file := range download.Files {
+				rel := filepath.Clean(filepath.FromSlash(file.Name))
+				if rel == "." || filepath.IsAbs(rel) || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+					continue
+				}
+				if rel == downloadStoreDirName || strings.HasPrefix(rel, downloadStoreDirName+string(os.PathSeparator)) {
+					continue
+				}
+				for _, suffix := range []string{"", ".part"} {
+					payload := rel + suffix
+					symlinked, err := hasSymlinkParent(root, payload)
+					if err != nil {
+						return err
+					}
+					if symlinked {
+						continue
+					}
+					if err := root.RemoveAll(payload); err != nil {
+						return err
+					}
+					removeEmptyParents(root, filepath.Dir(payload))
+				}
 			}
-			if err := os.RemoveAll(filepath.Join(dir, child.Name())); err != nil {
-				return err
-			}
+			return nil
+		}()
+		if removeErr != nil {
+			return removeErr
 		}
 	}
 	return nil
+}
+
+func hasSymlinkParent(root *os.Root, path string) (bool, error) {
+	parent := filepath.Dir(filepath.Clean(path))
+	if parent == "." {
+		return false, nil
+	}
+	current := ""
+	for _, component := range strings.Split(parent, string(os.PathSeparator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		current = filepath.Join(current, component)
+		info, err := root.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return true, nil
+		}
+		if !info.IsDir() {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func removeEmptyParents(root *os.Root, path string) {
+	for path = filepath.Clean(path); path != "."; path = filepath.Dir(path) {
+		if err := root.Remove(path); err != nil {
+			return
+		}
+	}
 }
 
 func (s *downloadStore) upsert(ctx context.Context, id, magnet string, files []domain.FileInfo) (domain.Download, error) {
@@ -206,13 +266,13 @@ func (s *downloadStore) expiredIDs(ctx context.Context, now time.Time) ([]string
 	return ids, nil
 }
 
-func (s *downloadStore) touch(ctx context.Context, id string) error {
+func (s *downloadStore) touch(ctx context.Context, id string) (bool, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return false, err
 	}
 	id, err := cleanInfoHash(id)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	s.mu.Lock()
@@ -220,16 +280,22 @@ func (s *downloadStore) touch(ctx context.Context, id string) error {
 
 	download, err := s.readLocked(id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	now := time.Now().UTC()
+	if download.Status == domain.DownloadStatusReady && !download.ExpiresAt.Before(now) && now.Sub(download.LastAccessedAt) < downloadTouchInterval {
+		return false, nil
+	}
 	download.LastAccessedAt = now
 	download.UpdatedAt = now
 	if download.ExpiresAt.Before(now) {
 		download.ExpiresAt = now.Add(downloadDefaultTTL)
 	}
 	download.Status = domain.DownloadStatusReady
-	return s.writeLocked(download)
+	if err := s.writeLocked(download); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *downloadStore) extend(ctx context.Context, id string, extension time.Duration) (domain.Download, error) {

@@ -16,10 +16,16 @@ import (
 )
 
 type streamKey struct {
+	InfoHash  string
+	Index     int
+	Audio     int
+	Subtitle  int
+	Transcode bool
+}
+
+type mediaKey struct {
 	InfoHash string
 	Index    int
-	Audio    int
-	Subtitle int
 }
 
 type streamInfo struct {
@@ -30,12 +36,16 @@ type streamInfo struct {
 	mtx                   sync.Mutex
 	selection             ffmpeg.StreamSelection
 	paths                 streamPaths
+	assetVersion          string
 	source                *torrentSource
 	ctx                   context.Context
 	ready                 chan struct{}
 	readyErr              error
 	fatalErr              error
 	mediaInfo             domain.MediaInfo
+	mediaInfoReady        bool
+	directPlay            bool
+	directWindows         map[int][]ffmpeg.HLSFragment
 	status                domain.HlsStatus
 	statusSegment         int
 	segmentErrors         map[int]segmentFailure
@@ -43,20 +53,38 @@ type streamInfo struct {
 	progressiveAdvertised int
 	progressiveEnded      bool
 	progressiveLast       float64
+	progressiveRetry      bool
 	videoJobs             map[*segmentJob]struct{}
 	subtitleJobs          map[*segmentJob]struct{}
 	playlistMtx           sync.Mutex
 	closing               bool
 }
 
-func (s *streamInfo) recordSourceBytes(n int64) {
+func (s *streamInfo) recordSourceBytes(jobID string, n int64) {
 	if n <= 0 {
 		return
 	}
 	s.mtx.Lock()
+	now := time.Now()
+	if jobID != "" {
+		for job := range s.videoJobs {
+			if job.id == jobID {
+				job.bytesRead += n
+				job.lastProgress = now
+				break
+			}
+		}
+		for job := range s.subtitleJobs {
+			if job.id == jobID {
+				job.bytesRead += n
+				job.lastProgress = now
+				break
+			}
+		}
+	}
 	if s.status.Phase == "probing" || s.status.Phase == "preparing" {
 		s.status.BytesRead += n
-		s.status.LastProgress = time.Now()
+		s.status.LastProgress = now
 	}
 	s.mtx.Unlock()
 }
@@ -71,6 +99,7 @@ func (s *streamInfo) markPreparing(index int, segmentDuration time.Duration) {
 	if s.status.Phase != "preparing" || s.statusSegment != index {
 		s.status = domain.HlsStatus{
 			Phase:         "preparing",
+			Mode:          s.status.Mode,
 			TargetSeconds: float64(index) * segmentDuration.Seconds(),
 			StartedAt:     now,
 			LastProgress:  now,
@@ -93,9 +122,12 @@ func (s *streamInfo) markReady(index int) {
 	s.mtx.Unlock()
 }
 
-func (s *streamInfo) markSegmentProgress(index int) {
+func (s *streamInfo) markSegmentProgress(job *segmentJob, index int) {
 	s.mtx.Lock()
 	delete(s.segmentErrors, index)
+	if job != nil {
+		job.lastProgress = time.Now()
+	}
 	if s.status.Phase == "probing" || s.status.Phase == "preparing" {
 		s.status.LastProgress = time.Now()
 	}
@@ -137,6 +169,28 @@ func (s *streamInfo) markJobError(job *segmentJob, err error) {
 	s.mtx.Unlock()
 }
 
+func (s *streamInfo) markSegmentError(index int, err error) {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if s.closing || s.fatalErr != nil {
+		return
+	}
+	if s.segmentErrors == nil {
+		s.segmentErrors = make(map[int]segmentFailure)
+	}
+	now := time.Now()
+	failure := segmentFailure{message: publicStreamError(err), at: now}
+	s.segmentErrors[index] = failure
+	if s.statusSegment == index {
+		s.status.Phase = "error"
+		s.status.Message = failure.message
+		s.status.LastProgress = now
+	}
+}
+
 func (s *streamInfo) markJobCanceled(job *segmentJob) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -175,6 +229,8 @@ func publicStreamError(err error) string {
 		return "The server ran out of disk space while preparing video"
 	case strings.Contains(message, "reserve") && strings.Contains(message, "hls cache"):
 		return "The configured HLS cache is too small for a transcoding window"
+	case errors.Is(err, errStreamJobQueueFull), errors.Is(err, errStreamJobLimit), strings.Contains(message, "active stream limit"):
+		return "The server is at its configured streaming capacity; retry shortly"
 	case strings.Contains(message, "ffmpeg"):
 		return "FFmpeg could not decode or transcode this media window; check the server log for details"
 	case strings.Contains(message, "torrent") || strings.Contains(message, "reader panic"):
@@ -185,15 +241,21 @@ func publicStreamError(err error) string {
 }
 
 type segmentJob struct {
-	begin      int
-	end        int
-	cancel     context.CancelFunc
-	done       chan struct{}
-	startedAt  time.Time
-	waiters    int
-	background bool
-	err        error
-	result     ffmpeg.VideoWindowResult
+	begin        int
+	end          int
+	id           string
+	cancel       context.CancelFunc
+	done         chan struct{}
+	startedAt    time.Time
+	lastProgress time.Time
+	bytesRead    int64
+	waiters      int
+	background   bool
+	started      bool
+	err          error
+	result       ffmpeg.VideoWindowResult
+	fragments    []ffmpeg.HLSFragment
+	slotHeld     bool
 }
 
 type segmentFailure struct {
@@ -209,7 +271,7 @@ type streamPaths struct {
 }
 
 func (k streamKey) dirName() string {
-	return fmt.Sprintf("%s_%d_a%d_s%d", k.InfoHash, k.Index, k.Audio, k.Subtitle)
+	return fmt.Sprintf("%s_%d_a%d_s%d_t%d", k.InfoHash, k.Index, k.Audio, k.Subtitle, btoi(k.Transcode))
 }
 
 func (k streamKey) paths(root string) streamPaths {
@@ -224,14 +286,15 @@ func (k streamKey) paths(root string) streamPaths {
 
 func parseStreamDir(name string) (streamKey, error) {
 	parts := strings.Split(name, "_")
-	if len(parts) != 4 {
+	if len(parts) != 5 {
 		return streamKey{}, fmt.Errorf("bad stream dir")
 	}
-	if !strings.HasPrefix(parts[2], "a") || !strings.HasPrefix(parts[3], "s") {
+	if !strings.HasPrefix(parts[2], "a") || !strings.HasPrefix(parts[3], "s") || !strings.HasPrefix(parts[4], "t") {
 		return streamKey{}, fmt.Errorf("bad stream dir")
 	}
 	audio := strings.TrimPrefix(parts[2], "a")
 	subtitle := strings.TrimPrefix(parts[3], "s")
+	transcode := strings.TrimPrefix(parts[4], "t")
 	idx, err := strconv.Atoi(parts[1])
 	if err != nil {
 		return streamKey{}, err
@@ -244,10 +307,22 @@ func parseStreamDir(name string) (streamKey, error) {
 	if err != nil {
 		return streamKey{}, err
 	}
+	transcodeValue, err := strconv.Atoi(transcode)
+	if err != nil || transcodeValue < 0 || transcodeValue > 1 {
+		return streamKey{}, fmt.Errorf("bad transcode mode")
+	}
 	return streamKey{
-		InfoHash: parts[0],
-		Index:    idx,
-		Audio:    audioIdx,
-		Subtitle: subIdx,
+		InfoHash:  parts[0],
+		Index:     idx,
+		Audio:     audioIdx,
+		Subtitle:  subIdx,
+		Transcode: transcodeValue == 1,
 	}, nil
+}
+
+func btoi(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }

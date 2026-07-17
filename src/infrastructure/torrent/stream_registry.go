@@ -122,7 +122,7 @@ func (m *manager) TouchStream(_ context.Context, dirName string) {
 }
 
 func (m *manager) viewerWatcher() {
-	ticker := time.NewTicker(time.Minute / 3)
+	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
 		m.CleanupStreams()

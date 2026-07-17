@@ -150,11 +150,14 @@ func TestServeTorrentRangeReportsBodyProgress(t *testing.T) {
 	src := rangeSource{
 		file:      fakeRangeFile{data: []byte("0123456789")},
 		readahead: 128,
-		onRead: func(n int64) {
+		onRead: func(jobID string, n int64) {
+			if jobID != "job-7" {
+				t.Fatalf("job id = %q", jobID)
+			}
 			read += n
 		},
 	}
-	req := httptest.NewRequest(http.MethodGet, "/source/token/file.mkv", nil)
+	req := httptest.NewRequest(http.MethodGet, "/source/token/file.mkv?job=job-7", nil)
 	req.Header.Set("Range", "bytes=2-5")
 	rec := httptest.NewRecorder()
 
@@ -182,10 +185,31 @@ func TestServeTorrentRangeRetriesAfterEvictedPieceRead(t *testing.T) {
 	if file.readers != 2 {
 		t.Fatalf("readers = %d, want one retry", file.readers)
 	}
+	if file.closes != 2 {
+		t.Fatalf("closed readers = %d, want 2", file.closes)
+	}
 }
 
 func TestServeTorrentRangeRetriesAfterReaderPanic(t *testing.T) {
 	file := &flakyRangeFile{data: []byte("0123456789"), panicFirstRead: true}
+	src := rangeSource{file: file, readahead: 128}
+	req := httptest.NewRequest(http.MethodGet, "/source/token/file.mkv", nil)
+	req.Header.Set("Range", "bytes=2-5")
+	rec := httptest.NewRecorder()
+
+	if err := serveTorrentRange(rec, req, src); err != nil {
+		t.Fatalf("serveTorrentRange() error = %v", err)
+	}
+	if body := rec.Body.String(); body != "2345" {
+		t.Fatalf("body = %q, want %q", body, "2345")
+	}
+	if file.readers != 2 {
+		t.Fatalf("readers = %d, want one retry", file.readers)
+	}
+}
+
+func TestServeTorrentRangeResumesAfterPartialReaderPanic(t *testing.T) {
+	file := &flakyRangeFile{data: []byte("0123456789"), panicAfterPartial: true}
 	src := rangeSource{file: file, readahead: 128}
 	req := httptest.NewRequest(http.MethodGet, "/source/token/file.mkv", nil)
 	req.Header.Set("Range", "bytes=2-5")
@@ -240,9 +264,11 @@ func (f fakeRangeFile) NewReader() torrent.Reader {
 }
 
 type flakyRangeFile struct {
-	data           []byte
-	readers        int
-	panicFirstRead bool
+	data              []byte
+	readers           int
+	closes            int
+	panicFirstRead    bool
+	panicAfterPartial bool
 }
 
 type panicRangeFile struct {
@@ -263,10 +289,13 @@ func (f *flakyRangeFile) Length() int64 {
 
 func (f *flakyRangeFile) NewReader() torrent.Reader {
 	f.readers++
-	reader := &fakeTorrentReader{Reader: bytes.NewReader(f.data)}
+	reader := &fakeTorrentReader{Reader: bytes.NewReader(f.data), onClose: func() { f.closes++ }}
 	if f.readers == 1 {
 		if f.panicFirstRead {
 			reader.panicOnRead = true
+		} else if f.panicAfterPartial {
+			reader.maxRead = 2
+			reader.panicAfterReads = 1
 		} else {
 			reader.fail = io.ErrUnexpectedEOF
 		}
@@ -276,20 +305,31 @@ func (f *flakyRangeFile) NewReader() torrent.Reader {
 
 type fakeTorrentReader struct {
 	*bytes.Reader
-	ctx          context.Context
-	fail         error
-	panicOnClose bool
-	panicOnRead  bool
+	ctx             context.Context
+	fail            error
+	panicOnClose    bool
+	panicOnRead     bool
+	onClose         func()
+	maxRead         int
+	panicAfterReads int
+	reads           int
 }
 
 func (r *fakeTorrentReader) Read(b []byte) (int, error) {
 	if r.panicOnRead {
 		panic("reader read failed")
 	}
+	if r.panicAfterReads > 0 && r.reads >= r.panicAfterReads {
+		panic("reader read failed after partial response")
+	}
+	r.reads++
 	if r.fail != nil {
 		err := r.fail
 		r.fail = nil
 		return 0, err
+	}
+	if r.maxRead > 0 && len(b) > r.maxRead {
+		b = b[:r.maxRead]
 	}
 	return r.Reader.Read(b)
 }
@@ -308,6 +348,9 @@ func (r *fakeTorrentReader) ReadContext(ctx context.Context, b []byte) (int, err
 }
 
 func (r *fakeTorrentReader) Close() error {
+	if r.onClose != nil {
+		r.onClose()
+	}
 	if r.panicOnClose {
 		panic("reader close failed")
 	}

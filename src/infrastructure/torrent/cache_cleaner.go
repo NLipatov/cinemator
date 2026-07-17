@@ -17,6 +17,8 @@ type hlsCacheItem struct {
 	last time.Time
 }
 
+const hlsAssetGracePeriod = 10 * time.Second
+
 func (m *manager) enforceCacheLimit() {
 	limit := m.settings.MaxCacheBytes()
 	if limit <= 0 {
@@ -29,12 +31,12 @@ func (m *manager) enforceCacheLimit() {
 	}
 }
 
-func (m *manager) reserveHlsGeneration(segments int) (func(), error) {
+func (m *manager) reserveHlsGeneration(duration time.Duration, bitrate int64) (func(), error) {
 	limit := m.settings.MaxCacheBytes()
 	if limit <= 0 {
 		return func() {}, nil
 	}
-	required := estimatedHlsWindowBytes(segments, m.settings.HlsSegmentDuration())
+	required := estimatedHlsWindowBytes(duration, bitrate)
 	if required > limit {
 		return nil, fmt.Errorf("HLS window requires about %d bytes but the cache limit is %d", required, limit)
 	}
@@ -64,12 +66,13 @@ func (m *manager) reserveHlsGeneration(segments int) (func(), error) {
 	}, nil
 }
 
-func estimatedHlsWindowBytes(segments int, segmentDuration time.Duration) int64 {
+func estimatedHlsWindowBytes(duration time.Duration, bitrate int64) int64 {
 	const maxMuxedBitsPerSecond = int64(5_500_000)
-	if segments <= 0 || segmentDuration <= 0 {
+	if duration <= 0 {
 		return 0
 	}
-	base := maxMuxedBitsPerSecond * int64(segments) * int64(segmentDuration) / int64(8*time.Second)
+	bitrate = max(bitrate, maxMuxedBitsPerSecond)
+	base := bitrate / 8 * int64(duration/time.Second)
 	return base + base/4
 }
 
@@ -101,6 +104,12 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 			if isHlsGenerationTemporary(rel) || !isGeneratedHlsAsset(filepath.Base(path)) {
 				return nil
 			}
+			// Ensure/open happens in separate steps. Keep newly generated or just
+			// requested assets long enough for the HTTP handler to open them; an
+			// already-open file remains safe if it is evicted later on Unix hosts.
+			if time.Since(info.ModTime()) < hlsAssetGracePeriod {
+				return nil
+			}
 		}
 		candidates = append(candidates, hlsCacheItem{path: path, size: size, last: info.ModTime()})
 		return nil
@@ -112,6 +121,8 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].last.Before(candidates[j].last)
 	})
+	var removedFiles int
+	var removedBytes int64
 	for _, item := range candidates {
 		if total <= target {
 			break
@@ -121,7 +132,11 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 			continue
 		}
 		total -= item.size
-		log.Printf("enforceCacheLimit: removed %s (freed %d bytes)", item.path, item.size)
+		removedFiles++
+		removedBytes += item.size
+	}
+	if removedFiles > 0 {
+		log.Printf("enforceCacheLimit: removed %d files (freed %d bytes)", removedFiles, removedBytes)
 	}
 
 	entries, _ := os.ReadDir(root)
@@ -138,7 +153,7 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 
 func isHlsGenerationTemporary(rel string) bool {
 	parts := strings.Split(filepath.ToSlash(rel), "/")
-	return len(parts) > 1 && strings.HasPrefix(parts[1], ".generating-")
+	return len(parts) > 1 && (strings.HasPrefix(parts[1], ".generating-") || strings.HasPrefix(parts[1], ".remuxing-"))
 }
 
 func (m *manager) hlsCacheProtection() (active, pinned map[string]struct{}) {

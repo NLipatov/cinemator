@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"net/url"
 	"time"
 
 	"cinemator/domain"
@@ -26,15 +28,15 @@ type torrentSource struct {
 	token     string
 	url       string
 	readahead int64
-	onRead    func(int64)
+	onRead    func(string, int64)
 }
 
 type filePieceWindow struct {
 	index int
-	state torrent.FilePieceState
+	state torrent.PieceState
 }
 
-func newTorrentSource(file *torrent.File, registry *rangeServer, readaheadLimit int64, onRead func(int64), onError func(error)) (*torrentSource, error) {
+func newTorrentSource(file *torrent.File, registry *rangeServer, readaheadLimit int64, onRead func(string, int64), onError func(error)) (*torrentSource, error) {
 	readahead := targetReadaheadBytes(file, readaheadLimit)
 	token, sourceURL, err := registry.register(file, readahead, onRead, onError)
 	if err != nil {
@@ -52,6 +54,13 @@ func newTorrentSource(file *torrent.File, registry *rangeServer, readaheadLimit 
 
 func (s *torrentSource) URL() string {
 	return s.url
+}
+
+func (s *torrentSource) URLForJob(jobID string) string {
+	if jobID == "" {
+		return s.url
+	}
+	return s.url + "?job=" + url.QueryEscape(jobID)
 }
 
 func (s *torrentSource) Close() {
@@ -76,15 +85,20 @@ func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err e
 	}
 
 	reader := s.file.NewReader()
-	reader.SetContext(ctx)
-	reader.SetReadahead(min(int64(maxProbeBytes), s.readahead))
-	sampleInfo, sampleErr := (ffmpeg.SampleAnalyzer{}).Analyze(ctx, sourceProgressReader{Reader: reader, onRead: s.onRead})
-	if closeErr := closeTorrentReader(reader); closeErr != nil {
-		log.Printf("torrent probe recovered reader close failure: %v", closeErr)
-	}
-	if sampleErr == nil && sampleInfo.Duration > 0 {
-		return sampleInfo, nil
-	}
+	sampleInfo, sampleErr := func() (domain.MediaInfo, error) {
+		defer func() {
+			if closeErr := closeTorrentReader(reader); closeErr != nil {
+				log.Printf("torrent probe recovered reader close failure: %v", closeErr)
+			}
+		}()
+		reader.SetContext(ctx)
+		reader.SetReadahead(min(int64(maxProbeBytes), s.readahead))
+		return (ffmpeg.SampleAnalyzer{}).Analyze(ctx, sourceProgressReader{Reader: reader, onRead: func(n int64) {
+			if s.onRead != nil {
+				s.onRead("", n)
+			}
+		}})
+	}()
 	if ctx.Err() != nil {
 		return domain.MediaInfo{}, ctx.Err()
 	}
@@ -93,20 +107,42 @@ func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err e
 	if tailOffset := s.file.Length() - tailBytes; tailOffset > 0 {
 		s.PrefetchRange(tailOffset, tailBytes)
 	}
+	if sampleErr == nil && sampleInfo.Duration > 0 {
+		return s.refineDurationFromTail(ctx, sampleInfo), nil
+	}
 	probeCtx, cancel := context.WithTimeout(ctx, urlProbeTimeout)
 	defer cancel()
 	info, urlErr := (ffmpeg.SampleAnalyzer{}).AnalyzeURL(probeCtx, s.url)
 	if urlErr == nil {
-		return info, nil
+		return s.refineDurationFromTail(ctx, info), nil
 	}
 	// A valid head sample is enough for progressive HLS even when the container
 	// cannot expose a duration without an expensive scan to EOF.
 	if sampleErr == nil && sampleInfo.VideoCodec != "" {
+		tailCtx, cancelTail := context.WithTimeout(ctx, urlProbeTimeout)
+		tailDuration, tailErr := (ffmpeg.SampleAnalyzer{}).AnalyzeTailDurationURL(tailCtx, s.url, sampleInfo.VideoTrackIndex)
+		cancelTail()
+		if tailErr == nil {
+			sampleInfo.Duration = tailDuration
+			sampleInfo.Seekable = true
+			return sampleInfo, nil
+		}
 		sampleInfo.Duration = 0
 		sampleInfo.Seekable = false
 		return sampleInfo, nil
 	}
 	return domain.MediaInfo{}, urlErr
+}
+
+func (s *torrentSource) refineDurationFromTail(ctx context.Context, info domain.MediaInfo) domain.MediaInfo {
+	tailCtx, cancel := context.WithTimeout(ctx, urlProbeTimeout)
+	defer cancel()
+	tailDuration, err := (ffmpeg.SampleAnalyzer{}).AnalyzeTailDurationURL(tailCtx, s.url, info.VideoTrackIndex)
+	if err == nil && math.Abs(tailDuration-info.Duration) > 0.25 {
+		info.Duration = tailDuration
+		info.Seekable = true
+	}
+	return info
 }
 
 type sourceProgressReader struct {
@@ -207,24 +243,17 @@ func (s *torrentSource) rangeWindows(offset, length int64) []filePieceWindow {
 		return nil
 	}
 
-	rangeStart := offset
-	rangeEnd := offset + length
-	pieceIndex := s.file.BeginPieceIndex()
-	pieceStart := int64(0)
-	var windows []filePieceWindow
-	for _, state := range s.file.State() {
-		pieceEnd := pieceStart + state.Bytes
-		if pieceEnd > rangeStart && pieceStart < rangeEnd {
-			windows = append(windows, filePieceWindow{
-				index: pieceIndex,
-				state: state,
-			})
-		}
-		pieceStart = pieceEnd
-		pieceIndex++
-		if pieceStart >= rangeEnd {
-			break
-		}
+	pieceLength := s.file.Torrent().Info().PieceLength
+	absoluteStart := s.file.Offset() + offset
+	absoluteEnd := absoluteStart + length
+	begin := int(absoluteStart / pieceLength)
+	end := int((absoluteEnd-1)/pieceLength) + 1
+	windows := make([]filePieceWindow, 0, end-begin)
+	for index := begin; index < end; index++ {
+		windows = append(windows, filePieceWindow{
+			index: index,
+			state: s.file.Torrent().Piece(index).State(),
+		})
 	}
 	return windows
 }

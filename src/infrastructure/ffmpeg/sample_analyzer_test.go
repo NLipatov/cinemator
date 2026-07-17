@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -45,8 +46,8 @@ func TestSampleAnalyzerReturnsCanceledContextBeforeReading(t *testing.T) {
 func TestParseProbeOutputIncludesDurationAndBitrate(t *testing.T) {
 	out := []byte(`{
 		"streams":[
-				{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":3840,"height":2160,"duration":"119.5"},
-			{"codec_type":"audio","codec_name":"aac","duration":"119.5"}
+			{"codec_type":"video","codec_name":"h264","profile":"High","level":40,"pix_fmt":"yuv420p","width":3840,"height":2160,"duration":"119.5"},
+			{"codec_type":"audio","codec_name":"aac","profile":"LC","channels":2,"sample_rate":"48000","duration":"119.5"}
 		],
 		"format":{"duration":"120.25","bit_rate":"8000000"}
 	}`)
@@ -63,6 +64,10 @@ func TestParseProbeOutputIncludesDurationAndBitrate(t *testing.T) {
 	}
 	if info.Width != 3840 || info.Height != 2160 {
 		t.Fatalf("dimensions = %dx%d", info.Width, info.Height)
+	}
+	if info.VideoProfile != "High" || info.VideoLevel != 40 ||
+		info.AudioTracks[0].Profile != "LC" || info.AudioTracks[0].Channels != 2 || info.AudioTracks[0].SampleRate != 48000 {
+		t.Fatalf("codec compatibility metadata = %+v", info)
 	}
 	if !info.Seekable {
 		t.Fatal("Seekable = false for media with a known duration")
@@ -115,5 +120,60 @@ func TestParseProbeOutputDetectsHDRTransfer(t *testing.T) {
 	}
 	if !info.HDR {
 		t.Fatalf("HDR = false for PQ transfer: %+v", info)
+	}
+}
+
+func TestParseTailDurationUsesLastPacketAndFormatStart(t *testing.T) {
+	out := []byte(`#format: frame checksums
+#tb 0: 1/1000
+#stream#, dts, pts, duration, size, hash
+0, 108000, 108000, 1000, 42, abc
+0, 111500, 109500, 500, 42, def
+0, 109000, 110000, 500, 42, ghi
+`)
+	duration, err := parseTailDuration(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duration != 110.5 {
+		t.Fatalf("tail duration = %v, want 110.5", duration)
+	}
+}
+
+func TestParseProbeOutputSkipsAttachedCoverArt(t *testing.T) {
+	out := []byte(`{
+		"streams":[
+			{"codec_type":"video","codec_name":"mjpeg","width":1200,"height":1200,"disposition":{"attached_pic":1}},
+			{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":1920,"height":1080,"duration":"90"}
+		],
+		"format":{}
+	}`)
+	info, err := parseProbeOutput(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.VideoCodec != "h264" || info.VideoTrackIndex != 1 || info.Width != 1920 || info.Height != 1080 || info.Duration != 90 {
+		t.Fatalf("media info = %+v", info)
+	}
+}
+
+func TestParseProbeOutputHandlesRotationInterlaceAndStyledSubtitleWarning(t *testing.T) {
+	out := []byte(`{
+		"streams":[
+			{"codec_type":"video","codec_name":"h264","pix_fmt":"yuv420p","width":1080,"height":1920,"field_order":"tt","side_data_list":[{"side_data_type":"Display Matrix","rotation":-90}]},
+			{"codec_type":"subtitle","codec_name":"ass"},
+			{"codec_type":"subtitle","codec_name":"ass"}
+		],
+		"format":{"duration":"30"}
+	}`)
+	info, err := parseProbeOutput(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Width != 1920 || info.Height != 1080 || !info.Deinterlace || !info.Rotated {
+		t.Fatalf("media info = %+v", info)
+	}
+	if len(info.Warnings) != 1 || !strings.Contains(info.Warnings[0], "ASS/SSA") {
+		t.Fatalf("warnings = %v", info.Warnings)
 	}
 }

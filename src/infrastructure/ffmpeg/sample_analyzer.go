@@ -6,7 +6,9 @@ import (
 	"cinemator/infrastructure/cli"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -21,7 +23,7 @@ const (
 type SampleAnalyzer struct{}
 
 func (SampleAnalyzer) Analyze(ctx context.Context, r io.Reader) (domain.MediaInfo, error) {
-	data := make([]byte, 0, maxProbeBytes)
+	data := make([]byte, 0, initialProbeBytes)
 	target := initialProbeBytes
 	var lastErr error
 
@@ -35,9 +37,10 @@ func (SampleAnalyzer) Analyze(ctx context.Context, r io.Reader) (domain.MediaInf
 			if need > maxProbeBytes-len(data) {
 				need = maxProbeBytes - len(data)
 			}
-			tmp := make([]byte, need)
-			n, readErr := io.ReadFull(cappedReader{reader: r, max: probeReadBytes}, tmp)
-			data = append(data, tmp[:n]...)
+			start := len(data)
+			data = append(data, make([]byte, need)...)
+			n, readErr := io.ReadFull(cappedReader{reader: r, max: probeReadBytes}, data[start:])
+			data = data[:start+n]
 			if readErr != nil {
 				if readErr != io.ErrUnexpectedEOF && readErr != io.EOF {
 					return domain.MediaInfo{}, readErr
@@ -96,6 +99,55 @@ func (SampleAnalyzer) AnalyzeURL(ctx context.Context, sourceURL string) (domain.
 	return parseProbeOutput(out)
 }
 
+// AnalyzeTailDurationURL seeks from EOF and derives duration from actual video
+// packet timestamps. Container headers occasionally misreport duration,
+// which would otherwise truncate the tail or advertise positions past EOF.
+// Framehash gives us packet timestamps on stdout without decoding the video.
+func (SampleAnalyzer) AnalyzeTailDurationURL(ctx context.Context, sourceURL string, videoTrackIndex int) (float64, error) {
+	out, err := cli.RunWithStdin(ctx, nil,
+		"ffmpeg", "-v", "error",
+		"-sseof", "-30",
+		"-copyts", "-start_at_zero",
+		"-i", sourceURL,
+		"-map", fmt.Sprintf("0:v:%d", max(0, videoTrackIndex)), "-an", "-sn", "-dn",
+		"-c:v", "copy", "-hash", "md5", "-f", "framehash", "-",
+	)
+	if err != nil {
+		return 0, err
+	}
+	return parseTailDuration(out)
+}
+
+func parseTailDuration(out []byte) (float64, error) {
+	timeBase := 0.0
+	lastEnd := int64(0)
+	for line := range strings.SplitSeq(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#tb 0:") {
+			timeBase = parseTimeBase(strings.TrimSpace(strings.TrimPrefix(line, "#tb 0:")))
+			continue
+		}
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, ",")
+		if len(fields) < 4 {
+			continue
+		}
+		pts, ptsErr := strconv.ParseInt(strings.TrimSpace(fields[2]), 10, 64)
+		packetDuration, durationErr := strconv.ParseInt(strings.TrimSpace(fields[3]), 10, 64)
+		if ptsErr != nil || durationErr != nil {
+			continue
+		}
+		lastEnd = max(lastEnd, pts+max(0, packetDuration))
+	}
+	duration := float64(lastEnd) * timeBase
+	if duration <= 0 {
+		return 0, fmt.Errorf("ffmpeg returned no usable tail timestamps")
+	}
+	return duration, nil
+}
+
 func probeSample(ctx context.Context, sample []byte) (domain.MediaInfo, error) {
 	out, err := cli.RunWithStdin(ctx, bytes.NewReader(sample),
 		"ffprobe", "-v", "error",
@@ -113,8 +165,13 @@ func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 			Index         int    `json:"index"`
 			CodecType     string `json:"codec_type"`
 			CodecName     string `json:"codec_name"`
+			Profile       string `json:"profile"`
+			Level         int    `json:"level"`
+			Channels      int    `json:"channels"`
+			SampleRate    string `json:"sample_rate"`
 			PixFmt        string `json:"pix_fmt"`
 			ColorTransfer string `json:"color_transfer"`
+			FieldOrder    string `json:"field_order"`
 			Width         int    `json:"width"`
 			Height        int    `json:"height"`
 			Duration      string `json:"duration"`
@@ -123,7 +180,15 @@ func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 			Tags          struct {
 				Language string `json:"language"`
 				Title    string `json:"title"`
+				Rotate   string `json:"rotate"`
 			} `json:"tags"`
+			Disposition struct {
+				AttachedPic int `json:"attached_pic"`
+			} `json:"disposition"`
+			SideData []struct {
+				Type     string `json:"side_data_type"`
+				Rotation int    `json:"rotation"`
+			} `json:"side_data_list"`
 		} `json:"streams"`
 		Format struct {
 			Duration string `json:"duration"`
@@ -136,18 +201,33 @@ func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 
 	var info domain.MediaInfo
 	info.Duration, _ = strconv.ParseFloat(meta.Format.Duration, 64)
+	if info.Duration <= 0 || math.IsNaN(info.Duration) || math.IsInf(info.Duration, 0) {
+		info.Duration = 0
+	}
 	info.Bitrate, _ = strconv.ParseInt(meta.Format.Bitrate, 10, 64)
 	audioIdx := 0
 	subIdx := 0
+	videoIdx := 0
+	warnedStyledSubtitles := false
 	for _, s := range meta.Streams {
 		switch s.CodecType {
 		case "video":
-			if info.VideoCodec == "" {
-				info.VideoCodec = s.CodecName
-				info.Width = s.Width
-				info.Height = s.Height
-				info.HDR = s.ColorTransfer == "smpte2084" || s.ColorTransfer == "arib-std-b67"
+			if s.Disposition.AttachedPic != 0 || info.VideoCodec != "" {
+				videoIdx++
+				continue
 			}
+			info.VideoCodec = s.CodecName
+			info.VideoProfile = s.Profile
+			info.VideoLevel = s.Level
+			info.VideoTrackIndex = videoIdx
+			info.Width = s.Width
+			info.Height = s.Height
+			info.Rotated = displayRotation(s.Tags.Rotate, s.SideData)
+			if info.Rotated {
+				info.Width, info.Height = info.Height, info.Width
+			}
+			info.HDR = s.ColorTransfer == "smpte2084" || s.ColorTransfer == "arib-std-b67"
+			info.Deinterlace = s.FieldOrder != "" && s.FieldOrder != "unknown" && s.FieldOrder != "progressive"
 			streamDuration, _ := strconv.ParseFloat(s.Duration, 64)
 			if streamDuration <= 0 && s.DurationTS > 0 {
 				streamDuration = float64(s.DurationTS) * parseTimeBase(s.TimeBase)
@@ -158,12 +238,23 @@ func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 			if s.PixFmt != "yuv420p" && s.PixFmt != "" {
 				info.NeedFilter = true
 			}
+			for _, sideData := range s.SideData {
+				if strings.Contains(strings.ToLower(sideData.Type), "dovi") {
+					info.Warnings = append(info.Warnings, "Dolby Vision enhancement metadata is not preserved; playback uses the decodable base video layer.")
+					break
+				}
+			}
+			videoIdx++
 		case "audio":
+			sampleRate, _ := strconv.Atoi(s.SampleRate)
 			info.AudioTracks = append(info.AudioTracks, domain.AudioTrack{
-				Index:    audioIdx,
-				Codec:    s.CodecName,
-				Language: s.Tags.Language,
-				Title:    s.Tags.Title,
+				Index:      audioIdx,
+				Codec:      s.CodecName,
+				Profile:    s.Profile,
+				Channels:   s.Channels,
+				SampleRate: sampleRate,
+				Language:   s.Tags.Language,
+				Title:      s.Tags.Title,
 			})
 			audioIdx++
 		case "subtitle":
@@ -174,10 +265,29 @@ func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 				Title:    s.Tags.Title,
 			})
 			subIdx++
+			if !warnedStyledSubtitles && (s.CodecName == "ass" || s.CodecName == "ssa") {
+				info.Warnings = append(info.Warnings, "Styled ASS/SSA subtitles are converted to plain WebVTT, so advanced positioning and effects may be simplified.")
+				warnedStyledSubtitles = true
+			}
 		}
 	}
 	info.Seekable = info.Duration > 0
 	return info, nil
+}
+
+func displayRotation(tag string, sideData []struct {
+	Type     string `json:"side_data_type"`
+	Rotation int    `json:"rotation"`
+}) bool {
+	rotation, _ := strconv.Atoi(tag)
+	for _, data := range sideData {
+		if data.Rotation != 0 {
+			rotation = data.Rotation
+			break
+		}
+	}
+	normalized := ((rotation % 360) + 360) % 360
+	return normalized == 90 || normalized == 270
 }
 
 func parseTimeBase(value string) float64 {

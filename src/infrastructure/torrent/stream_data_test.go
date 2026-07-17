@@ -9,7 +9,7 @@ import (
 
 func TestStreamKeyDirNameAndParse(t *testing.T) {
 	key := streamKey{InfoHash: "abc123", Index: 7, Audio: 1, Subtitle: -1}
-	if got := key.dirName(); got != "abc123_7_a1_s-1" {
+	if got := key.dirName(); got != "abc123_7_a1_s-1_t0" {
 		t.Fatalf("dirName() = %q", got)
 	}
 	parsed, err := parseStreamDir(key.dirName())
@@ -21,7 +21,7 @@ func TestStreamKeyDirNameAndParse(t *testing.T) {
 func TestStreamKeyPaths(t *testing.T) {
 	root := t.TempDir()
 	paths := (streamKey{InfoHash: "hash", Index: 2, Audio: 0, Subtitle: 3}).paths(root)
-	wantDir := filepath.Join(root, "hash_2_a0_s3")
+	wantDir := filepath.Join(root, "hash_2_a0_s3_t0")
 	if paths.outDir != wantDir ||
 		paths.videoPlaylist != filepath.Join(wantDir, "index.m3u8") ||
 		paths.subtitlePlaylist != filepath.Join(wantDir, "subs.m3u8") ||
@@ -31,7 +31,7 @@ func TestStreamKeyPaths(t *testing.T) {
 }
 
 func TestParseStreamDirRejectsMalformedNames(t *testing.T) {
-	for _, name := range []string{"", "hash_1_a0", "hash_x_a0_s0", "hash_1_x0_s0", "hash_1_a0_x0", "hash_1_a0_sx"} {
+	for _, name := range []string{"", "hash_1_a0", "hash_x_a0_s0_t0", "hash_1_x0_s0_t0", "hash_1_a0_x0_t0", "hash_1_a0_sx_t0", "hash_1_a0_s0_tx"} {
 		if _, err := parseStreamDir(name); err == nil {
 			t.Fatalf("parseStreamDir(%q) succeeded", name)
 		}
