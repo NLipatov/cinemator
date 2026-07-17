@@ -3,15 +3,7 @@ package ffmpeg
 import (
 	"cinemator/domain"
 	"fmt"
-	"math"
 	"strings"
-)
-
-const (
-	maxVideoWidth   = 1920
-	maxVideoHeight  = 1080
-	videoBitrate    = "4000k"
-	videoMaxBitrate = "5000k"
 )
 
 // StreamSelection specifies which audio/subtitle tracks to include.
@@ -27,9 +19,6 @@ type StreamSelection struct {
 func CanRemuxHLS(info domain.MediaInfo, sel StreamSelection) bool {
 	if sel.ForceTranscode || info.Duration <= 0 || info.VideoCodec != "h264" || !copyableH264Profile(info.VideoProfile, info.VideoLevel) || info.NeedFilter ||
 		info.HDR || info.Deinterlace || info.Rotated {
-		return false
-	}
-	if _, _, resize := boundedVideoSize(info.Width, info.Height); resize {
 		return false
 	}
 	return sel.SubtitleTrackIndex < 0 ||
@@ -52,7 +41,7 @@ func CopiesAudio(info domain.MediaInfo, sel StreamSelection) bool {
 func copyableH264Profile(profile string, level int) bool {
 	switch strings.ToLower(profile) {
 	case "", "baseline", "constrained baseline", "main", "high":
-		return level <= 51
+		return level <= 62
 	default:
 		return false
 	}
@@ -85,9 +74,6 @@ func buildStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 	var videoFilters []string
 	if info.Deinterlace {
 		videoFilters = append(videoFilters, "bwdif=mode=send_frame:parity=auto:deint=interlaced")
-	}
-	if width, height, resize := boundedVideoSize(info.Width, info.Height); resize {
-		videoFilters = append(videoFilters, fmt.Sprintf("scale=%d:%d", width, height))
 	}
 	if info.HDR {
 		videoFilters = append(videoFilters,
@@ -134,9 +120,7 @@ func buildStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
-		"-b:v", videoBitrate,
-		"-maxrate", videoMaxBitrate,
-		"-bufsize", "10000k",
+		"-crf", "18",
 	)
 	if !bitmapSubtitle && len(videoFilters) > 0 {
 		args = append(args, "-vf", strings.Join(videoFilters, ","))
@@ -171,14 +155,4 @@ func selectedAudioIndex(info domain.MediaInfo, sel StreamSelection) int {
 		return 0
 	}
 	return sel.AudioTrackIndex
-}
-
-func boundedVideoSize(width, height int) (int, int, bool) {
-	if width <= 0 || height <= 0 || width <= maxVideoWidth && height <= maxVideoHeight {
-		return width, height, false
-	}
-	scale := math.Min(float64(maxVideoWidth)/float64(width), float64(maxVideoHeight)/float64(height))
-	targetWidth := max(2, int(float64(width)*scale)/2*2)
-	targetHeight := max(2, int(float64(height)*scale)/2*2)
-	return targetWidth, targetHeight, true
 }

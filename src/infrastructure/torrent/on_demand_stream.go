@@ -380,13 +380,12 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 	log.Printf("Generating HLS video window: dir=%s, segments=[%d,%d) mode=%s", filepath.Base(s.paths.outDir), job.begin, job.end, ffmpeg.HLSMode(info, selection))
 	segmentCount := job.end - job.begin
 	generationDuration := time.Duration(segmentCount) * m.settings.HlsSegmentDuration()
-	bitrate := int64(0)
+	bitrate := info.Bitrate
+	if bitrate <= 0 && info.Duration > 0 {
+		bitrate = int64(float64(s.file.Length()*8) / info.Duration)
+	}
 	if directPlay {
 		generationDuration = ffmpeg.DirectWindowGenerationDuration(segmentCount, m.settings.HlsSegmentDuration())
-		bitrate = info.Bitrate
-		if bitrate <= 0 && info.Duration > 0 {
-			bitrate = int64(float64(s.file.Length()*8) / info.Duration)
-		}
 	}
 	release, err := m.reserveHlsGeneration(generationDuration, bitrate)
 	if err != nil {

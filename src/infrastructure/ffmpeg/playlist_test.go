@@ -3,7 +3,7 @@ package ffmpeg
 import "testing"
 
 func TestBuildMasterPlaylistWithoutSubtitles(t *testing.T) {
-	got := buildMasterPlaylist("index.m3u8", "subs.m3u8", false, "", "")
+	got := buildMasterPlaylist("index.m3u8", "subs.m3u8", false, "", "", 0)
 	want := "#EXTM3U\n" +
 		"#EXT-X-VERSION:3\n" +
 		"#EXT-X-STREAM-INF:BANDWIDTH=5500000\n" +
@@ -15,7 +15,7 @@ func TestBuildMasterPlaylistWithoutSubtitles(t *testing.T) {
 }
 
 func TestBuildMasterPlaylistWithSubtitles(t *testing.T) {
-	got := buildMasterPlaylist("index.m3u8", "subs.m3u8", true, "eng", "")
+	got := buildMasterPlaylist("index.m3u8", "subs.m3u8", true, "eng", "", 0)
 	want := "#EXTM3U\n" +
 		"#EXT-X-VERSION:3\n" +
 		"#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"Subtitles\",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,URI=\"subs.m3u8\",LANGUAGE=\"eng\"\n" +

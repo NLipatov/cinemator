@@ -97,7 +97,7 @@ func PrepareOnDemandHLS(
 	if withSubtitles {
 		language = info.Subtitles[selection.SubtitleTrackIndex].Language
 	}
-	master := buildMasterPlaylist(filepath.Base(videoPlaylist), filepath.Base(subtitlePlaylist), withSubtitles, language, assetVersion)
+	master := buildMasterPlaylist(filepath.Base(videoPlaylist), filepath.Base(subtitlePlaylist), withSubtitles, language, assetVersion, info.Bitrate)
 	return writeFileAtomic(masterPlaylist, []byte(master), 0644)
 }
 
@@ -782,7 +782,8 @@ func formatSeconds(value float64) string {
 	return strconv.FormatFloat(value, 'f', 3, 64)
 }
 
-func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVersion string) string {
+func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVersion string, bandwidth int64) string {
+	bandwidth = max(bandwidth, int64(5_500_000))
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:3\n")
@@ -800,9 +801,9 @@ func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVe
 			attributes = append(attributes, fmt.Sprintf("LANGUAGE=\"%s\"", lang))
 		}
 		b.WriteString("#EXT-X-MEDIA:" + strings.Join(attributes, ",") + "\n")
-		b.WriteString("#EXT-X-STREAM-INF:BANDWIDTH=5500000,SUBTITLES=\"subs\"\n")
+		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d,SUBTITLES=\"subs\"\n", bandwidth)
 	} else {
-		b.WriteString("#EXT-X-STREAM-INF:BANDWIDTH=5500000\n")
+		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d\n", bandwidth)
 	}
 	b.WriteString(versionedAsset(videoList, assetVersion) + "\n")
 	return b.String()

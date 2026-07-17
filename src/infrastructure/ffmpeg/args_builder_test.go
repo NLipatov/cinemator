@@ -83,22 +83,30 @@ func TestBuildStreamArgsToneMapsHDRBeforeBitmapSubtitles(t *testing.T) {
 	}
 }
 
-func TestBuildStreamArgsBoundsResolutionAndBitrate(t *testing.T) {
+func TestBuildStreamArgsPreservesResolutionAndUsesQualityMode(t *testing.T) {
 	args := buildStreamArgs(domain.MediaInfo{VideoCodec: "hevc", Width: 3840, Height: 2160}, StreamSelection{})
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"scale=1920:1080", "-b:v 4000k", "-maxrate 5000k", "format=yuv420p"} {
+	for _, want := range []string{"-crf 18", "format=yuv420p"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("buildStreamArgs() missing %q: %v", want, args)
 		}
 	}
+	for _, unwanted := range []string{"scale=", "-b:v", "-maxrate", "-bufsize"} {
+		if strings.Contains(joined, unwanted) {
+			t.Fatalf("buildStreamArgs() contains %q: %v", unwanted, args)
+		}
+	}
 }
 
-func TestBuildStreamArgsDeinterlacesBeforeScaling(t *testing.T) {
+func TestBuildStreamArgsDeinterlacesWithoutScaling(t *testing.T) {
 	args := buildStreamArgs(domain.MediaInfo{VideoCodec: "h264", Width: 3840, Height: 2160, Deinterlace: true}, StreamSelection{})
 	joined := strings.Join(args, " ")
-	want := "bwdif=mode=send_frame:parity=auto:deint=interlaced,scale=1920:1080,format=yuv420p"
+	want := "bwdif=mode=send_frame:parity=auto:deint=interlaced,format=yuv420p"
 	if !strings.Contains(joined, want) {
 		t.Fatalf("buildStreamArgs() missing ordered filters %q: %v", want, args)
+	}
+	if strings.Contains(joined, "scale=") {
+		t.Fatalf("buildStreamArgs() scales the source: %v", args)
 	}
 }
 
@@ -137,12 +145,11 @@ func TestCanRemuxHLSRejectsVideoTransformations(t *testing.T) {
 		{name: "unknown duration", info: domain.MediaInfo{VideoCodec: "h264"}},
 		{name: "codec", info: domain.MediaInfo{Duration: 60, VideoCodec: "hevc"}},
 		{name: "profile", info: domain.MediaInfo{Duration: 60, VideoCodec: "h264", VideoProfile: "High 10", Width: 1280, Height: 720}},
-		{name: "level", info: domain.MediaInfo{Duration: 60, VideoCodec: "h264", VideoProfile: "High", VideoLevel: 52, Width: 1280, Height: 720}},
+		{name: "level", info: domain.MediaInfo{Duration: 60, VideoCodec: "h264", VideoProfile: "High", VideoLevel: 63, Width: 1280, Height: 720}},
 		{name: "pixel format", info: func() domain.MediaInfo { v := base; v.NeedFilter = true; return v }()},
 		{name: "HDR", info: func() domain.MediaInfo { v := base; v.HDR = true; return v }()},
 		{name: "interlace", info: func() domain.MediaInfo { v := base; v.Deinterlace = true; return v }()},
 		{name: "rotation", info: func() domain.MediaInfo { v := base; v.Rotated = true; return v }()},
-		{name: "resolution", info: domain.MediaInfo{Duration: 60, VideoCodec: "h264", Width: 3840, Height: 2160}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -164,5 +171,16 @@ func TestCanRemuxHLSRejectsVideoTransformations(t *testing.T) {
 	}
 	if CanRemuxHLS(base, StreamSelection{ForceTranscode: true}) {
 		t.Fatal("CanRemuxHLS() ignored forced native-HLS fallback")
+	}
+}
+
+func TestCanRemuxHLSPreserves4KAnd8KVideo(t *testing.T) {
+	for _, info := range []domain.MediaInfo{
+		{Duration: 60, VideoCodec: "h264", VideoProfile: "High", VideoLevel: 52, Width: 3840, Height: 2160},
+		{Duration: 60, VideoCodec: "h264", VideoProfile: "High", VideoLevel: 62, Width: 7680, Height: 4320},
+	} {
+		if got := HLSMode(info, StreamSelection{}); got != "direct" {
+			t.Errorf("HLSMode(%dx%d, level %d) = %q, want direct", info.Width, info.Height, info.VideoLevel, got)
+		}
 	}
 }
