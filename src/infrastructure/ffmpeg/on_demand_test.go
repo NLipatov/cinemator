@@ -59,7 +59,7 @@ func TestPrepareOnDemandHLSWritesStaticManifests(t *testing.T) {
 }
 
 func TestBuildSparseMediaPlaylistReplacesGapWithGOPs(t *testing.T) {
-	got := buildSparseMediaPlaylist(40, 6, 2, "v1", []HLSFragment{
+	got := buildSparseMediaPlaylist(40, 6, 2, "v1", false, []HLSFragment{
 		{Start: 10, Duration: 10, Name: "direct_000003_0000.ts"},
 		{Start: 20, Duration: 10, Name: "direct_000003_0001.ts"},
 		{Start: 30, Duration: 10, Name: "direct_000003_0002.ts"},
@@ -76,6 +76,23 @@ func TestBuildSparseMediaPlaylistReplacesGapWithGOPs(t *testing.T) {
 	}
 	if strings.Count(got, "direct_000003_0000.ts") != 1 {
 		t.Fatalf("sparse playlist duplicated prepared GOP:\n%s", got)
+	}
+}
+
+func TestBuildSparseFMP4PlaylistMapsInitSegments(t *testing.T) {
+	got := buildSparseMediaPlaylist(24, 6, 2, "v1", true, []HLSFragment{
+		{Start: 0, Duration: 12, Name: "direct_000000_0000.m4s", Init: "init_000000.mp4"},
+	})
+	for _, want := range []string{
+		"#EXT-X-VERSION:7\n",
+		"#EXT-X-MAP:URI=\"init_000000.mp4?v=v1\"\n",
+		"direct_000000_0000.m4s?v=v1\n",
+		"#EXT-X-MAP:URI=\"init_seek_000002.mp4?v=v1\"\n",
+		"seek_000002.m4s?v=v1\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fMP4 playlist missing %q:\n%s", want, got)
+		}
 	}
 }
 

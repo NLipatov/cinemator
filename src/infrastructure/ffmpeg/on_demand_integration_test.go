@@ -238,6 +238,79 @@ func TestGenerateDirectWindowCoalescesFrequentKeyframes(t *testing.T) {
 	}
 }
 
+func TestGenerateDirectWindowPreservesFMP4Video(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe is not installed")
+	}
+	encoders := string(runMediaCommand(t, "ffmpeg", "-hide_banner", "-encoders"))
+	tests := []struct {
+		name, encoder, codec, tag, profile string
+		level                              int
+		encoderArgs                        []string
+	}{
+		{"HEVC Main 10", "libx265", "hevc", "hvc1", "Main 10", 30, []string{"-preset", "ultrafast", "-x265-params", "log-level=error:keyint=50:min-keyint=50:scenecut=0:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc"}},
+		{"AV1 Main 10", "libsvtav1", "av1", "av01", "Main", 0, []string{"-preset", "11", "-g", "50", "-svtav1-params", "color-primaries=9:transfer-characteristics=16:matrix-coefficients=9"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !strings.Contains(encoders, tt.encoder) {
+				t.Skip(tt.encoder + " is not installed")
+			}
+			dir := t.TempDir()
+			source := filepath.Join(dir, "source.mkv")
+			args := []string{
+				"-hide_banner", "-loglevel", "error", "-y",
+				"-f", "lavfi", "-i", "testsrc2=size=160x96:rate=25:duration=4",
+				"-c:v", tt.encoder,
+			}
+			args = append(args, tt.encoderArgs...)
+			args = append(args,
+				"-pix_fmt", "yuv420p10le",
+				"-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc",
+				source,
+			)
+			runMediaCommand(t, "ffmpeg", args...)
+
+			result, err := GenerateDirectWindow(
+				context.Background(), source, dir,
+				domain.MediaInfo{
+					Duration:     4,
+					VideoCodec:   tt.codec,
+					VideoProfile: tt.profile,
+					VideoLevel:   tt.level,
+					PixelFormat:  "yuv420p10le",
+					HDR:          true,
+				},
+				StreamSelection{SubtitleTrackIndex: -1},
+				0, 1, 2*time.Second,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Fragments) == 0 || result.Fragments[0].Init == "" || !strings.HasSuffix(result.Fragments[0].Name, ".m4s") {
+				t.Fatalf("direct fMP4 result = %+v", result)
+			}
+			probeURL := "concat:" + filepath.Join(dir, result.Fragments[0].Init) + "|" + filepath.Join(dir, result.Fragments[0].Name)
+			probe := runMediaCommand(t, "ffprobe",
+				"-v", "error", "-select_streams", "v:0",
+				"-show_entries", "stream=codec_name,codec_tag_string,pix_fmt,color_primaries,color_transfer,color_space",
+				"-of", "default=nw=1", probeURL,
+			)
+			for _, want := range []string{
+				"codec_name=" + tt.codec, "codec_tag_string=" + tt.tag, "pix_fmt=yuv420p10le",
+				"color_primaries=bt2020", "color_transfer=smpte2084", "color_space=bt2020nc",
+			} {
+				if !strings.Contains(string(probe), want) {
+					t.Fatalf("fMP4 probe missing %q: %s", want, probe)
+				}
+			}
+		})
+	}
+}
+
 func TestAnalyzeTailDurationBeyondSeekWindow(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg is not installed")

@@ -92,10 +92,35 @@
 
       <div id="player-block" class="player-stage step" style="display:none">
         <video id="video" controls autoplay playsinline></video>
+        <div class="player-toolbar">
+          <button id="mediaInfoBtn" class="media-info-button" type="button" hidden>Media info</button>
+        </div>
         <div class="msg" id="playerMsg"></div>
       </div>
     </section>
   </main>
+  <dialog id="mediaInfoDialog" class="media-info-dialog" aria-labelledby="mediaInfoTitle">
+    <div class="media-info-head">
+      <h2 id="mediaInfoTitle">Media info</h2>
+      <button id="mediaInfoClose" class="media-info-close" type="button" aria-label="Close">×</button>
+    </div>
+    <section class="media-info-section" aria-labelledby="mediaSourceTitle">
+      <h3 id="mediaSourceTitle">Source</h3>
+      <dl>
+        <div id="mediaVideoRow"><dt>Video</dt><dd id="mediaVideo"></dd></div>
+        <div id="mediaColorRow"><dt>Color</dt><dd id="mediaColor"></dd></div>
+        <div id="mediaBitrateRow"><dt>Bitrate</dt><dd id="mediaBitrate"></dd></div>
+        <div id="mediaAudioRow"><dt>Audio</dt><dd id="mediaAudio"></dd></div>
+      </dl>
+    </section>
+    <section class="media-info-section" aria-labelledby="mediaPlaybackTitle">
+      <h3 id="mediaPlaybackTitle">Playback</h3>
+      <dl>
+        <div><dt>Mode</dt><dd id="mediaPlaybackMode">Preparing</dd></div>
+        <div id="mediaDecisionRow"><dt>Decision</dt><dd id="mediaDecision"></dd></div>
+      </dl>
+    </section>
+  </dialog>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.6.13"></script>
   <script src="index.js"></script>
 </body>

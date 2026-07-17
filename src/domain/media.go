@@ -10,9 +10,9 @@ var ErrHlsPlaylistChanged = errors.New("HLS playlist changed")
 type AudioTrack struct {
 	Index      int    `json:"index"`
 	Codec      string `json:"codec"`
-	Profile    string `json:"-"`
-	Channels   int    `json:"-"`
-	SampleRate int    `json:"-"`
+	Profile    string `json:"profile,omitempty"`
+	Channels   int    `json:"channels,omitempty"`
+	SampleRate int    `json:"sampleRate,omitempty"`
 	Language   string `json:"language"`
 	Title      string `json:"title"`
 }
@@ -25,22 +25,31 @@ type SubtitleTrack struct {
 }
 
 type MediaInfo struct {
-	VideoCodec      string          `json:"-"`
-	VideoProfile    string          `json:"-"`
-	VideoLevel      int             `json:"-"`
-	VideoTrackIndex int             `json:"-"`
-	Width           int             `json:"-"`
-	Height          int             `json:"-"`
-	Rotated         bool            `json:"-"`
-	HDR             bool            `json:"-"`
-	NeedFilter      bool            `json:"-"`
-	Deinterlace     bool            `json:"-"`
-	Duration        float64         `json:"duration"`
-	Seekable        bool            `json:"seekable"`
-	Bitrate         int64           `json:"-"`
-	AudioTracks     []AudioTrack    `json:"audioTracks"`
-	Subtitles       []SubtitleTrack `json:"subtitles"`
-	Warnings        []string        `json:"warnings,omitempty"`
+	VideoCodec       string          `json:"videoCodec,omitempty"`
+	VideoCodecString string          `json:"videoCodecString,omitempty"`
+	VideoProfile     string          `json:"videoProfile,omitempty"`
+	VideoLevel       int             `json:"videoLevel,omitempty"`
+	VideoTrackIndex  int             `json:"-"`
+	Width            int             `json:"width,omitempty"`
+	Height           int             `json:"height,omitempty"`
+	FrameRate        float64         `json:"frameRate,omitempty"`
+	PixelFormat      string          `json:"pixelFormat,omitempty"`
+	BitDepth         int             `json:"bitDepth,omitempty"`
+	ColorPrimaries   string          `json:"colorPrimaries,omitempty"`
+	ColorTransfer    string          `json:"colorTransfer,omitempty"`
+	ColorSpace       string          `json:"colorSpace,omitempty"`
+	Rotated          bool            `json:"rotated,omitempty"`
+	HDR              bool            `json:"hdr,omitempty"`
+	HDRFormat        string          `json:"hdrFormat,omitempty"`
+	DolbyVision      bool            `json:"dolbyVision,omitempty"`
+	NeedFilter       bool            `json:"-"`
+	Deinterlace      bool            `json:"interlaced,omitempty"`
+	Duration         float64         `json:"duration"`
+	Seekable         bool            `json:"seekable"`
+	Bitrate          int64           `json:"bitrate,omitempty"`
+	AudioTracks      []AudioTrack    `json:"audioTracks"`
+	Subtitles        []SubtitleTrack `json:"subtitles"`
+	Warnings         []string        `json:"warnings,omitempty"`
 }
 
 type HlsStatus struct {

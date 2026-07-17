@@ -193,13 +193,23 @@ func TestSegmentWindowCreatesCanonicalNonOverlappingRanges(t *testing.T) {
 }
 
 func TestParseDirectSegmentOwner(t *testing.T) {
-	owner, ok := parseDirectSegmentOwner("direct_000015_0003.ts")
-	if !ok || owner != 15 {
-		t.Fatalf("parseDirectSegmentOwner() = %d, %v", owner, ok)
+	for _, name := range []string{"direct_000015_0003.ts", "direct_000015_0003.m4s"} {
+		owner, ok := parseDirectSegmentOwner(name)
+		if !ok || owner != 15 {
+			t.Fatalf("parseDirectSegmentOwner(%q) = %d, %v", name, owner, ok)
+		}
 	}
-	for _, name := range []string{"direct_15_0003.ts", "direct_000015.ts", "../direct_000015_0003.ts"} {
+	for _, name := range []string{"direct_15_0003.ts", "direct_000015.ts", "direct_000015_0003.mp4", "../direct_000015_0003.ts"} {
 		if _, ok := parseDirectSegmentOwner(name); ok {
 			t.Fatalf("parseDirectSegmentOwner(%q) accepted invalid name", name)
+		}
+	}
+	if owner, ok := parseDirectInitOwner("init_000015.mp4"); !ok || owner != 15 {
+		t.Fatalf("parseDirectInitOwner() = %d, %v", owner, ok)
+	}
+	for _, name := range []string{"seek_000015.ts", "seek_000015.m4s", "init_seek_000015.mp4"} {
+		if index, ok := parseSeekAsset(name); !ok || index != 15 {
+			t.Fatalf("parseSeekAsset(%q) = %d, %v", name, index, ok)
 		}
 	}
 }

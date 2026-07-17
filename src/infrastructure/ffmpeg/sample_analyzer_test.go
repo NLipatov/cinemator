@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"strings"
 	"testing"
 )
@@ -46,7 +47,7 @@ func TestSampleAnalyzerReturnsCanceledContextBeforeReading(t *testing.T) {
 func TestParseProbeOutputIncludesDurationAndBitrate(t *testing.T) {
 	out := []byte(`{
 		"streams":[
-			{"codec_type":"video","codec_name":"h264","profile":"High","level":40,"pix_fmt":"yuv420p","width":3840,"height":2160,"duration":"119.5"},
+			{"codec_type":"video","codec_name":"h264","profile":"High","level":40,"pix_fmt":"yuv420p","bits_per_raw_sample":"8","avg_frame_rate":"24000/1001","color_primaries":"bt709","color_transfer":"bt709","color_space":"bt709","width":3840,"height":2160,"duration":"119.5"},
 			{"codec_type":"audio","codec_name":"aac","profile":"LC","channels":2,"sample_rate":"48000","duration":"119.5"}
 		],
 		"format":{"duration":"120.25","bit_rate":"8000000"}
@@ -64,6 +65,9 @@ func TestParseProbeOutputIncludesDurationAndBitrate(t *testing.T) {
 	}
 	if info.Width != 3840 || info.Height != 2160 {
 		t.Fatalf("dimensions = %dx%d", info.Width, info.Height)
+	}
+	if info.VideoCodecString != "avc1.640028" || info.BitDepth != 8 || info.PixelFormat != "yuv420p" || math.Abs(info.FrameRate-23.976) > 0.001 {
+		t.Fatalf("browser capability metadata = %+v", info)
 	}
 	if info.VideoProfile != "High" || info.VideoLevel != 40 ||
 		info.AudioTracks[0].Profile != "LC" || info.AudioTracks[0].Channels != 2 || info.AudioTracks[0].SampleRate != 48000 {
@@ -120,6 +124,37 @@ func TestParseProbeOutputDetectsHDRTransfer(t *testing.T) {
 	}
 	if !info.HDR {
 		t.Fatalf("HDR = false for PQ transfer: %+v", info)
+	}
+	if info.HDRFormat != "HDR10" {
+		t.Fatalf("HDRFormat = %q, want HDR10", info.HDRFormat)
+	}
+}
+
+func TestParseProbeOutputDetectsHDR10PlusMetadata(t *testing.T) {
+	out := []byte(`{
+		"streams":[{"codec_type":"video","codec_name":"hevc","color_transfer":"smpte2084","side_data_list":[{"side_data_type":"HDR10+ Metadata"}]}],
+		"format":{"duration":"10"}
+	}`)
+	info, err := parseProbeOutput(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.HDR || info.HDRFormat != "HDR10+" {
+		t.Fatalf("HDR10+ metadata = %+v", info)
+	}
+}
+
+func TestParseProbeOutputBuildsAV1CapabilityString(t *testing.T) {
+	out := []byte(`{
+		"streams":[{"codec_type":"video","codec_name":"av1","profile":"Main","level":8,"pix_fmt":"yuv420p10le","avg_frame_rate":"60/1"}],
+		"format":{"duration":"10"}
+	}`)
+	info, err := parseProbeOutput(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.VideoCodecString != "av01.0.08M.10" || info.BitDepth != 10 || info.FrameRate != 60 {
+		t.Fatalf("AV1 capability metadata = %+v", info)
 	}
 }
 

@@ -149,13 +149,17 @@ func (m *manager) EnsureHlsAsset(ctx context.Context, streamDir, assetName strin
 	s.mtx.Lock()
 	s.lastView = time.Now()
 	s.mtx.Unlock()
-	if index, ok := parseSegmentName(assetName, "seek_", ".ts"); ok {
+	if index, ok := parseSeekAsset(assetName); ok {
 		if err := m.ensureVideoSegment(ctx, s, index); err != nil {
 			return err
 		}
 		return domain.ErrHlsPlaylistChanged
 	}
-	if owner, ok := parseDirectSegmentOwner(assetName); ok {
+	owner, directAsset := parseDirectSegmentOwner(assetName)
+	if !directAsset {
+		owner, directAsset = parseDirectInitOwner(assetName)
+	}
+	if directAsset {
 		path := filepath.Join(s.paths.outDir, assetName)
 		if touchExisting(path) {
 			return nil
@@ -483,12 +487,14 @@ func (m *manager) publishDirectWindow(s *streamInfo, job *segmentJob) error {
 	for _, window := range s.directWindows {
 		fragments = append(fragments, window...)
 	}
-	duration := s.mediaInfo.Duration
+	info := s.mediaInfo
+	selection := s.selection
 	s.mtx.Unlock()
 
 	err := ffmpeg.UpdateDirectHLS(
 		s.paths.videoPlaylist,
-		duration,
+		info,
+		selection,
 		m.settings.HlsSegmentDuration(),
 		m.settings.HlsWindowSegments(),
 		s.assetVersion,
@@ -523,11 +529,13 @@ func (m *manager) switchToTranscode(s *streamInfo, current *segmentJob) error {
 
 	s.playlistMtx.Lock()
 	defer s.playlistMtx.Unlock()
-	return ffmpeg.UpdateOnDemandHLS(
+	return ffmpeg.PrepareOnDemandHLS(
+		s.paths.outDir,
 		s.paths.videoPlaylist,
 		s.paths.subtitlePlaylist,
-		ffmpeg.UsesTextSubtitles(info, selection),
-		info.Duration,
+		s.paths.masterPlaylist,
+		info,
+		selection,
 		m.settings.HlsSegmentDuration(),
 		m.settings.HlsWindowSegments(),
 		s.assetVersion,
@@ -1058,14 +1066,31 @@ func parseSegmentName(name, prefix, suffix string) (int, bool) {
 }
 
 func parseDirectSegmentOwner(name string) (int, bool) {
-	if filepath.Base(name) != name || !strings.HasPrefix(name, "direct_") || !strings.HasSuffix(name, ".ts") {
+	if filepath.Base(name) != name || !strings.HasPrefix(name, "direct_") {
 		return 0, false
 	}
-	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(name, "direct_"), ".ts"), "_")
+	extension := filepath.Ext(name)
+	if extension != ".ts" && extension != ".m4s" {
+		return 0, false
+	}
+	parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(name, "direct_"), extension), "_")
 	if len(parts) != 2 || len(parts[0]) != 6 || len(parts[1]) != 4 {
 		return 0, false
 	}
 	owner, ownerErr := strconv.Atoi(parts[0])
 	position, positionErr := strconv.Atoi(parts[1])
 	return owner, ownerErr == nil && positionErr == nil && owner >= 0 && position >= 0
+}
+
+func parseDirectInitOwner(name string) (int, bool) {
+	return parseSegmentName(name, "init_", ".mp4")
+}
+
+func parseSeekAsset(name string) (int, bool) {
+	for _, format := range [][2]string{{"seek_", ".ts"}, {"seek_", ".m4s"}, {"init_seek_", ".mp4"}} {
+		if index, ok := parseSegmentName(name, format[0], format[1]); ok {
+			return index, true
+		}
+	}
+	return 0, false
 }

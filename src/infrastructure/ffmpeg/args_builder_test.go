@@ -143,13 +143,14 @@ func TestCanRemuxHLSRejectsVideoTransformations(t *testing.T) {
 		info domain.MediaInfo
 	}{
 		{name: "unknown duration", info: domain.MediaInfo{VideoCodec: "h264"}},
-		{name: "codec", info: domain.MediaInfo{Duration: 60, VideoCodec: "hevc"}},
+		{name: "codec", info: domain.MediaInfo{Duration: 60, VideoCodec: "vp9"}},
 		{name: "profile", info: domain.MediaInfo{Duration: 60, VideoCodec: "h264", VideoProfile: "High 10", Width: 1280, Height: 720}},
 		{name: "level", info: domain.MediaInfo{Duration: 60, VideoCodec: "h264", VideoProfile: "High", VideoLevel: 63, Width: 1280, Height: 720}},
 		{name: "pixel format", info: func() domain.MediaInfo { v := base; v.NeedFilter = true; return v }()},
 		{name: "HDR", info: func() domain.MediaInfo { v := base; v.HDR = true; return v }()},
 		{name: "interlace", info: func() domain.MediaInfo { v := base; v.Deinterlace = true; return v }()},
 		{name: "rotation", info: func() domain.MediaInfo { v := base; v.Rotated = true; return v }()},
+		{name: "Dolby Vision", info: domain.MediaInfo{Duration: 60, VideoCodec: "hevc", VideoProfile: "Main 10", PixelFormat: "yuv420p10le", DolbyVision: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -171,6 +172,20 @@ func TestCanRemuxHLSRejectsVideoTransformations(t *testing.T) {
 	}
 	if CanRemuxHLS(base, StreamSelection{ForceTranscode: true}) {
 		t.Fatal("CanRemuxHLS() ignored forced native-HLS fallback")
+	}
+}
+
+func TestCanRemuxHLSUsesFMP4ForHEVCAndAV1(t *testing.T) {
+	for _, info := range []domain.MediaInfo{
+		{Duration: 60, VideoCodec: "hevc", VideoProfile: "Main 10", VideoLevel: 153, PixelFormat: "yuv420p10le", HDR: true},
+		{Duration: 60, VideoCodec: "av1", VideoProfile: "Main", VideoLevel: 18, PixelFormat: "yuv420p10le", HDR: true},
+	} {
+		if !CanRemuxHLS(info, StreamSelection{}) {
+			t.Errorf("CanRemuxHLS(%s) = false", info.VideoCodec)
+		}
+		if !UsesFMP4(info, StreamSelection{}) {
+			t.Errorf("UsesFMP4(%s) = false", info.VideoCodec)
+		}
 	}
 }
 

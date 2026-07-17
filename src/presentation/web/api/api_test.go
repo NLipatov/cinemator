@@ -24,6 +24,7 @@ type fakeTorrentManager struct {
 	ensureErr error
 	status    domain.HlsStatus
 	statusErr error
+	mediaInfo domain.MediaInfo
 	ensured   chan [2]string
 	ensure    func(streamDir, assetName string) error
 }
@@ -33,7 +34,7 @@ func (m fakeTorrentManager) GetTorrentFiles(context.Context, string) ([]domain.F
 }
 
 func (m fakeTorrentManager) GetMediaInfo(context.Context, string, int) (domain.MediaInfo, error) {
-	return domain.MediaInfo{}, nil
+	return m.mediaInfo, nil
 }
 
 func (m fakeTorrentManager) PrepareHlsStream(_ context.Context, _ string, _, _, _ int, start float64, _ bool) (string, error) {
@@ -239,6 +240,44 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 	}
 }
 
+func TestHandleGetMediaInfoExposesPlaybackCapabilities(t *testing.T) {
+	server := HttpServer{mgr: fakeTorrentManager{mediaInfo: domain.MediaInfo{
+		VideoCodec:       "hevc",
+		VideoCodecString: "hvc1.2.4.L153.B0",
+		VideoProfile:     "Main 10",
+		VideoLevel:       153,
+		Width:            3840,
+		Height:           2160,
+		FrameRate:        23.976,
+		PixelFormat:      "yuv420p10le",
+		BitDepth:         10,
+		HDR:              true,
+		HDRFormat:        "HDR10",
+		Bitrate:          20_000_000,
+		AudioTracks:      []domain.AudioTrack{{Index: 0, Codec: "eac3", Channels: 6, SampleRate: 48000}},
+	}}}
+	req := httptest.NewRequest(http.MethodGet, "/api/media/info?magnet=magnet&file=0", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleGetMediaInfo(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+	for _, want := range []string{
+		`"videoCodec":"hevc"`,
+		`"videoCodecString":"hvc1.2.4.L153.B0"`,
+		`"width":3840`,
+		`"frameRate":23.976`,
+		`"hdrFormat":"HDR10"`,
+		`"channels":6`,
+	} {
+		if !strings.Contains(rec.Body.String(), want) {
+			t.Fatalf("media info missing %q: %s", want, rec.Body.String())
+		}
+	}
+}
+
 func TestHandleGetHlsStatus(t *testing.T) {
 	want := domain.HlsStatus{Phase: "preparing", TargetSeconds: 72, BytesRead: 4096, ActivePeers: 2, TotalPeers: 4}
 	server := HttpServer{mgr: fakeTorrentManager{status: want}, settings: settings.NewSettings()}
@@ -432,7 +471,7 @@ func TestHandleGetHlsChunkEnsuresOnDemandAsset(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	dir := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0_a0_s-1"
-	asset := "chunk_000003.ts"
+	asset := "direct_000003_0000.m4s"
 	if err := os.MkdirAll(filepath.Join(root, dir), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -457,6 +496,9 @@ func TestHandleGetHlsChunkEnsuresOnDemandAsset(t *testing.T) {
 	}
 	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "immutable") {
 		t.Fatalf("Cache-Control = %q", got)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "video/mp4" {
+		t.Fatalf("Content-Type = %q, want video/mp4", got)
 	}
 }
 

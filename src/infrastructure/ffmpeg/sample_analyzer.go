@@ -162,22 +162,26 @@ func probeSample(ctx context.Context, sample []byte) (domain.MediaInfo, error) {
 func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 	var meta struct {
 		Streams []struct {
-			Index         int    `json:"index"`
-			CodecType     string `json:"codec_type"`
-			CodecName     string `json:"codec_name"`
-			Profile       string `json:"profile"`
-			Level         int    `json:"level"`
-			Channels      int    `json:"channels"`
-			SampleRate    string `json:"sample_rate"`
-			PixFmt        string `json:"pix_fmt"`
-			ColorTransfer string `json:"color_transfer"`
-			FieldOrder    string `json:"field_order"`
-			Width         int    `json:"width"`
-			Height        int    `json:"height"`
-			Duration      string `json:"duration"`
-			DurationTS    int64  `json:"duration_ts"`
-			TimeBase      string `json:"time_base"`
-			Tags          struct {
+			Index            int    `json:"index"`
+			CodecType        string `json:"codec_type"`
+			CodecName        string `json:"codec_name"`
+			Profile          string `json:"profile"`
+			Level            int    `json:"level"`
+			Channels         int    `json:"channels"`
+			SampleRate       string `json:"sample_rate"`
+			PixFmt           string `json:"pix_fmt"`
+			BitsPerRawSample string `json:"bits_per_raw_sample"`
+			ColorPrimaries   string `json:"color_primaries"`
+			ColorTransfer    string `json:"color_transfer"`
+			ColorSpace       string `json:"color_space"`
+			FieldOrder       string `json:"field_order"`
+			Width            int    `json:"width"`
+			Height           int    `json:"height"`
+			AverageFrameRate string `json:"avg_frame_rate"`
+			Duration         string `json:"duration"`
+			DurationTS       int64  `json:"duration_ts"`
+			TimeBase         string `json:"time_base"`
+			Tags             struct {
 				Language string `json:"language"`
 				Title    string `json:"title"`
 				Rotate   string `json:"rotate"`
@@ -219,14 +223,28 @@ func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 			info.VideoCodec = s.CodecName
 			info.VideoProfile = s.Profile
 			info.VideoLevel = s.Level
+			info.VideoCodecString = videoCodecString(s.CodecName, s.Profile, s.Level, videoBitDepth(s.PixFmt, s.BitsPerRawSample))
 			info.VideoTrackIndex = videoIdx
 			info.Width = s.Width
 			info.Height = s.Height
+			info.FrameRate = parseTimeBase(s.AverageFrameRate)
+			info.PixelFormat = s.PixFmt
+			info.BitDepth = videoBitDepth(s.PixFmt, s.BitsPerRawSample)
+			info.ColorPrimaries = s.ColorPrimaries
+			info.ColorTransfer = s.ColorTransfer
+			info.ColorSpace = s.ColorSpace
 			info.Rotated = displayRotation(s.Tags.Rotate, s.SideData)
 			if info.Rotated {
 				info.Width, info.Height = info.Height, info.Width
 			}
-			info.HDR = s.ColorTransfer == "smpte2084" || s.ColorTransfer == "arib-std-b67"
+			switch s.ColorTransfer {
+			case "smpte2084":
+				info.HDR = true
+				info.HDRFormat = "HDR10"
+			case "arib-std-b67":
+				info.HDR = true
+				info.HDRFormat = "HLG"
+			}
 			info.Deinterlace = s.FieldOrder != "" && s.FieldOrder != "unknown" && s.FieldOrder != "progressive"
 			streamDuration, _ := strconv.ParseFloat(s.Duration, 64)
 			if streamDuration <= 0 && s.DurationTS > 0 {
@@ -239,9 +257,17 @@ func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 				info.NeedFilter = true
 			}
 			for _, sideData := range s.SideData {
-				if strings.Contains(strings.ToLower(sideData.Type), "dovi") {
-					info.Warnings = append(info.Warnings, "Dolby Vision enhancement metadata is not preserved; playback uses the decodable base video layer.")
+				typeName := strings.ToLower(sideData.Type)
+				if strings.Contains(typeName, "dovi") {
+					info.HDR = true
+					info.HDRFormat = "Dolby Vision"
+					info.DolbyVision = true
+					info.Warnings = append(info.Warnings, "Dolby Vision playback depends on client support; unsupported clients use the SDR fallback.")
 					break
+				}
+				if strings.Contains(typeName, "hdr10+") || strings.Contains(typeName, "dynamic hdr plus") {
+					info.HDR = true
+					info.HDRFormat = "HDR10+"
 				}
 			}
 			videoIdx++
@@ -304,4 +330,63 @@ func parseTimeBase(value string) float64 {
 		return 0
 	}
 	return numerator / denominator
+}
+
+func videoBitDepth(pixelFormat, raw string) int {
+	if value, err := strconv.Atoi(raw); err == nil && value > 0 {
+		return value
+	}
+	for _, depth := range []int{16, 14, 12, 10, 9} {
+		if strings.Contains(pixelFormat, strconv.Itoa(depth)) {
+			return depth
+		}
+	}
+	if pixelFormat != "" {
+		return 8
+	}
+	return 0
+}
+
+func videoCodecString(codec, profile string, level, bitDepth int) string {
+	switch codec {
+	case "h264":
+		prefix := "6400"
+		switch strings.ToLower(profile) {
+		case "baseline":
+			prefix = "4200"
+		case "constrained baseline":
+			prefix = "42e0"
+		case "main":
+			prefix = "4d00"
+		}
+		if level > 0 {
+			return fmt.Sprintf("avc1.%s%02x", prefix, level)
+		}
+		return "avc1"
+	case "hevc":
+		profileID := 1
+		compatibility := 6
+		if strings.Contains(strings.ToLower(profile), "10") {
+			profileID = 2
+			compatibility = 4
+		}
+		if level > 0 {
+			return fmt.Sprintf("hvc1.%d.%d.L%d.B0", profileID, compatibility, level)
+		}
+		return "hvc1"
+	case "av1":
+		profileID := 0
+		switch strings.ToLower(profile) {
+		case "high":
+			profileID = 1
+		case "professional":
+			profileID = 2
+		}
+		if level >= 0 && bitDepth > 0 {
+			return fmt.Sprintf("av01.%d.%02dM.%02d", profileID, level, bitDepth)
+		}
+		return "av01"
+	default:
+		return ""
+	}
 }

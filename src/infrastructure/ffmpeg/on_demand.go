@@ -70,7 +70,7 @@ func PrepareOnDemandHLS(
 
 	video := ""
 	if CanRemuxHLS(info, selection) {
-		video = buildSparseMediaPlaylist(info.Duration, seconds, windowSegments, assetVersion, nil)
+		video = buildSparseMediaPlaylist(info.Duration, seconds, windowSegments, assetVersion, UsesFMP4(info, selection), nil)
 	} else if info.Duration > 0 {
 		video = buildOnDemandMediaPlaylist(info.Duration, seconds, windowSegments, videoSegmentPrefix, ".ts", assetVersion)
 	} else {
@@ -97,7 +97,7 @@ func PrepareOnDemandHLS(
 	if withSubtitles {
 		language = info.Subtitles[selection.SubtitleTrackIndex].Language
 	}
-	master := buildMasterPlaylist(filepath.Base(videoPlaylist), filepath.Base(subtitlePlaylist), withSubtitles, language, assetVersion, info.Bitrate)
+	master := buildMasterPlaylist(filepath.Base(videoPlaylist), filepath.Base(subtitlePlaylist), withSubtitles, language, assetVersion, info, selection)
 	return writeFileAtomic(masterPlaylist, []byte(master), 0644)
 }
 
@@ -214,6 +214,7 @@ type HLSFragment struct {
 	Start    float64
 	Duration float64
 	Name     string
+	Init     string
 }
 
 type DirectWindowResult struct {
@@ -229,15 +230,16 @@ func DirectWindowGenerationDuration(segmentCount int, segmentDuration time.Durat
 	return time.Duration(segmentCount)*segmentDuration + maxDirectPreroll
 }
 
-func UpdateDirectHLS(videoPlaylist string, duration float64, segmentDuration time.Duration, windowSegments int, assetVersion string, fragments []HLSFragment) error {
+func UpdateDirectHLS(videoPlaylist string, info domain.MediaInfo, selection StreamSelection, segmentDuration time.Duration, windowSegments int, assetVersion string, fragments []HLSFragment) error {
+	duration := info.Duration
 	if duration <= 0 || segmentDuration <= 0 || windowSegments <= 0 {
 		return fmt.Errorf("invalid direct HLS timeline")
 	}
-	playlist := buildSparseMediaPlaylist(duration, segmentDuration.Seconds(), windowSegments, assetVersion, fragments)
+	playlist := buildSparseMediaPlaylist(duration, segmentDuration.Seconds(), windowSegments, assetVersion, UsesFMP4(info, selection), fragments)
 	return writeFileAtomic(videoPlaylist, []byte(playlist), 0644)
 }
 
-func buildSparseMediaPlaylist(duration, segmentDuration float64, windowSegments int, assetVersion string, fragments []HLSFragment) string {
+func buildSparseMediaPlaylist(duration, segmentDuration float64, windowSegments int, assetVersion string, fmp4 bool, fragments []HLSFragment) string {
 	windowSegments = max(1, windowSegments)
 	triggerDuration := segmentDuration * float64(windowSegments)
 	timelineEnd := duration
@@ -261,11 +263,16 @@ func buildSparseMediaPlaylist(duration, segmentDuration float64, windowSegments 
 			if next <= begin+0.001 {
 				next = math.Min(end, begin+triggerDuration)
 			}
-			entries = append(entries, HLSFragment{
+			entry := HLSFragment{
 				Start:    begin,
 				Duration: next - begin,
 				Name:     fmt.Sprintf("%s%0*d.ts", seekSegmentPrefix, segmentNumberWidth, index),
-			})
+			}
+			if fmp4 {
+				entry.Name = fmt.Sprintf("%s%0*d.m4s", seekSegmentPrefix, segmentNumberWidth, index)
+				entry.Init = fmt.Sprintf("init_%s%0*d.mp4", seekSegmentPrefix, segmentNumberWidth, index)
+			}
+			entries = append(entries, entry)
 			begin = next
 		}
 	}
@@ -301,11 +308,21 @@ func buildSparseMediaPlaylist(duration, segmentDuration float64, windowSegments 
 	}
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:3\n")
+	if fmp4 {
+		b.WriteString("#EXT-X-VERSION:7\n")
+		b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
+	} else {
+		b.WriteString("#EXT-X-VERSION:3\n")
+	}
 	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration))
 	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
+	currentInit := ""
 	for _, entry := range entries {
+		if entry.Init != "" && entry.Init != currentInit {
+			b.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", versionedAsset(entry.Init, assetVersion)))
+			currentInit = entry.Init
+		}
 		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", entry.Duration))
 		b.WriteString(versionedAsset(entry.Name, assetVersion) + "\n")
 	}
@@ -344,6 +361,11 @@ func GenerateDirectWindow(
 		return DirectWindowResult{}, fmt.Errorf("create direct HLS generation directory: %w", err)
 	}
 	defer os.RemoveAll(workDir)
+	fmp4 := UsesFMP4(info, selection)
+	segmentExtension := ".ts"
+	if fmp4 {
+		segmentExtension = ".m4s"
+	}
 
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostats",
@@ -360,9 +382,19 @@ func GenerateDirectWindow(
 		"-f", "hls",
 		"-hls_time", formatDuration(segmentDuration),
 		"-hls_list_size", "0",
-		"-hls_flags", "temp_file",
 		"-start_number", "0",
-		"-hls_segment_filename", filepath.Join(workDir, "part_%06d.ts"),
+	)
+	if fmp4 {
+		args = append(args,
+			"-hls_flags", "temp_file+independent_segments",
+			"-hls_segment_type", "fmp4",
+			"-hls_fmp4_init_filename", "init.mp4",
+		)
+	} else {
+		args = append(args, "-hls_flags", "temp_file")
+	}
+	args = append(args,
+		"-hls_segment_filename", filepath.Join(workDir, "part_%06d"+segmentExtension),
 		"-muxdelay", "0",
 		filepath.Join(workDir, "window.m3u8"),
 	)
@@ -372,7 +404,7 @@ func GenerateDirectWindow(
 	defer stopFFmpeg.Close()
 	covered := make(chan struct{}, 1)
 	go func() {
-		if waitForDirectCoverage(monitorCtx, workDir, wantedEnd.Seconds()) {
+		if waitForDirectCoverage(monitorCtx, workDir, wantedEnd.Seconds(), fmp4) {
 			covered <- struct{}{}
 			_, _ = io.WriteString(stopFFmpeg, "q\n")
 			_ = stopFFmpeg.Close()
@@ -399,7 +431,7 @@ func GenerateDirectWindow(
 	if len(durations) == 0 {
 		return DirectWindowResult{}, fmt.Errorf("%w: FFmpeg produced no GOPs", ErrRemuxNeedsTranscode)
 	}
-	firstPTS, err := probeFirstVideoPTS(ctx, filepath.Join(workDir, "part_000000.ts"))
+	firstPTS, err := probeFirstDirectVideoPTS(ctx, workDir, fmp4)
 	if err != nil {
 		return DirectWindowResult{}, fmt.Errorf("%w: %v", ErrRemuxNeedsTranscode, err)
 	}
@@ -424,23 +456,31 @@ func GenerateDirectWindow(
 	}
 
 	result := DirectWindowResult{Fragments: make([]HLSFragment, 0, last+1)}
+	initName := ""
+	if fmp4 {
+		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, firstSegment)
+		if err := os.Rename(filepath.Join(workDir, "init.mp4"), filepath.Join(outDir, initName)); err != nil {
+			return DirectWindowResult{}, fmt.Errorf("publish direct HLS init segment: %w", err)
+		}
+	}
 	cursor = firstPTS
 	for index := 0; index <= last; index++ {
-		name := fmt.Sprintf("%s%0*d_%04d.ts", directSegmentPrefix, segmentNumberWidth, firstSegment, index)
-		if err := os.Rename(filepath.Join(workDir, fmt.Sprintf("part_%06d.ts", index)), filepath.Join(outDir, name)); err != nil {
+		name := fmt.Sprintf("%s%0*d_%04d%s", directSegmentPrefix, segmentNumberWidth, firstSegment, index, segmentExtension)
+		if err := os.Rename(filepath.Join(workDir, fmt.Sprintf("part_%06d%s", index, segmentExtension)), filepath.Join(outDir, name)); err != nil {
 			return DirectWindowResult{}, fmt.Errorf("publish direct HLS segment: %w", err)
 		}
 		result.Fragments = append(result.Fragments, HLSFragment{
 			Start:    cursor,
 			Duration: durations[index],
 			Name:     name,
+			Init:     initName,
 		})
 		cursor += durations[index]
 	}
 	return result, nil
 }
 
-func waitForDirectCoverage(ctx context.Context, workDir string, wantedEnd float64) bool {
+func waitForDirectCoverage(ctx context.Context, workDir string, wantedEnd float64, fmp4 bool) bool {
 	ticker := time.NewTicker(generationPollInterval)
 	defer ticker.Stop()
 	firstPTS := math.NaN()
@@ -448,7 +488,7 @@ func waitForDirectCoverage(ctx context.Context, workDir string, wantedEnd float6
 		durations, err := readAllGeneratedDurations(filepath.Join(workDir, "window.m3u8"))
 		if err == nil && len(durations) > 0 {
 			if math.IsNaN(firstPTS) {
-				firstPTS, err = probeFirstVideoPTS(ctx, filepath.Join(workDir, "part_000000.ts"))
+				firstPTS, err = probeFirstDirectVideoPTS(ctx, workDir, fmp4)
 			}
 			if err == nil {
 				end := firstPTS
@@ -466,6 +506,14 @@ func waitForDirectCoverage(ctx context.Context, workDir string, wantedEnd float6
 		case <-ticker.C:
 		}
 	}
+}
+
+func probeFirstDirectVideoPTS(ctx context.Context, workDir string, fmp4 bool) (float64, error) {
+	segment := filepath.Join(workDir, "part_000000.ts")
+	if fmp4 {
+		segment = "concat:" + filepath.Join(workDir, "init.mp4") + "|" + filepath.Join(workDir, "part_000000.m4s")
+	}
+	return probeFirstVideoPTS(ctx, segment)
 }
 
 func GenerateVideoWindow(
@@ -782,11 +830,38 @@ func formatSeconds(value float64) string {
 	return strconv.FormatFloat(value, 'f', 3, 64)
 }
 
-func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVersion string, bandwidth int64) string {
-	bandwidth = max(bandwidth, int64(5_500_000))
+func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVersion string, info domain.MediaInfo, selection StreamSelection) string {
+	bandwidth := max(info.Bitrate, int64(5_500_000))
+	streamAttributes := []string{fmt.Sprintf("BANDWIDTH=%d", bandwidth)}
+	if CanRemuxHLS(info, selection) {
+		codec := info.VideoCodecString
+		if codec == "" {
+			codec = videoCodecString(info.VideoCodec, info.VideoProfile, info.VideoLevel, info.BitDepth)
+		}
+		if selectedAudioIndex(info, selection) >= 0 {
+			codec += ",mp4a.40.2"
+		}
+		if codec != "" {
+			streamAttributes = append(streamAttributes, fmt.Sprintf("CODECS=\"%s\"", codec))
+		}
+		if info.HDR {
+			videoRange := "PQ"
+			if info.HDRFormat == "HLG" {
+				videoRange = "HLG"
+			}
+			streamAttributes = append(streamAttributes, "VIDEO-RANGE="+videoRange)
+		}
+	}
+	if withSubs {
+		streamAttributes = append(streamAttributes, "SUBTITLES=\"subs\"")
+	}
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:3\n")
+	if UsesFMP4(info, selection) {
+		b.WriteString("#EXT-X-VERSION:7\n")
+	} else {
+		b.WriteString("#EXT-X-VERSION:3\n")
+	}
 	if withSubs {
 		attributes := []string{
 			"TYPE=SUBTITLES",
@@ -801,10 +876,8 @@ func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVe
 			attributes = append(attributes, fmt.Sprintf("LANGUAGE=\"%s\"", lang))
 		}
 		b.WriteString("#EXT-X-MEDIA:" + strings.Join(attributes, ",") + "\n")
-		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d,SUBTITLES=\"subs\"\n", bandwidth)
-	} else {
-		fmt.Fprintf(&b, "#EXT-X-STREAM-INF:BANDWIDTH=%d\n", bandwidth)
 	}
+	b.WriteString("#EXT-X-STREAM-INF:" + strings.Join(streamAttributes, ",") + "\n")
 	b.WriteString(versionedAsset(videoList, assetVersion) + "\n")
 	return b.String()
 }

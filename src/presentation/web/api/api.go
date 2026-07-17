@@ -462,6 +462,14 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "chunk not found", http.StatusNotFound)
 		return
 	}
+	switch filepath.Ext(assetName) {
+	case ".m4s", ".mp4":
+		w.Header().Set("Content-Type", "video/mp4")
+	case ".ts":
+		w.Header().Set("Content-Type", "video/mp2t")
+	case ".vtt":
+		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
+	}
 	w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
 	http.ServeContent(w, r, assetName, info.ModTime(), file)
 }

@@ -113,6 +113,10 @@ docker compose up -d cinemator
 
 ## Small disks and on-demand HLS
 
+The normative future architecture is documented in
+[On-demand HLS target model](docs/on-demand-hls-target-model.md). This section
+describes the currently deployed behavior and configuration.
+
 Cinemator does not need enough local disk space for the complete selected file. Torrent data is stored as a bounded LRU cache of verified pieces, and HLS segments are generated on demand from the current playhead. Seeking to an uncached position starts a short FFmpeg window around that position. While it is being prepared, the player reports elapsed time, source bytes read, active/known peers, and whether the window is being remuxed or transcoded instead of appearing frozen.
 
 The defaults reserve 12 GiB for torrent pieces and 2 GiB for generated HLS assets. They are suitable starting values for a 30 GB VPS while leaving space for the operating system, container layers, and logs. Configure the budgets in `.env` using byte values:

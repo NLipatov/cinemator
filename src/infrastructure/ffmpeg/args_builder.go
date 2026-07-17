@@ -17,13 +17,28 @@ type StreamSelection struct {
 // unchanged. Unknown-duration inputs keep the progressive transcoding path
 // because they cannot expose a stable sparse VOD timeline.
 func CanRemuxHLS(info domain.MediaInfo, sel StreamSelection) bool {
-	if sel.ForceTranscode || info.Duration <= 0 || info.VideoCodec != "h264" || !copyableH264Profile(info.VideoProfile, info.VideoLevel) || info.NeedFilter ||
-		info.HDR || info.Deinterlace || info.Rotated {
+	if sel.ForceTranscode || info.Duration <= 0 || info.Deinterlace || info.Rotated || info.DolbyVision {
 		return false
 	}
-	return sel.SubtitleTrackIndex < 0 ||
-		sel.SubtitleTrackIndex >= len(info.Subtitles) ||
-		!isBitmapSubtitle(info.Subtitles[sel.SubtitleTrackIndex].Codec)
+	if sel.SubtitleTrackIndex >= 0 &&
+		sel.SubtitleTrackIndex < len(info.Subtitles) &&
+		isBitmapSubtitle(info.Subtitles[sel.SubtitleTrackIndex].Codec) {
+		return false
+	}
+	switch info.VideoCodec {
+	case "h264":
+		return !info.HDR && copyableH264Profile(info.VideoProfile, info.VideoLevel) && copyablePixelFormat(info)
+	case "hevc":
+		return copyableHEVCProfile(info.VideoProfile, info.VideoLevel) && copyablePixelFormat(info)
+	case "av1":
+		return copyableAV1Profile(info.VideoProfile, info.VideoLevel) && copyablePixelFormat(info)
+	default:
+		return false
+	}
+}
+
+func UsesFMP4(info domain.MediaInfo, sel StreamSelection) bool {
+	return CanRemuxHLS(info, sel) && (info.VideoCodec == "hevc" || info.VideoCodec == "av1")
 }
 
 func CopiesAudio(info domain.MediaInfo, sel StreamSelection) bool {
@@ -42,6 +57,30 @@ func copyableH264Profile(profile string, level int) bool {
 	switch strings.ToLower(profile) {
 	case "", "baseline", "constrained baseline", "main", "high":
 		return level <= 62
+	default:
+		return false
+	}
+}
+
+func copyableHEVCProfile(profile string, level int) bool {
+	profile = strings.ToLower(profile)
+	return (profile == "" || profile == "main" || profile == "main 10") && level <= 186
+}
+
+func copyableAV1Profile(profile string, level int) bool {
+	profile = strings.ToLower(profile)
+	return (profile == "" || profile == "main") && level <= 18
+}
+
+func copyablePixelFormat(info domain.MediaInfo) bool {
+	if info.PixelFormat == "" {
+		return !info.NeedFilter
+	}
+	switch info.VideoCodec {
+	case "h264":
+		return info.PixelFormat == "yuv420p"
+	case "hevc", "av1":
+		return info.PixelFormat == "yuv420p" || info.PixelFormat == "yuv420p10le"
 	default:
 		return false
 	}
@@ -136,6 +175,11 @@ func buildStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 
 func buildRemuxStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 	args := []string{"-map", fmt.Sprintf("0:v:%d", max(0, info.VideoTrackIndex)), "-c:v", "copy"}
+	if info.VideoCodec == "hevc" {
+		args = append(args, "-tag:v", "hvc1")
+	} else if info.VideoCodec == "av1" {
+		args = append(args, "-tag:v", "av01")
+	}
 	audioIdx := selectedAudioIndex(info, sel)
 	if audioIdx < 0 {
 		return args

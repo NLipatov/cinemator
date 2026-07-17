@@ -193,6 +193,8 @@ func pinSegmentJob(pinned map[string]struct{}, outDir string, job *segmentJob, n
 
 func isGeneratedHlsAsset(name string) bool {
 	return strings.HasSuffix(name, ".ts") ||
+		strings.HasSuffix(name, ".m4s") ||
+		strings.HasSuffix(name, ".mp4") ||
 		strings.HasSuffix(name, ".vtt") ||
 		strings.HasSuffix(name, ".tmp") ||
 		(strings.HasPrefix(name, "window_") && strings.HasSuffix(name, ".m3u8"))
