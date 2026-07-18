@@ -22,6 +22,7 @@ type streamKey struct {
 	Audio     int
 	Subtitle  int
 	Transcode bool
+	Start     int
 }
 
 type mediaKey struct {
@@ -30,37 +31,42 @@ type mediaKey struct {
 }
 
 type streamInfo struct {
-	cancel                context.CancelFunc
-	torrent               *torrent.Torrent
-	file                  *torrent.File
-	lastView              time.Time
-	mtx                   sync.Mutex
-	selection             ffmpeg.StreamSelection
-	paths                 streamPaths
-	assetVersion          string
-	source                *torrentSource
-	ctx                   context.Context
-	ready                 chan struct{}
-	readyErr              error
-	fatalErr              error
-	mediaInfo             domain.MediaInfo
-	mediaInfoReady        bool
-	directPlay            bool
-	directWindows         map[int][]ffmpeg.HLSFragment
-	status                domain.HlsStatus
-	statusSegment         int
-	segmentErrors         map[int]segmentFailure
-	lastTorrentBytes      int64
-	progressiveAdvertised int
-	progressiveEnded      bool
-	progressiveLast       float64
-	progressiveRetry      bool
-	videoJobs             map[*segmentJob]struct{}
-	subtitleJobs          map[*segmentJob]struct{}
-	playlistMtx           sync.RWMutex
-	generationMtx         sync.RWMutex
-	cleanupDone           chan struct{}
-	closing               bool
+	cancel                           context.CancelFunc
+	torrent                          *torrent.Torrent
+	file                             *torrent.File
+	lastView                         time.Time
+	mtx                              sync.Mutex
+	selection                        ffmpeg.StreamSelection
+	paths                            streamPaths
+	assetVersion                     string
+	source                           *torrentSource
+	ctx                              context.Context
+	ready                            chan struct{}
+	readyErr                         error
+	fatalErr                         error
+	mediaInfo                        domain.MediaInfo
+	mediaInfoReady                   bool
+	presentationTarget               float64
+	directPlay                       bool
+	directWindows                    map[int][]ffmpeg.HLSFragment
+	materializedTarget               time.Duration
+	status                           domain.HlsStatus
+	statusSegment                    int
+	segmentErrors                    map[int]segmentFailure
+	lastTorrentBytes                 int64
+	progressiveAdvertised            int
+	progressiveSubtitles             int
+	progressiveSequence              int
+	progressiveDiscontinuitySequence int
+	progressiveEnded                 bool
+	progressiveLast                  float64
+	progressiveRetry                 bool
+	videoJobs                        map[*segmentJob]struct{}
+	subtitleJobs                     map[*segmentJob]struct{}
+	playlistMtx                      sync.RWMutex
+	generationMtx                    sync.RWMutex
+	cleanupDone                      chan struct{}
+	closing                          bool
 }
 
 func (s *streamInfo) recordSourceBytes(jobID string, n int64) {
@@ -69,11 +75,13 @@ func (s *streamInfo) recordSourceBytes(jobID string, n int64) {
 	}
 	s.mtx.Lock()
 	now := time.Now()
+	statusProgress := s.status.Phase == "probing" && jobID == ""
 	if jobID != "" {
 		for job := range s.videoJobs {
 			if job.id == jobID {
 				job.bytesRead += n
 				job.lastProgress = now
+				statusProgress = s.statusSegment >= job.begin && s.statusSegment < job.end
 				break
 			}
 		}
@@ -85,7 +93,7 @@ func (s *streamInfo) recordSourceBytes(jobID string, n int64) {
 			}
 		}
 	}
-	if s.status.Phase == "probing" || s.status.Phase == "preparing" {
+	if statusProgress && (s.status.Phase == "probing" || s.status.Phase == "preparing") {
 		s.status.BytesRead += n
 		s.status.LastProgress = now
 	}
@@ -128,11 +136,14 @@ func (s *streamInfo) markReady(index int) {
 func (s *streamInfo) markSegmentProgress(job *segmentJob, index int) {
 	s.mtx.Lock()
 	delete(s.segmentErrors, index)
+	now := time.Now()
 	if job != nil {
-		job.lastProgress = time.Now()
+		job.lastProgress = now
 	}
-	if s.status.Phase == "probing" || s.status.Phase == "preparing" {
-		s.status.LastProgress = time.Now()
+	if s.status.Phase == "preparing" && job != nil {
+		if _, videoJob := s.videoJobs[job]; videoJob && s.statusSegment >= job.begin && s.statusSegment < job.end {
+			s.status.LastProgress = now
+		}
 	}
 	s.mtx.Unlock()
 }
@@ -260,6 +271,7 @@ type segmentJob struct {
 	err          error
 	result       ffmpeg.VideoWindowResult
 	fragments    []ffmpeg.HLSFragment
+	directEnd    bool
 	slotHeld     bool
 }
 
@@ -276,7 +288,11 @@ type streamPaths struct {
 }
 
 func (k streamKey) dirName() string {
-	return fmt.Sprintf("%s_%d_a%d_s%d_t%d", k.InfoHash, k.Index, k.Audio, k.Subtitle, btoi(k.Transcode))
+	name := fmt.Sprintf("%s_%d_a%d_s%d_t%d", k.InfoHash, k.Index, k.Audio, k.Subtitle, btoi(k.Transcode))
+	if k.Start > 0 {
+		name += fmt.Sprintf("_p%d", k.Start)
+	}
+	return name
 }
 
 func (k streamKey) paths(root string) streamPaths {
@@ -291,7 +307,7 @@ func (k streamKey) paths(root string) streamPaths {
 
 func parseStreamDir(name string) (streamKey, error) {
 	parts := strings.Split(name, "_")
-	if len(parts) != 5 {
+	if len(parts) != 5 && len(parts) != 6 {
 		return streamKey{}, fmt.Errorf("bad stream dir")
 	}
 	if !strings.HasPrefix(parts[2], "a") || !strings.HasPrefix(parts[3], "s") || !strings.HasPrefix(parts[4], "t") {
@@ -316,12 +332,23 @@ func parseStreamDir(name string) (streamKey, error) {
 	if err != nil || transcodeValue < 0 || transcodeValue > 1 {
 		return streamKey{}, fmt.Errorf("bad transcode mode")
 	}
+	start := 0
+	if len(parts) == 6 {
+		if !strings.HasPrefix(parts[5], "p") {
+			return streamKey{}, fmt.Errorf("bad presentation start")
+		}
+		start, err = strconv.Atoi(strings.TrimPrefix(parts[5], "p"))
+		if err != nil || start < 0 {
+			return streamKey{}, fmt.Errorf("bad presentation start")
+		}
+	}
 	return streamKey{
 		InfoHash:  parts[0],
 		Index:     idx,
 		Audio:     audioIdx,
 		Subtitle:  subIdx,
 		Transcode: transcodeValue == 1,
+		Start:     start,
 	}, nil
 }
 

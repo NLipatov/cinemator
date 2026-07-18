@@ -116,7 +116,6 @@ func estimatedHlsWindowInodes(duration, segmentDuration time.Duration) uint64 {
 }
 
 func (m *manager) trimHlsCache(target int64) (int64, error) {
-
 	active, pinned := m.hlsCacheProtection()
 	root := m.settings.HlsPath()
 	var total int64
@@ -173,28 +172,10 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 		return candidates[i].last.Before(candidates[j].last)
 	})
 	type hlsEvictionBatch struct {
-		dir   string
-		items []hlsCacheItem
-	}
-	activeBatches := make(map[string]*hlsEvictionBatch)
-	var batches []*hlsEvictionBatch
-	for _, item := range candidates {
-		rel, relErr := filepath.Rel(root, item.path)
-		parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
-		if relErr == nil && len(parts) == 2 {
-			_, isActive := active[parts[0]]
-			if isActive && isImmutableHlsAsset(filepath.Base(item.path)) {
-				batch := activeBatches[parts[0]]
-				if batch == nil {
-					batch = &hlsEvictionBatch{dir: parts[0]}
-					activeBatches[parts[0]] = batch
-					batches = append(batches, batch)
-				}
-				batch.items = append(batch.items, item)
-				continue
-			}
-		}
-		batches = append(batches, &hlsEvictionBatch{items: []hlsCacheItem{item}})
+		dir    string
+		stream *streamInfo
+		items  []hlsCacheItem
+		locked bool
 	}
 	var removedFiles int
 	var unlinkedBytes int64
@@ -203,31 +184,66 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 		removedFiles++
 		unlinkedBytes += item.size
 	}
-	for _, batch := range batches {
-		if total <= target {
+	activeBatches := make(map[string]*hlsEvictionBatch)
+	var batches []*hlsEvictionBatch
+	defer func() {
+		for _, batch := range batches {
+			if batch.locked {
+				batch.stream.generationMtx.Unlock()
+			}
+		}
+	}()
+	remaining := total
+	for _, item := range candidates {
+		if remaining <= target {
 			break
 		}
-		if batch.dir == "" {
-			item := batch.items[0]
-			removed, err := m.assets.TryEvict(item.path)
-			if err != nil {
-				log.Printf("enforceCacheLimit: failed to remove %s: %v", item.path, err)
+		rel, relErr := filepath.Rel(root, item.path)
+		parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
+		if relErr == nil && len(parts) == 2 {
+			stream, isActive := active[parts[0]]
+			if isActive && isImmutableHlsAsset(filepath.Base(item.path)) {
+				batch := activeBatches[parts[0]]
+				if batch == nil {
+					stream.generationMtx.Lock()
+					batch = &hlsEvictionBatch{dir: parts[0], stream: stream, locked: true}
+					activeBatches[parts[0]] = batch
+					batches = append(batches, batch)
+				}
+				ok, canEvictErr := m.assets.CanEvict(item.path)
+				if canEvictErr != nil {
+					log.Printf("enforceCacheLimit: failed to inspect %s: %v", item.path, canEvictErr)
+					continue
+				}
+				if !ok {
+					continue
+				}
+				batch.items = append(batch.items, item)
+				remaining -= item.size
 				continue
 			}
-			if removed {
-				recordRemoved(item)
-			}
+		}
+		removed, err := m.assets.TryEvict(item.path)
+		if err != nil {
+			log.Printf("enforceCacheLimit: failed to remove %s: %v", item.path, err)
 			continue
 		}
-		removed, err := m.evictActiveHlsAssets(batch.dir, batch.items, total-target)
+		if removed {
+			recordRemoved(item)
+			remaining -= item.size
+		}
+	}
+	for _, batch := range batches {
+		removed, err := m.evictActiveHlsAssets(batch.stream, batch.items)
 		for _, item := range batch.items {
 			if _, ok := removed[item.path]; ok {
 				recordRemoved(item)
 			}
 		}
+		batch.stream.generationMtx.Unlock()
+		batch.locked = false
 		if err != nil {
 			log.Printf("enforceCacheLimit: failed to rotate stream %s: %v", batch.dir, err)
-			continue
 		}
 	}
 	if removedFiles > 0 {
@@ -305,13 +321,13 @@ func isHlsGenerationTemporary(rel string) bool {
 	return len(parts) > 1 && (strings.HasPrefix(parts[1], ".generating-") || strings.HasPrefix(parts[1], ".remuxing-"))
 }
 
-func (m *manager) hlsCacheProtection() (active, pinned map[string]struct{}) {
-	active = make(map[string]struct{})
+func (m *manager) hlsCacheProtection() (active map[string]*streamInfo, pinned map[string]struct{}) {
+	active = make(map[string]*streamInfo)
 	pinned = make(map[string]struct{})
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for key, stream := range m.active {
-		active[key.dirName()] = struct{}{}
+		active[key.dirName()] = stream
 		stream.mtx.Lock()
 		publishing := false
 		if stream.ready != nil {
@@ -333,6 +349,19 @@ func (m *manager) hlsCacheProtection() (active, pinned map[string]struct{}) {
 		for job := range stream.subtitleJobs {
 			pinSegmentJob(pinned, stream.paths.outDir, job, subtitleSegmentName)
 			publishing = publishing || !jobFinished(job)
+		}
+		for _, fragments := range stream.directWindows {
+			for _, fragment := range fragments {
+				pinned[filepath.Join(stream.paths.outDir, fragment.Name)] = struct{}{}
+				if fragment.Init != "" {
+					pinned[filepath.Join(stream.paths.outDir, fragment.Init)] = struct{}{}
+				}
+			}
+		}
+		window := max(3, m.settings.HlsWindowSegments())
+		first := max(0, stream.progressiveSubtitles-window)
+		for index := first; index < stream.progressiveSubtitles; index++ {
+			pinned[filepath.Join(stream.paths.outDir, subtitleSegmentName(index))] = struct{}{}
 		}
 		if publishing {
 			pinned[stream.paths.outDir] = struct{}{}

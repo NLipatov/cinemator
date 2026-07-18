@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -106,6 +107,21 @@ func TestEstimatedHlsWindowBytesUsesSourceBitrate(t *testing.T) {
 	}
 }
 
+func TestHlsCacheProtectionPinsPublishedPresentation(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
+	paths := key.paths(t.TempDir())
+	stream := readyCacheTestStream(paths)
+	stream.directWindows[0] = []ffmpeg.HLSFragment{{Name: "direct_000000_0000.m4s", Init: "init_000000.mp4"}}
+	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, settings: settings.NewSettings()}
+
+	_, pinned := manager.hlsCacheProtection()
+	for _, name := range []string{"direct_000000_0000.m4s", "init_000000.mp4"} {
+		if _, ok := pinned[filepath.Join(paths.outDir, name)]; !ok {
+			t.Fatalf("published asset %q is not protected", name)
+		}
+	}
+}
+
 func TestCacheSkipsLeasedActiveSegmentAndContinuesEviction(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
@@ -145,6 +161,64 @@ func TestCacheSkipsLeasedActiveSegmentAndContinuesEviction(t *testing.T) {
 	m.enforceCacheLimit()
 	if _, err := os.Stat(segment); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("released segment was not evicted: %v", err)
+	}
+}
+
+func TestCachePreservesGlobalLRUWhenOldestActiveAssetIsLeased(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CINEMATOR_HLS_PATH", root)
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
+	paths := key.paths(root)
+	oldest := filepath.Join(paths.outDir, "chunk_000000.ts")
+	middle := filepath.Join(root, "inactive", "chunk_000000.ts")
+	newest := filepath.Join(paths.outDir, "chunk_000001.ts")
+	files := []string{oldest, middle, newest}
+	for index, path := range files {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("segment"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		stamp := time.Unix(int64(index+1), 0)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var total int64
+	for _, path := range files {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		total += allocatedFileSize(info)
+	}
+	middleInfo, err := os.Stat(middle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", strconv.FormatInt(total-allocatedFileSize(middleInfo), 10))
+
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := assets.Open(oldest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	m := &manager{active: map[streamKey]*streamInfo{key: readyCacheTestStream(paths)}, assets: assets, settings: settings.NewSettings()}
+	m.enforceCacheLimit()
+
+	if _, err := os.Stat(oldest); err != nil {
+		t.Fatalf("leased oldest segment was removed: %v", err)
+	}
+	if _, err := os.Stat(middle); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("next-oldest inactive segment was not removed: %v", err)
+	}
+	if _, err := os.Stat(newest); err != nil {
+		t.Fatalf("newer active segment was removed ahead of global LRU: %v", err)
 	}
 }
 
@@ -210,7 +284,14 @@ func TestActiveAssetEvictionRotatesImmutableGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(playlist), "?v="+version) {
-		t.Fatalf("rotated playlist does not use version %q:\n%s", version, playlist)
+	if strings.Contains(string(playlist), "chunk_") {
+		t.Fatalf("rotated playlist still advertises evicted media:\n%s", playlist)
+	}
+	master, err := os.ReadFile(paths.masterPlaylist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(master), "index.m3u8?v="+version) {
+		t.Fatalf("rotated master does not use version %q:\n%s", version, master)
 	}
 }

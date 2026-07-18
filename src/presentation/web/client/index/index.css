@@ -725,7 +725,23 @@ button:focus-visible {
 
 .player-toolbar {
   display: flex;
+  align-items: center;
+  gap: 0.8rem;
   justify-content: flex-end;
+}
+
+.source-timeline {
+  display: grid;
+  grid-template-columns: auto minmax(8rem, 28rem);
+  align-items: center;
+  gap: 0.65rem;
+  margin-right: auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 0.82rem;
+}
+
+.source-timeline input {
+  width: min(44vw, 28rem);
 }
 
 .media-info-button {

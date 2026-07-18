@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,7 @@ type manager struct {
 	pieces      *pieceCacheProvider
 	events      *downloadEventBroadcaster
 	mu          sync.Mutex
+	torrentMu   sync.Mutex
 	cacheMu     sync.Mutex
 	hlsReserved int64
 	hlsDisk     *diskBudget
@@ -318,6 +320,9 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 }
 
 func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int, startSeconds float64, forceTranscode bool) (string, error) {
+	if startSeconds < 0 || math.IsNaN(startSeconds) || math.IsInf(startSeconds, 0) {
+		return "", fmt.Errorf("%w: bad start position", domain.ErrBadHlsRequest)
+	}
 	t, hash, err := m.acquireTorrent(magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
@@ -337,14 +342,17 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	files := t.Files()
 	if fileIndex < 0 || fileIndex >= len(files) {
 		log.Printf("PrepareHlsStream: bad file index: %d", fileIndex)
-		return "", fmt.Errorf("bad file index")
+		return "", fmt.Errorf("%w: bad file index", domain.ErrBadHlsRequest)
 	}
 	if err := validatePieceCacheCapacity(t.Info().PieceLength, m.settings.MaxTorrentCacheBytes()); err != nil {
 		return "", err
 	}
 	file := files[fileIndex]
 	m.touchDownload(ctx, hash)
-	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack, Transcode: forceTranscode}
+	startIndex := int(math.Floor(startSeconds / m.settings.HlsSegmentDuration().Seconds()))
+	startIndex, _ = segmentWindow(startIndex, 0, m.settings.HlsWindowSegments())
+	startMillis := int(math.Round(startSeconds * 1000))
+	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack, Transcode: forceTranscode, Start: startMillis}
 	probeKey := mediaKey{InfoHash: hash, Index: fileIndex}
 	paths := key.paths(m.settings.HlsPath())
 
@@ -380,26 +388,29 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		streamCtx, cancel := context.WithCancel(cli.WithProcessGuards(context.Background(), m.ownership.guardFiles()...))
 		now := time.Now()
 		candidate = &streamInfo{
-			cancel:         cancel,
-			ctx:            streamCtx,
-			torrent:        t,
-			file:           file,
-			lastView:       time.Now(),
-			paths:          paths,
-			assetVersion:   fmt.Sprintf("%x", now.UnixNano()),
-			source:         source,
-			selection:      ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack, ForceTranscode: forceTranscode},
-			mediaInfo:      cachedInfo,
-			mediaInfoReady: hasCachedInfo,
-			ready:          make(chan struct{}),
+			cancel:             cancel,
+			ctx:                streamCtx,
+			torrent:            t,
+			file:               file,
+			lastView:           time.Now(),
+			paths:              paths,
+			assetVersion:       fmt.Sprintf("%x", now.UnixNano()),
+			source:             source,
+			selection:          ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack, ForceTranscode: forceTranscode},
+			mediaInfo:          cachedInfo,
+			mediaInfoReady:     hasCachedInfo,
+			presentationTarget: startSeconds,
+			ready:              make(chan struct{}),
 			status: domain.HlsStatus{
 				Phase:         "probing",
 				TargetSeconds: startSeconds,
 				StartedAt:     now,
 				LastProgress:  now,
 			},
-			statusSegment: -1,
-			segmentErrors: make(map[int]segmentFailure),
+			statusSegment:         -1,
+			progressiveAdvertised: startIndex,
+			progressiveSubtitles:  startIndex,
+			segmentErrors:         make(map[int]segmentFailure),
 			lastTorrentBytes: func() int64 {
 				stats := t.Stats()
 				return stats.BytesReadUsefulData.Int64()
@@ -410,23 +421,29 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			cleanupDone:   make(chan struct{}),
 		}
 
+		// Keep stream publication atomic with the cache cleaner's active-stream
+		// snapshot and stale-tree reset.
+		m.cacheMu.Lock()
 		m.mu.Lock()
 		if current, ok := m.active[key]; ok {
 			s = current
 			m.mu.Unlock()
+			m.cacheMu.Unlock()
 			cancel()
 			source.Close()
 		} else if len(m.active) >= m.settings.MaxActiveStreams() {
 			m.mu.Unlock()
+			m.cacheMu.Unlock()
 			cancel()
 			source.Close()
-			return "", fmt.Errorf("active stream limit reached (%d)", m.settings.MaxActiveStreams())
+			return "", fmt.Errorf("%w: active stream limit reached (%d)", domain.ErrHlsTemporarilyUnavailable, m.settings.MaxActiveStreams())
 		} else {
 			// Remove playlists from an earlier process before publishing the
 			// stream. Otherwise a recovering player can read a stale master
 			// while initialization is still probing the torrent.
 			if resetErr := m.resetStreamOutput(paths); resetErr != nil {
 				m.mu.Unlock()
+				m.cacheMu.Unlock()
 				cancel()
 				source.Close()
 				return "", resetErr
@@ -435,6 +452,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			m.active[key] = s
 			keepTorrent = true
 			m.mu.Unlock()
+			m.cacheMu.Unlock()
 			go m.initializeOnDemandStream(key, s)
 			m.notifyDownloadsChanged()
 		}
@@ -485,15 +503,18 @@ func (m *manager) DeleteDownload(ctx context.Context, id string) error {
 	for _, key := range keys {
 		m.cleanup(key)
 	}
-	m.mu.Lock()
+	m.torrentMu.Lock()
 	if use := m.torrentUses[id]; use != nil && use.refs > 0 {
-		m.mu.Unlock()
+		m.torrentMu.Unlock()
 		return fmt.Errorf("download is in use")
 	}
 	delete(m.torrentUses, id)
 	if t, ok := m.client.Torrent(metainfo.NewHashFromHex(id)); ok {
 		t.Drop()
 	}
+	m.torrentMu.Unlock()
+
+	m.mu.Lock()
 	for key := range m.mediaInfo {
 		if key.InfoHash == id {
 			delete(m.mediaInfo, key)
@@ -558,11 +579,15 @@ func (m *manager) streamKeysForDownload(id string) []streamKey {
 }
 
 func (m *manager) downloadActive(id string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if use := m.torrentUses[id]; use != nil && use.refs > 0 {
+	m.torrentMu.Lock()
+	inUse := m.torrentUses[id] != nil && m.torrentUses[id].refs > 0
+	m.torrentMu.Unlock()
+	if inUse {
 		return true
 	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	for key := range m.active {
 		if key.InfoHash == id {
 			return true
@@ -572,8 +597,8 @@ func (m *manager) downloadActive(id string) bool {
 }
 
 func (m *manager) acquireTorrent(magnet string) (*torrent.Torrent, string, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.torrentMu.Lock()
+	defer m.torrentMu.Unlock()
 	t, err := addMagnet(m.client, magnet)
 	if err != nil {
 		return nil, "", err
@@ -591,9 +616,9 @@ func (m *manager) acquireTorrent(magnet string) (*torrent.Torrent, string, error
 }
 
 func (m *manager) releaseTorrentUse(hash string, dropWhenIdle bool) {
-	m.mu.Lock()
+	m.torrentMu.Lock()
 	m.releaseTorrentUseLocked(hash, dropWhenIdle)
-	m.mu.Unlock()
+	m.torrentMu.Unlock()
 }
 
 func (m *manager) releaseTorrentUseLocked(hash string, dropWhenIdle bool) {

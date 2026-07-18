@@ -20,10 +20,8 @@ import (
 const (
 	videoSegmentPrefix     = "chunk_"
 	directSegmentPrefix    = "direct_"
-	seekSegmentPrefix      = "seek_"
 	subtitleSegmentPrefix  = "subs_"
 	segmentNumberWidth     = 6
-	maxDirectPreroll       = 30 * time.Second
 	generationPollInterval = 100 * time.Millisecond
 )
 
@@ -36,16 +34,16 @@ func UsesTextSubtitles(info domain.MediaInfo, selection StreamSelection) bool {
 
 func validateSelection(info domain.MediaInfo, selection StreamSelection) error {
 	if selection.AudioTrackIndex < -1 {
-		return fmt.Errorf("invalid audio track index: %d", selection.AudioTrackIndex)
+		return fmt.Errorf("%w: invalid audio track index: %d", domain.ErrBadHlsRequest, selection.AudioTrackIndex)
 	}
 	if len(info.AudioTracks) > 0 && selection.AudioTrackIndex >= len(info.AudioTracks) {
-		return fmt.Errorf("audio track index %d out of range (tracks: %d)", selection.AudioTrackIndex, len(info.AudioTracks))
+		return fmt.Errorf("%w: audio track index %d out of range (tracks: %d)", domain.ErrBadHlsRequest, selection.AudioTrackIndex, len(info.AudioTracks))
 	}
 	if len(info.AudioTracks) == 0 && selection.AudioTrackIndex > 0 {
-		return fmt.Errorf("audio track index %d out of range (no audio tracks)", selection.AudioTrackIndex)
+		return fmt.Errorf("%w: audio track index %d out of range (no audio tracks)", domain.ErrBadHlsRequest, selection.AudioTrackIndex)
 	}
 	if selection.SubtitleTrackIndex < -1 || selection.SubtitleTrackIndex >= len(info.Subtitles) {
-		return fmt.Errorf("subtitle track index %d out of range (tracks: %d)", selection.SubtitleTrackIndex, len(info.Subtitles))
+		return fmt.Errorf("%w: subtitle track index %d out of range (tracks: %d)", domain.ErrBadHlsRequest, selection.SubtitleTrackIndex, len(info.Subtitles))
 	}
 	return nil
 }
@@ -69,26 +67,19 @@ func PrepareOnDemandHLS(
 		return err
 	}
 
-	video := ""
+	videoTarget := 2 * segmentDuration
+	fmp4 := false
 	if CanRemuxHLS(info, selection) {
-		video = buildSparseMediaPlaylist(info.Duration, seconds, windowSegments, assetVersion, UsesFMP4(info, selection), nil)
-	} else if info.Duration > 0 {
-		video = buildOnDemandMediaPlaylist(info.Duration, seconds, windowSegments, videoSegmentPrefix, ".ts", assetVersion)
-	} else {
-		video = buildProgressiveMediaPlaylist(seconds, windowSegments, videoSegmentPrefix, ".ts", assetVersion, 0, 0, false)
+		fmp4 = UsesFMP4(info, selection)
 	}
+	video := buildMaterializedPlaylist(videoTarget, assetVersion, fmp4, 0, 0, 0, false, nil)
 	if err := writeFileAtomic(videoPlaylist, []byte(video), 0644); err != nil {
 		return err
 	}
 
 	withSubtitles := UsesTextSubtitles(info, selection)
 	if withSubtitles {
-		subtitles := ""
-		if info.Duration > 0 {
-			subtitles = buildOnDemandMediaPlaylist(info.Duration, seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion)
-		} else {
-			subtitles = buildProgressiveMediaPlaylist(seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion, 0, 0, false)
-		}
+		subtitles := buildProgressiveMediaPlaylist(seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion, 0, 0, false)
 		if err := writeFileAtomic(subtitlePlaylist, []byte(subtitles), 0644); err != nil {
 			return err
 		}
@@ -98,13 +89,12 @@ func PrepareOnDemandHLS(
 	if withSubtitles {
 		language = info.Subtitles[selection.SubtitleTrackIndex].Language
 	}
-	master := buildMasterPlaylist(filepath.Base(videoPlaylist), filepath.Base(subtitlePlaylist), withSubtitles, language, assetVersion, info, selection)
+	master := buildMasterPlaylist(filepath.Base(videoPlaylist), filepath.Base(subtitlePlaylist), withSubtitles, language, assetVersion, info, selection, segmentDuration)
 	return writeFileAtomic(masterPlaylist, []byte(master), 0644)
 }
 
-func UpdateProgressiveHLS(
-	videoPlaylist, subtitlePlaylist string,
-	withSubtitles bool,
+func UpdateProgressiveSubtitleHLS(
+	subtitlePlaylist string,
 	segmentDuration time.Duration,
 	windowSegments int,
 	assetVersion string,
@@ -114,71 +104,26 @@ func UpdateProgressiveHLS(
 ) error {
 	seconds := segmentDuration.Seconds()
 	if seconds <= 0 || segmentCount < 0 {
-		return fmt.Errorf("invalid progressive HLS state")
+		return fmt.Errorf("invalid progressive subtitle HLS state")
 	}
-	video := buildProgressiveMediaPlaylist(seconds, windowSegments, videoSegmentPrefix, ".ts", assetVersion, segmentCount, lastDuration, ended)
-	if err := writeFileAtomic(videoPlaylist, []byte(video), 0644); err != nil {
-		return err
-	}
-	if withSubtitles {
-		subtitles := buildProgressiveMediaPlaylist(seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion, segmentCount, lastDuration, ended)
-		if err := writeFileAtomic(subtitlePlaylist, []byte(subtitles), 0644); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func UpdateOnDemandHLS(
-	videoPlaylist, subtitlePlaylist string,
-	withSubtitles bool,
-	duration float64,
-	segmentDuration time.Duration,
-	windowSegments int,
-	assetVersion string,
-) error {
-	seconds := segmentDuration.Seconds()
-	if duration < 0 || seconds <= 0 {
-		return fmt.Errorf("invalid on-demand HLS duration")
-	}
-	if err := writeFileAtomic(videoPlaylist, []byte(buildOnDemandMediaPlaylist(duration, seconds, windowSegments, videoSegmentPrefix, ".ts", assetVersion)), 0644); err != nil {
-		return err
-	}
-	if withSubtitles {
-		return writeFileAtomic(subtitlePlaylist, []byte(buildOnDemandMediaPlaylist(duration, seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion)), 0644)
-	}
-	return nil
-}
-
-func buildOnDemandMediaPlaylist(duration, segmentDuration float64, windowSegments int, prefix, suffix, assetVersion string) string {
-	segments := int(math.Ceil(duration / segmentDuration))
-	targetDuration := int(math.Ceil(segmentDuration))
-	var b strings.Builder
-	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:3\n")
-	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration))
-	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
-	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
-	for index := 0; index < segments; index++ {
-		writeWindowDiscontinuity(&b, index, windowSegments)
-		length := math.Min(segmentDuration, duration-float64(index)*segmentDuration)
-		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", length))
-		b.WriteString(versionedAsset(fmt.Sprintf("%s%0*d%s", prefix, segmentNumberWidth, index, suffix), assetVersion) + "\n")
-	}
-	b.WriteString("#EXT-X-ENDLIST\n")
-	return b.String()
+	subtitles := buildProgressiveMediaPlaylist(seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion, segmentCount, lastDuration, ended)
+	return writeFileAtomic(subtitlePlaylist, []byte(subtitles), 0644)
 }
 
 func buildProgressiveMediaPlaylist(segmentDuration float64, windowSegments int, prefix, suffix, assetVersion string, segments int, lastDuration float64, ended bool) string {
+	discontinuityWindow := max(1, windowSegments)
+	first := max(0, segments-max(3, windowSegments))
 	targetDuration := int(math.Ceil(segmentDuration))
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
 	b.WriteString("#EXT-X-VERSION:3\n")
 	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration))
-	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
-	b.WriteString("#EXT-X-PLAYLIST-TYPE:EVENT\n")
-	for index := 0; index < segments; index++ {
-		writeWindowDiscontinuity(&b, index, windowSegments)
+	b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", first))
+	b.WriteString(fmt.Sprintf("#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", first/discontinuityWindow))
+	for index := first; index < segments; index++ {
+		if index > first {
+			writeWindowDiscontinuity(&b, index, discontinuityWindow)
+		}
 		length := segmentDuration
 		if ended && index == segments-1 && lastDuration > 0 {
 			length = lastDuration
@@ -212,100 +157,94 @@ type VideoWindowResult struct {
 }
 
 type HLSFragment struct {
-	Start    float64
-	Duration float64
-	Name     string
-	Init     string
+	Start         float64
+	Duration      float64
+	Name          string
+	Init          string
+	Discontinuity bool
 }
 
 type DirectWindowResult struct {
-	Fragments []HLSFragment
+	Fragments  []HLSFragment
+	ReachedEnd bool
 }
 
 // DirectWindowGenerationDuration is the maximum input span a direct window
 // reads while looking for its closing keyframe.
-func DirectWindowGenerationDuration(segmentCount int, segmentDuration time.Duration) time.Duration {
-	if segmentCount <= 0 || segmentDuration <= 0 {
+func DirectWindowGenerationDuration(segmentCount int, segmentDuration, prerollBudget time.Duration) time.Duration {
+	if segmentCount <= 0 || segmentDuration <= 0 || prerollBudget < 0 {
 		return 0
 	}
-	return time.Duration(segmentCount)*segmentDuration + maxDirectPreroll
+	return time.Duration(segmentCount)*segmentDuration + prerollBudget
 }
 
-func UpdateDirectHLS(videoPlaylist string, info domain.MediaInfo, selection StreamSelection, segmentDuration time.Duration, windowSegments int, assetVersion string, fragments []HLSFragment) error {
-	duration := info.Duration
-	if duration <= 0 || segmentDuration <= 0 || windowSegments <= 0 {
-		return fmt.Errorf("invalid direct HLS timeline")
+// UpdateMaterializedHLS publishes only complete media fragments. The caller
+// owns the bounded tail and its media-sequence value.
+func UpdateMaterializedHLS(
+	videoPlaylist string,
+	targetDuration time.Duration,
+	assetVersion string,
+	fmp4 bool,
+	mediaSequence int,
+	discontinuitySequence int,
+	sourceTarget float64,
+	ended bool,
+	fragments []HLSFragment,
+) error {
+	if targetDuration <= 0 || mediaSequence < 0 || discontinuitySequence < 0 || math.IsNaN(sourceTarget) || math.IsInf(sourceTarget, 0) {
+		return fmt.Errorf("invalid materialized HLS state")
 	}
-	playlist := buildSparseMediaPlaylist(duration, segmentDuration.Seconds(), windowSegments, assetVersion, UsesFMP4(info, selection), fragments)
+	playlist := buildMaterializedPlaylist(
+		targetDuration,
+		assetVersion,
+		fmp4,
+		mediaSequence,
+		discontinuitySequence,
+		sourceTarget,
+		ended,
+		fragments,
+	)
 	return writeFileAtomic(videoPlaylist, []byte(playlist), 0644)
 }
 
-func buildSparseMediaPlaylist(duration, segmentDuration float64, windowSegments int, assetVersion string, fmp4 bool, fragments []HLSFragment) string {
-	windowSegments = max(1, windowSegments)
-	triggerDuration := segmentDuration * float64(windowSegments)
-	timelineEnd := duration
-	prepared := append([]HLSFragment(nil), fragments...)
-	sort.Slice(prepared, func(i, j int) bool {
-		if math.Abs(prepared[i].Start-prepared[j].Start) > 0.001 {
-			return prepared[i].Start < prepared[j].Start
+func buildMaterializedPlaylist(
+	targetDuration time.Duration,
+	assetVersion string,
+	fmp4 bool,
+	mediaSequence int,
+	discontinuitySequence int,
+	sourceTarget float64,
+	ended bool,
+	fragments []HLSFragment,
+) string {
+	fragments = append([]HLSFragment(nil), fragments...)
+	sort.Slice(fragments, func(i, j int) bool {
+		if math.Abs(fragments[i].Start-fragments[j].Start) > 0.001 {
+			return fragments[i].Start < fragments[j].Start
 		}
-		return prepared[i].Duration > prepared[j].Duration
+		return fragments[i].Duration > fragments[j].Duration
 	})
-	for _, fragment := range prepared {
-		timelineEnd = max(timelineEnd, fragment.Start+fragment.Duration)
-	}
-
-	entries := make([]HLSFragment, 0, len(prepared)+int(math.Ceil(timelineEnd/triggerDuration)))
-	appendGap := func(begin, end float64) {
-		for begin < end-0.001 {
-			segment := int(math.Floor((begin + 0.001) / segmentDuration))
-			index := segment / windowSegments * windowSegments
-			next := math.Min(end, float64(index+windowSegments)*segmentDuration)
-			if next <= begin+0.001 {
-				next = math.Min(end, begin+triggerDuration)
-			}
-			entry := HLSFragment{
-				Start:    begin,
-				Duration: next - begin,
-				Name:     fmt.Sprintf("%s%0*d.ts", seekSegmentPrefix, segmentNumberWidth, index),
-			}
-			if fmp4 {
-				entry.Name = fmt.Sprintf("%s%0*d.m4s", seekSegmentPrefix, segmentNumberWidth, index)
-				entry.Init = fmt.Sprintf("init_%s%0*d.mp4", seekSegmentPrefix, segmentNumberWidth, index)
-			}
-			entries = append(entries, entry)
-			begin = next
-		}
-	}
-
-	cursor := 0.0
-	for _, fragment := range prepared {
-		if gap := fragment.Start - cursor; gap > 0.001 && gap <= 0.25 {
-			fragment.Start = cursor
-			fragment.Duration += gap
-		}
-		end := fragment.Start + fragment.Duration
-		if fragment.Duration <= 0.001 || fragment.Name == "" || end <= cursor+0.001 {
+	prepared := fragments[:0]
+	cursor := math.Inf(-1)
+	for _, fragment := range fragments {
+		if fragment.Duration <= 0.001 || fragment.Name == "" {
 			continue
 		}
-		// HLS fragments cannot be cropped. Overlapping windows emit the same
-		// source GOPs, so keeping the first complete copy preserves continuity.
-		if fragment.Start < cursor-0.001 {
-			continue
+		if !math.IsInf(cursor, -1) {
+			if overlap := cursor - fragment.Start; overlap > 0.001 && overlap <= 0.25 {
+				fragment.Start = cursor
+			}
+			if fragment.Start < cursor-0.001 {
+				continue
+			}
 		}
-		if fragment.Start > cursor+0.001 {
-			appendGap(cursor, fragment.Start)
-		}
-		entries = append(entries, fragment)
-		cursor = end
-	}
-	if cursor < timelineEnd-0.001 {
-		appendGap(cursor, timelineEnd)
+		prepared = append(prepared, fragment)
+		cursor = fragment.Start + fragment.Duration
 	}
 
-	targetDuration := int(math.Ceil(triggerDuration))
-	for _, entry := range entries {
-		targetDuration = max(targetDuration, int(math.Ceil(entry.Duration)))
+	targetSeconds := int(math.Ceil(targetDuration.Seconds()))
+	for _, fragment := range prepared {
+		targetSeconds = max(targetSeconds, int(math.Ceil(fragment.Duration)))
 	}
 	var b strings.Builder
 	b.WriteString("#EXTM3U\n")
@@ -315,20 +254,42 @@ func buildSparseMediaPlaylist(duration, segmentDuration float64, windowSegments 
 	} else {
 		b.WriteString("#EXT-X-VERSION:3\n")
 	}
-	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetDuration))
-	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
-	b.WriteString("#EXT-X-PLAYLIST-TYPE:VOD\n")
-	currentInit := ""
-	for _, entry := range entries {
-		if entry.Init != "" && entry.Init != currentInit {
-			b.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", versionedAsset(entry.Init, assetVersion)))
-			currentInit = entry.Init
-		}
-		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", entry.Duration))
-		b.WriteString(versionedAsset(entry.Name, assetVersion) + "\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", targetSeconds))
+	b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", mediaSequence))
+	b.WriteString(fmt.Sprintf("#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discontinuitySequence))
+	if offset, ok := playlistStartOffset(prepared, sourceTarget); ok {
+		b.WriteString(fmt.Sprintf("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", offset))
 	}
-	b.WriteString("#EXT-X-ENDLIST\n")
+	currentInit := ""
+	previousEnd := math.Inf(-1)
+	for _, fragment := range prepared {
+		if !math.IsInf(previousEnd, -1) && (fragment.Discontinuity || fragment.Start > previousEnd+0.25 || fragment.Init != "" && currentInit != "" && fragment.Init != currentInit) {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
+		if fragment.Init != "" && fragment.Init != currentInit {
+			b.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", versionedAsset(fragment.Init, assetVersion)))
+			currentInit = fragment.Init
+		}
+		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", fragment.Duration))
+		b.WriteString(versionedAsset(fragment.Name, assetVersion) + "\n")
+		previousEnd = fragment.Start + fragment.Duration
+	}
+	if ended {
+		b.WriteString("#EXT-X-ENDLIST\n")
+	}
 	return b.String()
+}
+
+func playlistStartOffset(fragments []HLSFragment, sourceTarget float64) (float64, bool) {
+	offset := 0.0
+	for _, fragment := range fragments {
+		end := fragment.Start + fragment.Duration
+		if sourceTarget >= fragment.Start-0.001 && sourceTarget < end-0.001 {
+			return offset + max(0, sourceTarget-fragment.Start), true
+		}
+		offset += fragment.Duration
+	}
+	return 0, false
 }
 
 func GenerateDirectWindow(
@@ -337,25 +298,24 @@ func GenerateDirectWindow(
 	info domain.MediaInfo,
 	selection StreamSelection,
 	firstSegment, segmentCount int,
-	segmentDuration time.Duration,
+	segmentDuration, prerollBudget time.Duration,
 ) (DirectWindowResult, error) {
 	if !CanRemuxHLS(info, selection) {
 		return DirectWindowResult{}, ErrRemuxNeedsTranscode
 	}
-	if firstSegment < 0 || segmentCount <= 0 || segmentDuration <= 0 {
+	if firstSegment < 0 || segmentCount <= 0 || segmentDuration <= 0 || prerollBudget < 0 {
 		return DirectWindowResult{}, fmt.Errorf("invalid direct HLS window")
 	}
 	start := time.Duration(firstSegment) * segmentDuration
 	wantedEnd := start + time.Duration(segmentCount)*segmentDuration
-	if remaining := time.Duration(info.Duration*float64(time.Second)) - start; remaining <= 0 {
-		return DirectWindowResult{}, fmt.Errorf("HLS window is outside media duration")
-	} else if wantedEnd > start+remaining {
-		wantedEnd = start + remaining
+	if info.Duration > 0 {
+		if remaining := time.Duration(info.Duration*float64(time.Second)) - start; remaining <= 0 {
+			return DirectWindowResult{}, fmt.Errorf("HLS window is outside media duration")
+		} else if wantedEnd > start+remaining {
+			wantedEnd = start + remaining
+		}
 	}
-	readDuration := DirectWindowGenerationDuration(segmentCount, segmentDuration)
-	if remaining := time.Duration(info.Duration*float64(time.Second)) - start; readDuration > remaining {
-		readDuration = remaining
-	}
+	readDuration := DirectWindowGenerationDuration(segmentCount, segmentDuration, prerollBudget)
 
 	workDir, err := os.MkdirTemp(outDir, ".remuxing-")
 	if err != nil {
@@ -399,25 +359,34 @@ func GenerateDirectWindow(
 		"-muxdelay", "0",
 		filepath.Join(workDir, "window.m3u8"),
 	)
-	monitorCtx, stopMonitor := context.WithCancel(ctx)
-	stdin, stopFFmpeg := io.Pipe()
-	defer stdin.Close()
-	defer stopFFmpeg.Close()
-	covered := make(chan struct{}, 1)
-	go func() {
-		if waitForDirectCoverage(monitorCtx, workDir, wantedEnd.Seconds(), fmp4) {
-			covered <- struct{}{}
-			_, _ = io.WriteString(stopFFmpeg, "q\n")
-			_ = stopFFmpeg.Close()
-		}
-	}()
-	_, runErr := cli.RunWithStdin(ctx, stdin, "ffmpeg", args...)
-	stopMonitor()
 	wasCovered := false
-	select {
-	case <-covered:
-		wasCovered = true
-	default:
+	var runErr error
+	if info.Duration <= 0 {
+		_, runErr = cli.RunWithStdin(ctx, nil, "ffmpeg", args...)
+	} else {
+		monitorCtx, stopMonitor := context.WithCancel(ctx)
+		stdin, stopFFmpeg, pipeErr := os.Pipe()
+		if pipeErr != nil {
+			stopMonitor()
+			return DirectWindowResult{}, fmt.Errorf("create FFmpeg control pipe: %w", pipeErr)
+		}
+		covered := make(chan struct{}, 1)
+		go func() {
+			if waitForDirectCoverage(monitorCtx, workDir, wantedEnd.Seconds(), fmp4) {
+				covered <- struct{}{}
+				_, _ = io.WriteString(stopFFmpeg, "q\n")
+				_ = stopFFmpeg.Close()
+			}
+		}()
+		_, runErr = cli.RunWithStdin(ctx, stdin, "ffmpeg", args...)
+		_ = stdin.Close()
+		_ = stopFFmpeg.Close()
+		stopMonitor()
+		select {
+		case <-covered:
+			wasCovered = true
+		default:
+		}
 	}
 	if runErr != nil && !wasCovered {
 		if ctx.Err() != nil {
@@ -437,26 +406,44 @@ func GenerateDirectWindow(
 		return DirectWindowResult{}, fmt.Errorf("%w: %v", ErrRemuxNeedsTranscode, err)
 	}
 	startSeconds := start.Seconds()
-	if firstPTS > startSeconds+0.25 || startSeconds-firstPTS > maxDirectPreroll.Seconds()+0.25 {
+	if firstPTS > startSeconds+0.25 || startSeconds-firstPTS > prerollBudget.Seconds()+0.25 {
 		return DirectWindowResult{}, fmt.Errorf("%w: nearest keyframe is %.3fs from target", ErrRemuxNeedsTranscode, startSeconds-firstPTS)
 	}
 
 	wantedEndSeconds := wantedEnd.Seconds()
+	totalEnd := firstPTS
+	for _, duration := range durations {
+		totalEnd += duration
+	}
+	reachedFinalWindowEnd := totalEnd >= info.Duration-0.25 &&
+		info.Duration-wantedEndSeconds <= segmentDuration.Seconds()+0.25
+	reachedKnownEnd := info.Duration > 0 && (wantedEndSeconds >= info.Duration-0.25 ||
+		reachedFinalWindowEnd || totalEnd < wantedEndSeconds-0.25)
+	reachedUnknownEnd := info.Duration <= 0 && runErr == nil && !wasCovered &&
+		totalEnd < (start+readDuration).Seconds()-0.25
+	reachedEnd := reachedKnownEnd || reachedUnknownEnd
 	cursor := firstPTS
 	last := -1
-	for index, duration := range durations {
-		cursor += duration
-		complete := index+1 < len(durations) || wasCovered || cursor >= info.Duration-0.25
-		if complete && cursor >= wantedEndSeconds-0.05 {
-			last = index
-			break
+	if reachedEnd {
+		last = len(durations) - 1
+	} else {
+		for index, duration := range durations {
+			cursor += duration
+			complete := index+1 < len(durations) || wasCovered || info.Duration > 0 && cursor >= info.Duration-0.25
+			if complete && cursor >= wantedEndSeconds-0.05 {
+				last = index
+				break
+			}
 		}
 	}
 	if last < 0 {
-		return DirectWindowResult{}, fmt.Errorf("%w: no closing keyframe within %s", ErrRemuxNeedsTranscode, maxDirectPreroll)
+		return DirectWindowResult{}, fmt.Errorf("%w: no closing keyframe within admitted %s preroll", ErrRemuxNeedsTranscode, prerollBudget)
 	}
 
-	result := DirectWindowResult{Fragments: make([]HLSFragment, 0, last+1)}
+	result := DirectWindowResult{
+		Fragments:  make([]HLSFragment, 0, last+1),
+		ReachedEnd: reachedEnd,
+	}
 	initName := ""
 	if fmp4 {
 		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, firstSegment)
@@ -833,21 +820,15 @@ func formatSeconds(value float64) string {
 	return strconv.FormatFloat(value, 'f', 3, 64)
 }
 
-func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVersion string, info domain.MediaInfo, selection StreamSelection) string {
+func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVersion string, info domain.MediaInfo, selection StreamSelection, segmentDuration time.Duration) string {
 	bandwidth := max(info.Bitrate, int64(5_500_000))
 	if !CanRemuxHLS(info, selection) {
-		bandwidth = compatibilityHLSBitrate(info)
-		if selectedAudioIndex(info, selection) >= 0 && bandwidth <= math.MaxInt64-128_000 {
-			bandwidth += 128_000
-		}
+		bandwidth = compatibilityHLSBandwidth(info, selection, segmentDuration)
 	}
 	streamAttributes := []string{fmt.Sprintf("BANDWIDTH=%d", bandwidth)}
 	if CanRemuxHLS(info, selection) {
 		codec := info.VideoCodecString
-		if codec == "" {
-			codec = videoCodecString(info.VideoCodec, info.VideoProfile, info.VideoLevel, info.BitDepth)
-		}
-		if selectedAudioIndex(info, selection) >= 0 {
+		if codec != "" && selectedAudioIndex(info, selection) >= 0 {
 			codec += ",mp4a.40.2"
 		}
 		if codec != "" {

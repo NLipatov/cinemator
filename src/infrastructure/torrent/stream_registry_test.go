@@ -95,6 +95,55 @@ func TestTorrentDropIntentWaitsForPendingUser(t *testing.T) {
 	}
 }
 
+func TestUnregisterDoesNotHoldManagerLockWhileTorrentReleaseWaits(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
+	stream := &streamInfo{cleanupDone: make(chan struct{})}
+	manager := &manager{
+		active:      map[streamKey]*streamInfo{key: stream},
+		torrentUses: map[string]*torrentUse{key.InfoHash: {refs: 1}},
+	}
+
+	manager.torrentMu.Lock()
+	torrentLocked := true
+	defer func() {
+		if torrentLocked {
+			manager.torrentMu.Unlock()
+		}
+	}()
+	finished := make(chan struct{})
+	go func() {
+		manager.unregisterCleanedStream(key, stream)
+		close(finished)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		manager.mu.Lock()
+		_, registered := manager.active[key]
+		manager.mu.Unlock()
+		if !registered {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stream registry remained locked behind torrent release")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-finished:
+		t.Fatal("torrent release bypassed its lifecycle lock")
+	default:
+	}
+
+	manager.torrentMu.Unlock()
+	torrentLocked = false
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("unregister did not finish after torrent release resumed")
+	}
+}
+
 func TestMetadataOnlyTorrentUseRemainsReusable(t *testing.T) {
 	const hash = "hash"
 	manager := &manager{torrentUses: map[string]*torrentUse{
@@ -115,9 +164,9 @@ func TestMetadataOnlyTorrentUsesAreBounded(t *testing.T) {
 	}
 	manager := &manager{torrentUses: uses}
 
-	manager.mu.Lock()
+	manager.torrentMu.Lock()
 	manager.trimIdleTorrentUsesLocked()
-	manager.mu.Unlock()
+	manager.torrentMu.Unlock()
 
 	if len(manager.torrentUses) != 16 {
 		t.Fatalf("idle torrent uses = %d, want 16", len(manager.torrentUses))

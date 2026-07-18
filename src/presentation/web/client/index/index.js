@@ -106,6 +106,9 @@
     let currentMediaInfo = null;
     let currentPlaybackMode = '';
     let currentPlaybackDecision = '';
+    let presentationSourceStart = 0;
+    let presentationMediaAnchor = null;
+    let sourceSeekDragging = false;
     let playbackUsesPassthrough = false;
     let forceTranscodePlayback = false;
     let nativePassthroughRetries = 0;
@@ -113,6 +116,7 @@
     let hlsStatusTimer = null;
     let hlsStatusController = null;
     let hlsStatusSeq = 0;
+    let hlsStatusTarget = null;
     const idleRecoveryMs = 12 * 60 * 1000;
     const recoveryThrottleMs = 5000;
     const stallRecoveryDelayMs = 3500;
@@ -151,6 +155,7 @@
       if (hls) { hls.destroy(); hls = null; }
       stopHlsStatusPolling();
       activeStreamDir = null;
+      presentationMediaAnchor = null;
       const mediaDialog = $('mediaInfoDialog');
       if (mediaDialog?.open) mediaDialog.close();
       if (playbackRecoveryTimer) {
@@ -216,6 +221,7 @@
 
     function stopHlsStatusPolling() {
       hlsStatusSeq++;
+      hlsStatusTarget = null;
       if (hlsStatusTimer) {
         clearTimeout(hlsStatusTimer);
         hlsStatusTimer = null;
@@ -245,7 +251,41 @@
         : `${minutes}:${String(rest).padStart(2, '0')}`;
     }
 
+    function currentSourceTime(video = $('video')) {
+      if (!video || !Number.isFinite(presentationMediaAnchor)) return presentationSourceStart;
+      const local = Number.isFinite(video.currentTime) ? video.currentTime : presentationMediaAnchor;
+      return Math.max(0, presentationSourceStart + local - presentationMediaAnchor);
+    }
+
+    function updateSourceTimeline(value = currentSourceTime()) {
+      const duration = Number(currentMediaInfo?.duration);
+      const timeline = $('sourceTimeline');
+      const seek = $('sourceSeek');
+      if (!timeline || !seek || !Number.isFinite(duration) || duration <= 0) {
+        if (timeline) timeline.hidden = true;
+        return;
+      }
+      timeline.hidden = false;
+      seek.max = String(duration);
+      const position = Math.min(duration, Math.max(0, Number(value) || 0));
+      if (!sourceSeekDragging) seek.value = String(position);
+      const shown = sourceSeekDragging ? Number(seek.value) : position;
+      $('sourceTime').textContent = `${formatPlaybackTime(shown)} / ${formatPlaybackTime(duration)}`;
+    }
+
+    function anchorPresentation(video) {
+      if (!Number.isFinite(presentationMediaAnchor) && Number.isFinite(video?.currentTime)) {
+        presentationMediaAnchor = video.currentTime;
+      }
+      updateSourceTimeline();
+    }
+
     function renderHlsStatus(status, fallbackTarget) {
+      if (Number(status.duration) > 0 && currentMediaInfo && !(Number(currentMediaInfo.duration) > 0)) {
+        currentMediaInfo.duration = Number(status.duration);
+        currentMediaSeekable = true;
+        updateSourceTimeline();
+      }
       if (status.mode && status.mode !== currentPlaybackMode) {
         if (status.mode === 'transcode' && playbackUsesPassthrough) {
           playbackUsesPassthrough = false;
@@ -320,9 +360,12 @@
       );
     }
 
-    function beginHlsStatusPolling(targetSeconds) {
+    function beginHlsStatusPolling(targetSeconds, replace = false) {
       if (!activeStreamDir) return;
+      targetSeconds = Number.isFinite(targetSeconds) ? Math.max(0, targetSeconds) : 0;
+      if (hlsStatusTarget !== null && (!replace || Math.abs(hlsStatusTarget - targetSeconds) < 1)) return;
       stopHlsStatusPolling();
+      hlsStatusTarget = targetSeconds;
       const seq = hlsStatusSeq;
       showWarning(
         `Preparing ${formatPlaybackTime(targetSeconds)}`,
@@ -469,6 +512,8 @@
     function setMediaInfo(info = null) {
       currentMediaInfo = info;
       currentMediaSeekable = info?.seekable === true;
+      presentationSourceStart = 0;
+      presentationMediaAnchor = null;
       currentPlaybackMode = '';
       currentPlaybackDecision = '';
       playbackUsesPassthrough = false;
@@ -476,6 +521,7 @@
       nativePassthroughRetries = 0;
       playbackNotice = '';
       renderMediaInfo();
+      updateSourceTimeline(presentationSourceStart);
     }
 
     function useCompatibilityFallback(reason) {
@@ -492,9 +538,6 @@
       }
       if (info.dolbyVision) {
         return { supported: false, reason: 'Dolby Vision passthrough is not yet safely detectable in browsers.' };
-      }
-      if (!info.seekable) {
-        return { supported: false, reason: 'The source has no stable duration, so playback uses progressive transcoding.' };
       }
       if (info.interlaced || info.rotated) {
         return { supported: false, reason: 'The source requires a video transform before playback.' };
@@ -522,6 +565,9 @@
       const nativeHls = Boolean(video.canPlayType('application/vnd.apple.mpegurl'));
       if (!hlsJs && !nativeHls) {
         return { supported: false, reason: 'This browser has no HLS playback path.' };
+      }
+      if (!hlsJs) {
+        return { supported: false, reason: 'Native HLS decoder support cannot be verified precisely, so this browser uses the compatibility fallback.' };
       }
       if (info.hdr && window.matchMedia && !window.matchMedia('(dynamic-range: high)').matches) {
         return { supported: false, reason: 'The current display path does not report HDR output support.' };
@@ -886,6 +932,7 @@
     window.addEventListener('beforeunload', () => {
       if (downloadEvents) downloadEvents.close();
     });
+    loadDownloads({ quiet: true, suppressError: true });
     startDownloadEvents();
 
     $('form').onsubmit = async e => {
@@ -1045,6 +1092,9 @@
       }
       try {
         const start = currentMediaSeekable && Number.isFinite(resumeTime) && resumeTime > 0 ? resumeTime : 0;
+        presentationSourceStart = start;
+        presentationMediaAnchor = null;
+        updateSourceTimeline(start);
         const capability = await sourcePlaybackCapability(currentMediaInfo);
         if (isStale(requestId)) return;
         const forceTranscode = forceTranscodePlayback || !capability.supported;
@@ -1071,7 +1121,7 @@
         beginHlsStatusPolling(start);
         const segmentSeconds = Number(prepared.segmentDurationSeconds) || 6;
         const windowSegments = Number(prepared.windowSegments) || 5;
-        playHls(m3u8, subtitleSelected, start, { segmentSeconds, windowSegments });
+        playHls(m3u8, subtitleSelected, { segmentSeconds, windowSegments });
       } catch (e) {
         if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
@@ -1101,7 +1151,7 @@
         nativePassthroughRetries = 0;
         renderMediaInfo();
         if ($('player-block').style.display !== 'none') {
-          const t = $('video').currentTime || 0;
+          const t = currentSourceTime();
           startPlayback(t);
         }
       });
@@ -1172,7 +1222,7 @@
         }
         forcedRecoveryAttempts++;
       }
-      const resumeTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+      const resumeTime = currentSourceTime(video);
       startPlayback(resumeTime, { keepPlayerVisible: true }).finally(() => {
         playbackRecoveryInFlight = false;
       });
@@ -1198,20 +1248,24 @@
 
     function attachPlaybackRecovery(video) {
       video.addEventListener('play', () => requestPlaybackRecovery('play'));
-      video.addEventListener('seeking', () => beginHlsStatusPolling(video.currentTime));
+      video.addEventListener('playing', () => anchorPresentation(video));
+      video.addEventListener('timeupdate', () => {
+        if (Number.isFinite(presentationMediaAnchor)) updateSourceTimeline();
+      });
+      video.addEventListener('seeking', () => beginHlsStatusPolling(currentSourceTime(video), true));
       video.addEventListener('seeked', () => {
         if (video.readyState >= 3) {
           removeWarning();
         } else {
-          beginHlsStatusPolling(video.currentTime);
+          beginHlsStatusPolling(currentSourceTime(video));
         }
       });
       video.addEventListener('waiting', () => {
-        beginHlsStatusPolling(video.currentTime);
+        beginHlsStatusPolling(currentSourceTime(video));
         schedulePlaybackRecovery('waiting');
       });
       video.addEventListener('stalled', () => {
-        beginHlsStatusPolling(video.currentTime);
+        beginHlsStatusPolling(currentSourceTime(video));
         schedulePlaybackRecovery('stalled');
       });
       video.addEventListener('error', () => {
@@ -1244,7 +1298,7 @@
       };
     }
 
-    function playHls(src, enableSubtitles, resumeTime = 0, streamConfig = {}) {
+    function playHls(src, enableSubtitles, streamConfig = {}) {
       const video = $('video');
       video.style.opacity = 0;
       setTimeout(() => { video.style.opacity = 1; }, 120);
@@ -1258,9 +1312,6 @@
 
       let mainFragBuffered = false;
       let subtitleFragLoaded = !enableSubtitles;
-      let playlistReloadPosition = null;
-      let playlistReloading = false;
-      let playlistReloadAttempts = 0;
       function currentPositionBuffered() {
         const position = video.currentTime;
         for (let index = 0; index < video.buffered.length; index++) {
@@ -1270,11 +1321,11 @@
         }
         return false;
       }
-      function fragmentCoversCurrentPosition(fragment) {
+      function fragmentCoversPosition(fragment, position) {
         const start = Number(fragment?.start);
         const duration = Number(fragment?.duration);
         if (!Number.isFinite(start) || !Number.isFinite(duration)) return false;
-        return video.currentTime >= start - 0.25 && video.currentTime < start + duration + 0.25;
+        return position >= start - 0.25 && position < start + duration + 0.25;
       }
       function hideWarningOnce() {
         if (mainFragBuffered && subtitleFragLoaded) {
@@ -1287,7 +1338,6 @@
         nativePassthroughRetries = 0;
         lastStreamActivityAt = Date.now();
         forcedRecoveryAttempts = 0;
-        playlistReloadAttempts = 0;
         showPlaybackNotice();
         hideWarningOnce();
       }
@@ -1305,7 +1355,7 @@
         const windowSegments = Math.max(1, Number(streamConfig.windowSegments) || 5);
         const forwardBuffer = segmentSeconds * Math.min(windowSegments, 2);
         hls = new Hls({
-          startPosition: resumeTime,
+          startPosition: -1,
           maxBufferLength: forwardBuffer,
           maxMaxBufferLength: forwardBuffer,
           backBufferLength: segmentSeconds * 2,
@@ -1333,12 +1383,6 @@
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
           lastStreamActivityAt = Date.now();
-          const target = playlistReloadPosition;
-          playlistReloadPosition = null;
-          playlistReloading = false;
-          if (target !== null && target > 0) {
-            video.currentTime = target;
-          }
           if (enableSubtitles && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
             hls.subtitleTrack = 0;
             hls.subtitleDisplay = true;
@@ -1360,7 +1404,7 @@
           if (!data?.frag || data.frag.type === 'main') {
             markPlaybackProgress();
           } else {
-            if (data.frag.type === 'subtitle' && fragmentCoversCurrentPosition(data.frag)) {
+            if (data.frag.type === 'subtitle' && fragmentCoversPosition(data.frag, video.currentTime)) {
               subtitleFragLoaded = true;
               hideWarningOnce();
             }
@@ -1375,23 +1419,13 @@
         hls.on(Hls.Events.ERROR, (evt, data) => {
           if (enableSubtitles && data?.frag?.type === 'subtitle') {
             showMsg('playerMsg', `Subtitle error: ${data.details || 'could not load subtitles'}`, true);
-            beginHlsStatusPolling(video.currentTime);
+            beginHlsStatusPolling(currentSourceTime(video));
             return;
           }
           const responseCode = Number(data?.response?.code || data?.response?.status || 0);
           if (responseCode === 409) {
-            if (!playlistReloading) {
-              playlistReloadAttempts++;
-              if (playlistReloadAttempts > 5) {
-                showPlaybackError('The refreshed playlist still points to an unprepared media window');
-                return;
-              }
-              playlistReloading = true;
-              playlistReloadPosition = video.currentTime;
-              const nextSource = new URL(src, window.location.href);
-              nextSource.searchParams.set('reload', String(Date.now()));
-              hls.loadSource(nextSource.href);
-            }
+            if (requestPlaybackRecovery('playlist-changed', true)) return;
+            showPlaybackError('The stream presentation changed before the player loaded it');
             return;
           }
           const levelEmpty = data.details === 'levelEmptyError' ||
@@ -1410,9 +1444,6 @@
         });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
-        video.addEventListener('loadedmetadata', () => {
-          video.currentTime = resumeTime;
-        }, { once: true });
         video.addEventListener('canplay', markStreamActive, { once: true });
         video.addEventListener('playing', markStreamActive);
         video.addEventListener('progress', markPlaybackProgress);
@@ -1464,4 +1495,22 @@
     }
     if (mediaInfoClose && mediaInfoDialog) {
       mediaInfoClose.onclick = () => mediaInfoDialog.close();
+    }
+
+    const sourceSeek = $('sourceSeek');
+    if (sourceSeek) {
+      sourceSeek.addEventListener('input', () => {
+        sourceSeekDragging = true;
+        updateSourceTimeline(Number(sourceSeek.value));
+      });
+      sourceSeek.addEventListener('change', () => {
+        const target = Number(sourceSeek.value);
+        sourceSeekDragging = false;
+        updateSourceTimeline(target);
+        if (Number.isFinite(target)) startPlayback(target, { keepPlayerVisible: true });
+      });
+      sourceSeek.addEventListener('blur', () => {
+        sourceSeekDragging = false;
+        updateSourceTimeline();
+      });
     }

@@ -6,9 +6,15 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 )
 
-const minimumHLSBitrate = int64(5_500_000)
+const (
+	minimumHLSBitrate         = int64(5_500_000)
+	compatibilityAudioBitrate = int64(128_000)
+	compatibilityMuxHeadroom  = 1.25
+	compatibilityVBVBuffer    = 2 * time.Second
+)
 
 // StreamSelection specifies which audio/subtitle tracks to include.
 type StreamSelection struct {
@@ -17,11 +23,11 @@ type StreamSelection struct {
 	ForceTranscode     bool
 }
 
-// CanRemuxHLS reports whether the selected video can be sent to browsers
-// unchanged. Unknown-duration inputs keep the progressive transcoding path
-// because they cannot expose a stable sparse VOD timeline.
+// CanRemuxHLS reports whether the selected representation can be packaged for
+// browsers without changing its video samples. Timeline discovery is a
+// separate concern: unknown-duration inputs use progressive remuxing.
 func CanRemuxHLS(info domain.MediaInfo, sel StreamSelection) bool {
-	if sel.ForceTranscode || info.Duration <= 0 || info.Deinterlace || info.Rotated || info.DolbyVision {
+	if sel.ForceTranscode || info.Deinterlace || info.Rotated || info.DolbyVision {
 		return false
 	}
 	if sel.SubtitleTrackIndex >= 0 &&
@@ -113,6 +119,24 @@ func HLSReservationBitrate(info domain.MediaInfo, sel StreamSelection) int64 {
 
 func compatibilityHLSBitrate(info domain.MediaInfo) int64 {
 	return hlsPeakBitrate(info, 0.125)
+}
+
+// compatibilityHLSBandwidth bounds the aggregate bits that can land in one
+// segment: video maxrate, AAC, a full VBV burst and conservative mux overhead.
+func compatibilityHLSBandwidth(info domain.MediaInfo, sel StreamSelection, segmentDuration time.Duration) int64 {
+	if segmentDuration <= 0 {
+		return math.MaxInt64
+	}
+	video := compatibilityHLSBitrate(info)
+	audio := int64(0)
+	if selectedAudioIndex(info, sel) >= 0 {
+		audio = compatibilityAudioBitrate
+	}
+	bandwidth := (float64(video) + float64(audio) + float64(video)*compatibilityVBVBuffer.Seconds()/segmentDuration.Seconds()) * compatibilityMuxHeadroom
+	if math.IsInf(bandwidth, 0) || bandwidth >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	return int64(math.Ceil(bandwidth))
 }
 
 func hlsPeakBitrate(info domain.MediaInfo, bitsPerPixel float64) int64 {
@@ -216,8 +240,10 @@ func buildStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 	}
 
 	// Audio is encoded as well so its timestamps begin at the same exact boundary.
+	// Preserve the selected layout: silently folding surround tracks to stereo is
+	// a quality change, not a compatibility default.
 	if hasAudio {
-		args = append(args, "-c:a", "aac", "-b:a", "128k", "-ac", "2")
+		args = append(args, "-c:a", "aac", "-b:a", strconv.FormatInt(compatibilityAudioBitrate, 10))
 	}
 
 	return args
@@ -238,7 +264,7 @@ func buildRemuxStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 	if CopiesAudio(info, sel) {
 		return append(args, "-c:a", "copy")
 	}
-	return append(args, "-c:a", "aac", "-b:a", "128k", "-ac", "2")
+	return append(args, "-c:a", "aac", "-b:a", "128k")
 }
 
 func selectedAudioIndex(info domain.MediaInfo, sel StreamSelection) int {

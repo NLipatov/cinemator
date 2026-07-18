@@ -158,6 +158,24 @@ func TestParseProbeOutputBuildsAV1CapabilityString(t *testing.T) {
 	}
 }
 
+func TestParsedTenBitHEVCAndAV1RemainRemuxable(t *testing.T) {
+	for _, codec := range []string{"hevc", "av1"} {
+		t.Run(codec, func(t *testing.T) {
+			out := []byte(`{
+				"streams":[{"codec_type":"video","codec_name":"` + codec + `","profile":"Main","pix_fmt":"yuv420p10le"}],
+				"format":{"duration":"10"}
+			}`)
+			info, err := parseProbeOutput(out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.NeedFilter || !CanRemuxHLS(info, StreamSelection{}) {
+				t.Fatalf("parsed 10-bit %s unexpectedly requires a video filter: %+v", codec, info)
+			}
+		})
+	}
+}
+
 func TestParseTailDurationUsesLastPacketAndFormatStart(t *testing.T) {
 	out := []byte(`#format: frame checksums
 #tb 0: 1/1000

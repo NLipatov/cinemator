@@ -253,9 +253,7 @@ func parseProbeOutput(out []byte) (domain.MediaInfo, error) {
 			if streamDuration > info.Duration {
 				info.Duration = streamDuration
 			}
-			if s.PixFmt != "yuv420p" && s.PixFmt != "" {
-				info.NeedFilter = true
-			}
+			info.NeedFilter = s.PixFmt != "" && !copyablePixelFormat(info)
 			for _, sideData := range s.SideData {
 				typeName := strings.ToLower(sideData.Type)
 				if strings.Contains(typeName, "dovi") {

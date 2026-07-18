@@ -3,7 +3,6 @@ package ffmpeg
 import (
 	"cinemator/domain"
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -84,7 +83,7 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 			AudioTracks: []domain.AudioTrack{{Codec: "aac"}},
 		},
 		StreamSelection{AudioTrackIndex: 0},
-		1, 1, 6*time.Second,
+		1, 1, 6*time.Second, 30*time.Second,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -99,6 +98,25 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 	)
 	if !strings.Contains(string(directProbe), "h264") {
 		t.Fatalf("direct codec = %q, want h264", directProbe)
+	}
+	unknownDirectDir := filepath.Join(dir, "unknown-direct")
+	if err := os.MkdirAll(unknownDirectDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	unknownDirect, err := GenerateDirectWindow(
+		context.Background(), source, unknownDirectDir,
+		domain.MediaInfo{
+			VideoCodec: "h264", PixelFormat: "yuv420p",
+			AudioTracks: []domain.AudioTrack{{Codec: "aac"}},
+		},
+		StreamSelection{AudioTrackIndex: 0},
+		0, 5, 6*time.Second, 30*time.Second,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !unknownDirect.ReachedEnd || len(unknownDirect.Fragments) == 0 {
+		t.Fatalf("unknown-duration direct result = %+v", unknownDirect)
 	}
 	hybridSource := filepath.Join(dir, "source-ac3.mkv")
 	runMediaCommand(t, "ffmpeg",
@@ -119,7 +137,7 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 			AudioTracks: []domain.AudioTrack{{Codec: "ac3"}},
 		},
 		StreamSelection{AudioTrackIndex: 0},
-		0, 1, 6*time.Second,
+		0, 1, 6*time.Second, 30*time.Second,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -231,7 +249,7 @@ func TestGenerateDirectWindowCoalescesFrequentKeyframes(t *testing.T) {
 		context.Background(), source, dir,
 		domain.MediaInfo{Duration: 4, VideoCodec: "h264", Width: 160, Height: 90},
 		StreamSelection{SubtitleTrackIndex: -1},
-		0, 2, 2*time.Second,
+		0, 2, 2*time.Second, 30*time.Second,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -288,7 +306,7 @@ func TestGenerateDirectWindowPreservesFMP4Video(t *testing.T) {
 					HDR:          true,
 				},
 				StreamSelection{SubtitleTrackIndex: -1},
-				0, 1, 2*time.Second,
+				0, 1, 2*time.Second, 30*time.Second,
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -341,7 +359,7 @@ func TestAnalyzeTailDurationBeyondSeekWindow(t *testing.T) {
 		context.Background(), source, outDir,
 		domain.MediaInfo{Duration: 40, VideoCodec: "h264", Width: 64, Height: 64},
 		StreamSelection{SubtitleTrackIndex: -1},
-		2, 1, 6*time.Second,
+		2, 1, 6*time.Second, 30*time.Second,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -357,14 +375,17 @@ func TestAnalyzeTailDurationBeyondSeekWindow(t *testing.T) {
 		"-c:v", "libx264", "-preset", "ultrafast", "-g", "100", "-keyint_min", "100", "-sc_threshold", "0",
 		"-pix_fmt", "yuv420p", longGOP,
 	)
-	_, err = GenerateDirectWindow(
+	tail, err := GenerateDirectWindow(
 		context.Background(), longGOP, t.TempDir(),
 		domain.MediaInfo{Duration: 40, VideoCodec: "h264", Width: 64, Height: 64},
 		StreamSelection{SubtitleTrackIndex: -1},
-		6, 1, 6*time.Second,
+		5, 1, 6*time.Second, 40*time.Second,
 	)
-	if !errors.Is(err, ErrRemuxNeedsTranscode) {
-		t.Fatalf("long-GOP direct window error = %v, want transcode fallback", err)
+	if err != nil {
+		t.Fatalf("final long-GOP window fell back to transcoding: %v", err)
+	}
+	if !tail.ReachedEnd || len(tail.Fragments) == 0 {
+		t.Fatalf("final long-GOP window = %+v, want a finalized direct tail", tail)
 	}
 }
 

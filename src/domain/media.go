@@ -5,7 +5,13 @@ import (
 	"time"
 )
 
-var ErrHlsPlaylistChanged = errors.New("HLS playlist changed")
+var (
+	ErrBadHlsRequest             = errors.New("bad HLS request")
+	ErrHlsStreamNotFound         = errors.New("HLS stream not found")
+	ErrHlsAssetUnsupported       = errors.New("unsupported HLS asset")
+	ErrHlsTemporarilyUnavailable = errors.New("HLS stream temporarily unavailable")
+	ErrHlsPlaylistChanged        = errors.New("HLS playlist changed")
+)
 
 type AudioTrack struct {
 	Index      int    `json:"index"`

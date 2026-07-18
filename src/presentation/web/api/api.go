@@ -297,7 +297,7 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 
 	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack, startSeconds, forceTranscode)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), hlsErrorStatus(err))
 		return
 	}
 	streamDir := filepath.Base(filepath.Dir(playlist))
@@ -343,7 +343,7 @@ func (s *HttpServer) handleGetHlsStatus(w http.ResponseWriter, r *http.Request) 
 	}
 	status, err := s.mgr.GetHlsStatus(r.Context(), streamDir, targetSeconds)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		http.Error(w, err.Error(), hlsErrorStatus(err))
 		return
 	}
 	writeJSON(w, status)
@@ -403,6 +403,25 @@ func downloadErrorStatus(err error) int {
 	return http.StatusInternalServerError
 }
 
+func hlsErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, domain.ErrBadHlsRequest):
+		return http.StatusBadRequest
+	case errors.Is(err, domain.ErrHlsStreamNotFound), errors.Is(err, os.ErrNotExist):
+		return http.StatusNotFound
+	case errors.Is(err, domain.ErrHlsAssetUnsupported):
+		return http.StatusUnsupportedMediaType
+	case errors.Is(err, domain.ErrHlsPlaylistChanged):
+		return http.StatusConflict
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout
+	case errors.Is(err, domain.ErrHlsTemporarilyUnavailable):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 	const waitTimeout = 10 * time.Minute
 	clean := path.Clean("/" + r.URL.Path)
@@ -431,19 +450,18 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 			path.Base(clean) != "master.m3u8",
 		)
 		if err != nil {
-			if errors.Is(err, domain.ErrHlsPlaylistChanged) {
-				http.Error(w, "playlist changed", http.StatusConflict)
-				return
-			}
 			if !errors.Is(err, context.Canceled) {
 				log.Printf("prepare HLS playlist %s: %v", clean, err)
 			}
-			if errors.Is(err, os.ErrNotExist) {
-				http.Error(w, "playlist not found", http.StatusNotFound)
-			} else if errors.Is(err, context.DeadlineExceeded) {
-				http.Error(w, "playlist preparation timed out", http.StatusGatewayTimeout)
+			status := hlsErrorStatus(err)
+			if status == http.StatusConflict {
+				http.Error(w, "playlist changed", status)
+			} else if status == http.StatusNotFound {
+				http.Error(w, "playlist not found", status)
+			} else if status == http.StatusGatewayTimeout {
+				http.Error(w, "playlist preparation timed out", status)
 			} else {
-				http.Error(w, "playlist unavailable", http.StatusServiceUnavailable)
+				http.Error(w, "playlist unavailable", status)
 			}
 			return
 		}
@@ -456,16 +474,19 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	asset, err := s.mgr.OpenHlsAsset(r.Context(), streamDir, assetName, version)
 	if err != nil {
-		if errors.Is(err, domain.ErrHlsPlaylistChanged) {
-			w.Header().Set("Cache-Control", "no-store")
-			http.Error(w, "playlist changed", http.StatusConflict)
-			return
-		}
 		if !errors.Is(err, context.Canceled) {
 			log.Printf("prepare HLS asset %s: %v", clean, err)
 		}
-		w.Header().Set("Retry-After", "1")
-		http.Error(w, "chunk not available", http.StatusServiceUnavailable)
+		status := hlsErrorStatus(err)
+		if status == http.StatusConflict {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "playlist changed", status)
+			return
+		}
+		if status == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "1")
+		}
+		http.Error(w, "chunk not available", status)
 		return
 	}
 	defer asset.Close()
@@ -516,8 +537,7 @@ func (w *idleDeadlineWriter) clearDeadline() {
 
 func readHlsAssetWithWait(ctx context.Context, open func() (application.HlsAsset, error), timeout time.Duration, requireSegment bool) ([]byte, error) {
 	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(120 * time.Millisecond)
-	defer ticker.Stop()
+	delay := 120 * time.Millisecond
 	for {
 		asset, err := open()
 		if errors.Is(err, domain.ErrHlsPlaylistChanged) {
@@ -538,14 +558,21 @@ func readHlsAssetWithWait(ctx context.Context, open func() (application.HlsAsset
 				return nil, closeErr
 			}
 		}
-		if time.Now().After(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return nil, context.DeadlineExceeded
 		}
+		wait := min(delay, remaining)
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return nil, ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 		}
+		delay = min(delay*2, 2*time.Second)
 	}
 }
 

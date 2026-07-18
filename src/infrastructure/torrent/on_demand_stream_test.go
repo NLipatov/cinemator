@@ -17,9 +17,12 @@ func TestStreamStatusTracksRequestedSegmentProgress(t *testing.T) {
 	stream := &streamInfo{
 		mediaInfo:     domain.MediaInfo{Duration: 120, Seekable: true},
 		statusSegment: -1,
+		videoJobs:     make(map[*segmentJob]struct{}),
 	}
 	stream.markPreparing(7, 6*time.Second)
-	stream.recordSourceBytes("", 8192)
+	job := &segmentJob{begin: 5, end: 10, id: "requested"}
+	stream.videoJobs[job] = struct{}{}
+	stream.recordSourceBytes(job.id, 8192)
 
 	stream.mtx.Lock()
 	status := stream.status
@@ -77,42 +80,6 @@ func TestWaitForGeneratedAssetReturnsJobFailure(t *testing.T) {
 	err := waitForGeneratedAsset(context.Background(), filepath.Join(t.TempDir(), "missing.ts"), job)
 	if !errors.Is(err, want) {
 		t.Fatalf("waitForGeneratedAsset() error = %v, want %v", err, want)
-	}
-}
-
-func TestAdvanceProgressivePlaylistPublishesOnlyGeneratedSegments(t *testing.T) {
-	dir := t.TempDir()
-	stream := &streamInfo{
-		mediaInfo: domain.MediaInfo{},
-		paths: streamPaths{
-			videoPlaylist: filepath.Join(dir, "index.m3u8"),
-		},
-	}
-	manager := &manager{}
-	first := &segmentJob{begin: 0, end: 5, result: ffmpeg.VideoWindowResult{Generated: 5}}
-	if err := manager.advanceProgressivePlaylist(stream, first); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(stream.paths.videoPlaylist)
-	if err != nil {
-		t.Fatal(err)
-	}
-	playlist := string(data)
-	if !strings.Contains(playlist, "chunk_000004.ts") || strings.Contains(playlist, "chunk_000005.ts") {
-		t.Fatalf("unexpected progressive playlist:\n%s", playlist)
-	}
-
-	end := &segmentJob{begin: 5, end: 10, result: ffmpeg.VideoWindowResult{ReachedEnd: true}}
-	if err := manager.advanceProgressivePlaylist(stream, end); err != nil {
-		t.Fatal(err)
-	}
-	data, err = os.ReadFile(stream.paths.videoPlaylist)
-	if err != nil {
-		t.Fatal(err)
-	}
-	playlist = string(data)
-	if !strings.Contains(playlist, "#EXT-X-ENDLIST") || strings.Contains(playlist, "chunk_000005.ts") {
-		t.Fatalf("unexpected final progressive playlist:\n%s", playlist)
 	}
 }
 
@@ -269,11 +236,6 @@ func TestParseDirectSegmentOwner(t *testing.T) {
 	if owner, ok := parseDirectInitOwner("init_000015.mp4"); !ok || owner != 15 {
 		t.Fatalf("parseDirectInitOwner() = %d, %v", owner, ok)
 	}
-	for _, name := range []string{"seek_000015.ts", "seek_000015.m4s", "init_seek_000015.mp4"} {
-		if index, ok := parseSeekAsset(name); !ok || index != 15 {
-			t.Fatalf("parseSeekAsset(%q) = %d, %v", name, index, ok)
-		}
-	}
 }
 
 func TestReserveJobSlotEnforcesGlobalAndPerStreamLimits(t *testing.T) {
@@ -336,24 +298,6 @@ func TestClassifyHlsStatusDistinguishesNoPeersAndStalledWork(t *testing.T) {
 	}
 }
 
-func TestPublishProgressiveSegmentAdvertisesOnlyCompletedAssets(t *testing.T) {
-	dir := t.TempDir()
-	stream := &streamInfo{
-		paths: streamPaths{videoPlaylist: filepath.Join(dir, "index.m3u8")},
-	}
-	manager := &manager{}
-	if err := manager.publishProgressiveSegment(stream, 0); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(stream.paths.videoPlaylist)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "chunk_000000.ts") || strings.Contains(string(data), "chunk_000001.ts") {
-		t.Fatalf("unexpected playlist:\n%s", data)
-	}
-}
-
 func TestReconcileKnownDurationShrinksOverstatedTimeline(t *testing.T) {
 	dir := t.TempDir()
 	stream := &streamInfo{
@@ -372,11 +316,57 @@ func TestReconcileKnownDurationShrinksOverstatedTimeline(t *testing.T) {
 	if stream.mediaInfo.Duration != 38 || stream.status.Duration != 38 {
 		t.Fatalf("durations = media %.1f status %.1f", stream.mediaInfo.Duration, stream.status.Duration)
 	}
-	data, err := os.ReadFile(stream.paths.videoPlaylist)
-	if err != nil {
+}
+
+func TestTrimMaterializedTailKeepsThreeTargetDurations(t *testing.T) {
+	windows := make(map[int][]ffmpeg.HLSFragment)
+	for owner := 0; owner < 4; owner++ {
+		windows[owner] = []ffmpeg.HLSFragment{{Duration: 30, Name: videoSegmentName(owner)}}
+	}
+	mediaSequence, discontinuitySequence := 0, 0
+	trimMaterializedTail(windows, &mediaSequence, &discontinuitySequence, 30*time.Second)
+	if len(windows) != 3 || mediaSequence != 1 || discontinuitySequence != 1 {
+		t.Fatalf("trimmed state = windows %d, media %d, discontinuity %d", len(windows), mediaSequence, discontinuitySequence)
+	}
+}
+
+func TestNextDirectWindowStartsAfterMaterializedSourceCoverage(t *testing.T) {
+	windows := map[int][]ffmpeg.HLSFragment{
+		95: {
+			{Start: 590, Duration: 20},
+			{Start: 610, Duration: 19.5},
+		},
+	}
+	if begin := nextDirectWindowBegin(windows, 6*time.Second); begin != 104 {
+		t.Fatalf("next window begin = %d, want 104", begin)
+	}
+	windows[95][1].Duration = 20
+	if begin := nextDirectWindowBegin(windows, 6*time.Second); begin != 105 {
+		t.Fatalf("aligned next window begin = %d, want 105", begin)
+	}
+}
+
+func TestDirectPrerollBudgetUsesAvailableBytesAndBitrate(t *testing.T) {
+	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "536870912")
+	t.Setenv("CINEMATOR_MAX_QUEUED_JOBS", "4")
+	manager := &manager{settings: settings.NewSettings()}
+	lowBitrate := manager.directPrerollBudget(5_500_000)
+	highBitrate := manager.directPrerollBudget(50_000_000)
+	if lowBitrate <= highBitrate || lowBitrate <= 30*time.Second {
+		t.Fatalf("preroll budgets = low %s, high %s", lowBitrate, highBitrate)
+	}
+}
+
+func TestReconcileKnownDurationUsesDirectSourceTimeline(t *testing.T) {
+	stream := &streamInfo{
+		mediaInfo: domain.MediaInfo{Duration: 120, Seekable: true},
+		status:    domain.HlsStatus{Duration: 120, Seekable: true},
+	}
+	job := &segmentJob{fragments: []ffmpeg.HLSFragment{{Start: 29.5, Duration: 7.5}}}
+	if err := (&manager{}).reconcileKnownDuration(stream, job); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), "chunk_000006.ts") || strings.Contains(string(data), "chunk_000007.ts") {
-		t.Fatalf("unexpected reconciled playlist:\n%s", data)
+	if stream.mediaInfo.Duration != 37 || stream.status.Duration != 37 {
+		t.Fatalf("direct durations = media %.1f status %.1f", stream.mediaInfo.Duration, stream.status.Duration)
 	}
 }

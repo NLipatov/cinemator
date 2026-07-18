@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBuildStreamArgsTranscodesH264AndAACForExactSegmentBoundaries(t *testing.T) {
@@ -99,6 +100,21 @@ func TestBuildStreamArgsPreservesResolutionAndBoundsPeakRate(t *testing.T) {
 	}
 }
 
+func TestCompatibilityAudioPreservesSourceChannelLayout(t *testing.T) {
+	info := domain.MediaInfo{
+		VideoCodec:  "vp9",
+		AudioTracks: []domain.AudioTrack{{Codec: "ac3", Channels: 6}},
+	}
+	for name, args := range map[string][]string{
+		"full transcode": buildStreamArgs(info, StreamSelection{}),
+		"hybrid":         buildRemuxStreamArgs(info, StreamSelection{}),
+	} {
+		if slices.Contains(args, "-ac") {
+			t.Fatalf("%s args silently change the source channel count: %v", name, args)
+		}
+	}
+}
+
 func TestHLSReservationBitrateKeepsDirectVideoUntouched(t *testing.T) {
 	info := domain.MediaInfo{VideoCodec: "av1", VideoProfile: "Main", PixelFormat: "yuv420p10le", Duration: 60, Width: 7680, Height: 4320, FrameRate: 60, Bitrate: 80_000_000}
 	if !CanRemuxHLS(info, StreamSelection{}) {
@@ -120,6 +136,13 @@ func TestHLSReservationBitrateSaturates(t *testing.T) {
 	info := domain.MediaInfo{Width: 1, Height: 1, FrameRate: math.MaxFloat64}
 	if got := HLSReservationBitrate(info, StreamSelection{}); got != math.MaxInt64 {
 		t.Fatalf("HLSReservationBitrate() = %d, want saturation at %d", got, int64(math.MaxInt64))
+	}
+}
+
+func TestCompatibilityHLSBandwidthSaturates(t *testing.T) {
+	info := domain.MediaInfo{Bitrate: math.MaxInt64, AudioTracks: []domain.AudioTrack{{Codec: "aac"}}}
+	if got := compatibilityHLSBandwidth(info, StreamSelection{}, time.Nanosecond); got != math.MaxInt64 {
+		t.Fatalf("compatibilityHLSBandwidth() = %d, want saturation at %d", got, int64(math.MaxInt64))
 	}
 }
 
@@ -167,7 +190,6 @@ func TestCanRemuxHLSRejectsVideoTransformations(t *testing.T) {
 		name string
 		info domain.MediaInfo
 	}{
-		{name: "unknown duration", info: domain.MediaInfo{VideoCodec: "h264"}},
 		{name: "codec", info: domain.MediaInfo{Duration: 60, VideoCodec: "vp9"}},
 		{name: "profile", info: domain.MediaInfo{Duration: 60, VideoCodec: "h264", VideoProfile: "High 10", Width: 1280, Height: 720}},
 		{name: "level", info: domain.MediaInfo{Duration: 60, VideoCodec: "h264", VideoProfile: "High", VideoLevel: 63, Width: 1280, Height: 720}},
@@ -197,6 +219,10 @@ func TestCanRemuxHLSRejectsVideoTransformations(t *testing.T) {
 	}
 	if CanRemuxHLS(base, StreamSelection{ForceTranscode: true}) {
 		t.Fatal("CanRemuxHLS() ignored forced native-HLS fallback")
+	}
+	unknown := domain.MediaInfo{VideoCodec: "h264", PixelFormat: "yuv420p"}
+	if !CanRemuxHLS(unknown, StreamSelection{}) || HLSMode(unknown, StreamSelection{}) != "direct" {
+		t.Fatal("unknown duration incorrectly disabled progressive remux")
 	}
 }
 

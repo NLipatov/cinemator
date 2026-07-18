@@ -34,23 +34,7 @@ func TestPublishFileWithoutReplacementKeepsPublishedAsset(t *testing.T) {
 	}
 }
 
-func TestBuildOnDemandMediaPlaylistCoversWholeDuration(t *testing.T) {
-	got := buildOnDemandMediaPlaylist(25.5, 10, 2, "chunk_", ".ts", "")
-
-	for _, want := range []string{
-		"#EXT-X-PLAYLIST-TYPE:VOD\n",
-		"#EXTINF:10.000,\nchunk_000000.ts\n",
-		"#EXTINF:10.000,\nchunk_000001.ts\n",
-		"#EXT-X-DISCONTINUITY\n#EXTINF:5.500,\nchunk_000002.ts\n",
-		"#EXT-X-ENDLIST\n",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("playlist missing %q:\n%s", want, got)
-		}
-	}
-}
-
-func TestPrepareOnDemandHLSWritesStaticManifests(t *testing.T) {
+func TestPrepareOnDemandHLSAdvertisesNoUnmaterializedAssets(t *testing.T) {
 	dir := t.TempDir()
 	info := domain.MediaInfo{
 		Duration:  30,
@@ -74,77 +58,17 @@ func TestPrepareOnDemandHLSWritesStaticManifests(t *testing.T) {
 		t.Fatalf("PrepareOnDemandHLS() error = %v", err)
 	}
 	assertFileContains(t, dir+"/master.m3u8", "SUBTITLES=\"subs\"")
-	assertFileContains(t, dir+"/master.m3u8", "BANDWIDTH=100000000")
-	assertFileContains(t, dir+"/index.m3u8", "chunk_000002.ts")
-	assertFileContains(t, dir+"/index.m3u8", "chunk_000002.ts?v=v1")
+	assertFileContains(t, dir+"/master.m3u8", "BANDWIDTH=150000000")
 	assertFileContains(t, dir+"/master.m3u8", "index.m3u8?v=v1")
-	assertFileContains(t, dir+"/subs.m3u8", "subs_000002.vtt")
-}
-
-func TestBuildSparseMediaPlaylistReplacesGapWithGOPs(t *testing.T) {
-	got := buildSparseMediaPlaylist(40, 6, 2, "v1", false, []HLSFragment{
-		{Start: 10, Duration: 10, Name: "direct_000003_0000.ts"},
-		{Start: 20, Duration: 10, Name: "direct_000003_0001.ts"},
-		{Start: 30, Duration: 10, Name: "direct_000003_0002.ts"},
-	})
-	for _, want := range []string{
-		"#EXT-X-TARGETDURATION:12\n",
-		"#EXTINF:10.000,\nseek_000000.ts?v=v1\n",
-		"#EXTINF:10.000,\ndirect_000003_0000.ts?v=v1\n",
-		"#EXT-X-ENDLIST\n",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("sparse playlist missing %q:\n%s", want, got)
+	for _, playlist := range []string{dir + "/index.m3u8", dir + "/subs.m3u8"} {
+		data, err := os.ReadFile(playlist)
+		if err != nil {
+			t.Fatal(err)
 		}
-	}
-	if strings.Count(got, "direct_000003_0000.ts") != 1 {
-		t.Fatalf("sparse playlist duplicated prepared GOP:\n%s", got)
-	}
-}
-
-func TestBuildSparseFMP4PlaylistMapsInitSegments(t *testing.T) {
-	got := buildSparseMediaPlaylist(24, 6, 2, "v1", true, []HLSFragment{
-		{Start: 0, Duration: 12, Name: "direct_000000_0000.m4s", Init: "init_000000.mp4"},
-	})
-	for _, want := range []string{
-		"#EXT-X-VERSION:7\n",
-		"#EXT-X-MAP:URI=\"init_000000.mp4?v=v1\"\n",
-		"direct_000000_0000.m4s?v=v1\n",
-		"#EXT-X-MAP:URI=\"init_seek_000002.mp4?v=v1\"\n",
-		"seek_000002.m4s?v=v1\n",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("fMP4 playlist missing %q:\n%s", want, got)
+		if strings.Contains(string(data), ".ts") || strings.Contains(string(data), ".vtt") ||
+			strings.Contains(string(data), ".m4s") || strings.Contains(string(data), "#EXT-X-ENDLIST") {
+			t.Fatalf("initial playlist advertises unmaterialized media:\n%s", data)
 		}
-	}
-}
-
-func TestPrepareOnDemandHLSUsesSeekTriggersForDirectPlay(t *testing.T) {
-	dir := t.TempDir()
-	err := PrepareOnDemandHLS(
-		dir,
-		dir+"/index.m3u8",
-		dir+"/subs.m3u8",
-		dir+"/master.m3u8",
-		domain.MediaInfo{Duration: 30, VideoCodec: "h264", Width: 1280, Height: 720},
-		StreamSelection{SubtitleTrackIndex: -1},
-		6*time.Second,
-		3,
-		"v1",
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertFileContains(t, dir+"/index.m3u8", "#EXTINF:18.000,\nseek_000000.ts?v=v1")
-	data, err := os.ReadFile(dir + "/index.m3u8")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(data), "chunk_000000.ts") {
-		t.Fatalf("direct playlist uses transcoded placeholder:\n%s", data)
-	}
-	if got := strings.Count(string(data), "seek_"); got != 2 {
-		t.Fatalf("direct playlist has %d seek windows, want 2:\n%s", got, data)
 	}
 }
 
@@ -174,7 +98,8 @@ func TestPrepareOnDemandHLSWritesProgressiveManifestWithoutDuration(t *testing.T
 	if err != nil {
 		t.Fatalf("PrepareOnDemandHLS() error = %v", err)
 	}
-	assertFileContains(t, dir+"/index.m3u8", "#EXT-X-PLAYLIST-TYPE:EVENT")
+	assertFileContains(t, dir+"/index.m3u8", "#EXT-X-MEDIA-SEQUENCE:0")
+	assertFileContains(t, dir+"/index.m3u8", "#EXT-X-DISCONTINUITY-SEQUENCE:0")
 	data, readErr := os.ReadFile(dir + "/index.m3u8")
 	if readErr != nil {
 		t.Fatal(readErr)
@@ -187,15 +112,90 @@ func TestPrepareOnDemandHLSWritesProgressiveManifestWithoutDuration(t *testing.T
 	}
 }
 
-func TestUpdateProgressiveHLSFinalizesDiscoveredDuration(t *testing.T) {
+func TestPrepareOnDemandHLSKeepsCompatibleUnknownDurationProgressive(t *testing.T) {
 	dir := t.TempDir()
-	path := dir + "/index.m3u8"
-	if err := UpdateProgressiveHLS(path, "", false, 6*time.Second, 2, "v1", 3, 2.5, true); err != nil {
-		t.Fatalf("UpdateProgressiveHLS() error = %v", err)
+	info := domain.MediaInfo{VideoCodec: "hevc", VideoProfile: "Main 10", PixelFormat: "yuv420p10le"}
+	if err := PrepareOnDemandHLS(
+		dir, dir+"/index.m3u8", "", dir+"/master.m3u8",
+		info, StreamSelection{SubtitleTrackIndex: -1},
+		6*time.Second, 3, "v1",
+	); err != nil {
+		t.Fatal(err)
 	}
-	assertFileContains(t, path, "#EXTINF:2.500,\nchunk_000002.ts")
-	assertFileContains(t, path, "#EXT-X-DISCONTINUITY\n#EXTINF:2.500,")
-	assertFileContains(t, path, "#EXT-X-ENDLIST")
+	data, err := os.ReadFile(dir + "/index.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "seek_") || strings.Contains(string(data), "#EXT-X-ENDLIST") {
+		t.Fatalf("unknown-duration remux received a sparse VOD timeline:\n%s", data)
+	}
+	assertFileContains(t, dir+"/master.m3u8", "#EXT-X-VERSION:7")
+}
+
+func TestBuildMaterializedPlaylistContainsOnlyMaterializedFragments(t *testing.T) {
+	got := buildMaterializedPlaylist(36*time.Second, "v1", true, 4, 0, 27, false, []HLSFragment{
+		{Start: 24, Duration: 5.5, Name: "direct_000004_0000.m4s", Init: "init_000004.mp4"},
+		{Start: 29.5, Duration: 6.5, Name: "direct_000004_0001.m4s", Init: "init_000004.mp4"},
+	})
+	for _, want := range []string{
+		"#EXT-X-TARGETDURATION:36",
+		"#EXT-X-MEDIA-SEQUENCE:4",
+		"#EXT-X-DISCONTINUITY-SEQUENCE:0",
+		"#EXT-X-START:TIME-OFFSET=3.000,PRECISE=YES",
+		"#EXT-X-MAP:URI=\"init_000004.mp4?v=v1\"",
+		"direct_000004_0000.m4s?v=v1",
+		"direct_000004_0001.m4s?v=v1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("progressive direct playlist missing %q:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"seek_", "chunk_", "#EXT-X-PLAYLIST-TYPE", "#EXT-X-ENDLIST"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("progressive direct playlist contains %q:\n%s", unwanted, got)
+		}
+	}
+}
+
+func TestBuildMaterializedPlaylistOmitsStartAfterTargetLeavesTail(t *testing.T) {
+	got := buildMaterializedPlaylist(12*time.Second, "v1", false, 8, 2, 27, true, []HLSFragment{
+		{Start: 48, Duration: 6, Name: "chunk_000008.ts"},
+	})
+	if strings.Contains(got, "#EXT-X-START") {
+		t.Fatalf("playlist retained a start outside its materialized tail:\n%s", got)
+	}
+	if !strings.Contains(got, "#EXT-X-ENDLIST") {
+		t.Fatalf("final playlist lacks end marker:\n%s", got)
+	}
+	if !strings.Contains(got, "#EXT-X-DISCONTINUITY-SEQUENCE:2") {
+		t.Fatalf("playlist lost its discontinuity sequence:\n%s", got)
+	}
+}
+
+func TestDirectWindowGenerationDurationUsesAdmittedPrerollBudget(t *testing.T) {
+	if got := DirectWindowGenerationDuration(5, 6*time.Second, 42*time.Second); got != 72*time.Second {
+		t.Fatalf("generation duration = %s, want 1m12s", got)
+	}
+}
+
+func TestProgressivePlaylistKeepsBoundedLiveTail(t *testing.T) {
+	got := buildProgressiveMediaPlaylist(6, 3, "chunk_", ".ts", "v1", 8, 0, false)
+	for _, want := range []string{
+		"#EXT-X-MEDIA-SEQUENCE:5\n",
+		"#EXT-X-DISCONTINUITY-SEQUENCE:1\n",
+		"chunk_000005.ts?v=v1\n",
+		"#EXT-X-DISCONTINUITY\n#EXTINF:6.000,\nchunk_000006.ts?v=v1\n",
+		"chunk_000007.ts?v=v1\n",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("progressive playlist missing %q:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"#EXT-X-PLAYLIST-TYPE:EVENT", "chunk_000004.ts", "#EXT-X-ENDLIST"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("progressive playlist contains %q:\n%s", unwanted, got)
+		}
+	}
 }
 
 func TestAddWebVTTTimestampMapUsesAbsoluteMediaTime(t *testing.T) {
