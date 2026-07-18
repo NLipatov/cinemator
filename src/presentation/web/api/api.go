@@ -297,7 +297,9 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 
 	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack, startSeconds, forceTranscode)
 	if err != nil {
-		http.Error(w, err.Error(), hlsErrorStatus(err))
+		log.Printf("prepare HLS stream: %v", err)
+		status := hlsErrorStatus(err)
+		http.Error(w, hlsErrorMessage(status), status)
 		return
 	}
 	streamDir := filepath.Base(filepath.Dir(playlist))
@@ -343,7 +345,9 @@ func (s *HttpServer) handleGetHlsStatus(w http.ResponseWriter, r *http.Request) 
 	}
 	status, err := s.mgr.GetHlsStatus(r.Context(), streamDir, targetSeconds)
 	if err != nil {
-		http.Error(w, err.Error(), hlsErrorStatus(err))
+		log.Printf("get HLS status: %v", err)
+		code := hlsErrorStatus(err)
+		http.Error(w, hlsErrorMessage(code), code)
 		return
 	}
 	writeJSON(w, status)
@@ -419,6 +423,25 @@ func hlsErrorStatus(err error) int {
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
+	}
+}
+
+func hlsErrorMessage(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "bad HLS request"
+	case http.StatusNotFound:
+		return "HLS stream not found"
+	case http.StatusUnsupportedMediaType:
+		return "HLS media is unsupported"
+	case http.StatusConflict:
+		return "HLS playlist changed"
+	case http.StatusGatewayTimeout:
+		return "HLS preparation timed out"
+	case http.StatusServiceUnavailable:
+		return "HLS is temporarily unavailable"
+	default:
+		return "internal streaming error"
 	}
 }
 

@@ -224,10 +224,8 @@ type lockedHlsAsset struct {
 
 func (a *lockedHlsAsset) Close() error {
 	a.once.Do(func() {
+		defer a.unlock()
 		a.err = a.ReadSeekCloser.Close()
-		if a.err == nil {
-			a.unlock()
-		}
 	})
 	return a.err
 }
@@ -1134,6 +1132,9 @@ func (m *manager) reconcileKnownDuration(s *streamInfo, job *segmentJob) error {
 }
 
 func (m *manager) publishProgressiveSubtitle(s *streamInfo, index int) error {
+	s.playlistMtx.Lock()
+	defer s.playlistMtx.Unlock()
+
 	s.mtx.Lock()
 	if index < s.progressiveSubtitles {
 		s.mtx.Unlock()
@@ -1143,23 +1144,27 @@ func (m *manager) publishProgressiveSubtitle(s *streamInfo, index int) error {
 		s.mtx.Unlock()
 		return fmt.Errorf("progressive subtitle segment %d is not contiguous after %d", index, s.progressiveSubtitles)
 	}
-	s.progressiveSubtitles++
-	count := s.progressiveSubtitles
+	count := s.progressiveSubtitles + 1
 	last := s.progressiveLast
 	ended := s.progressiveEnded && count >= s.progressiveAdvertised
+	assetVersion := s.assetVersion
 	s.mtx.Unlock()
 
-	s.playlistMtx.Lock()
-	defer s.playlistMtx.Unlock()
-	return ffmpeg.UpdateProgressiveSubtitleHLS(
+	if err := ffmpeg.UpdateProgressiveSubtitleHLS(
 		s.paths.subtitlePlaylist,
 		m.settings.HlsSegmentDuration(),
 		m.settings.HlsWindowSegments(),
-		s.assetVersion,
+		assetVersion,
 		count,
 		last,
 		ended,
-	)
+	); err != nil {
+		return err
+	}
+	s.mtx.Lock()
+	s.progressiveSubtitles = count
+	s.mtx.Unlock()
+	return nil
 }
 
 func (m *manager) GetHlsStatus(ctx context.Context, streamDir string, targetSeconds float64) (result domain.HlsStatus, resultErr error) {

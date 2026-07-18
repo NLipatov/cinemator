@@ -175,7 +175,6 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 		dir    string
 		stream *streamInfo
 		items  []hlsCacheItem
-		locked bool
 	}
 	var removedFiles int
 	var unlinkedBytes int64
@@ -186,17 +185,30 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 	}
 	activeBatches := make(map[string]*hlsEvictionBatch)
 	var batches []*hlsEvictionBatch
-	defer func() {
+	planned := total
+	flushBatches := func() {
 		for _, batch := range batches {
-			if batch.locked {
-				batch.stream.generationMtx.Unlock()
+			removed, err := m.evictActiveHlsAssets(batch.stream, batch.items)
+			for _, item := range batch.items {
+				if _, ok := removed[item.path]; ok {
+					recordRemoved(item)
+				}
+			}
+			batch.stream.generationMtx.Unlock()
+			if err != nil {
+				log.Printf("enforceCacheLimit: failed to rotate stream %s: %v", batch.dir, err)
 			}
 		}
-	}()
-	remaining := total
+		clear(activeBatches)
+		batches = batches[:0]
+		planned = total
+	}
 	for _, item := range candidates {
-		if remaining <= target {
-			break
+		if planned <= target {
+			flushBatches()
+			if total <= target {
+				break
+			}
 		}
 		rel, relErr := filepath.Rel(root, item.path)
 		parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
@@ -206,7 +218,7 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 				batch := activeBatches[parts[0]]
 				if batch == nil {
 					stream.generationMtx.Lock()
-					batch = &hlsEvictionBatch{dir: parts[0], stream: stream, locked: true}
+					batch = &hlsEvictionBatch{dir: parts[0], stream: stream}
 					activeBatches[parts[0]] = batch
 					batches = append(batches, batch)
 				}
@@ -219,7 +231,7 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 					continue
 				}
 				batch.items = append(batch.items, item)
-				remaining -= item.size
+				planned -= item.size
 				continue
 			}
 		}
@@ -230,22 +242,10 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 		}
 		if removed {
 			recordRemoved(item)
-			remaining -= item.size
+			planned -= item.size
 		}
 	}
-	for _, batch := range batches {
-		removed, err := m.evictActiveHlsAssets(batch.stream, batch.items)
-		for _, item := range batch.items {
-			if _, ok := removed[item.path]; ok {
-				recordRemoved(item)
-			}
-		}
-		batch.stream.generationMtx.Unlock()
-		batch.locked = false
-		if err != nil {
-			log.Printf("enforceCacheLimit: failed to rotate stream %s: %v", batch.dir, err)
-		}
-	}
+	flushBatches()
 	if removedFiles > 0 {
 		log.Printf("enforceCacheLimit: unlinked %d closed files (%d allocated bytes removed from logical cache accounting)", removedFiles, unlinkedBytes)
 	}

@@ -24,6 +24,7 @@ type fakeTorrentManager struct {
 	deleteErr   error
 	events      <-chan struct{}
 	prepare     string
+	prepareErr  error
 	ensureErr   error
 	status      domain.HlsStatus
 	statusErr   error
@@ -62,7 +63,7 @@ func (m fakeTorrentManager) PrepareHlsStream(_ context.Context, magnet string, f
 			start: start, forceTranscode: forceTranscode,
 		}
 	}
-	return m.prepare, nil
+	return m.prepare, m.prepareErr
 }
 
 func (m fakeTorrentManager) OpenHlsAsset(_ context.Context, streamDir, assetName, version string) (application.HlsAsset, error) {
@@ -334,6 +335,18 @@ func TestHandlePrepareHlsStreamForwardsPlaybackSelection(t *testing.T) {
 	}
 }
 
+func TestHandlePrepareHlsStreamDoesNotExposeInternalError(t *testing.T) {
+	server := HttpServer{mgr: fakeTorrentManager{prepareErr: errors.New("open /private/cache/master.m3u8: permission denied")}}
+	req := httptest.NewRequest(http.MethodGet, "/api/hls/prepare?magnet=magnet&file=0", nil)
+	rec := httptest.NewRecorder()
+
+	server.handlePrepareHlsStream(rec, req)
+
+	if rec.Code != http.StatusInternalServerError || strings.TrimSpace(rec.Body.String()) != "internal streaming error" {
+		t.Fatalf("response = %d %q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleGetMediaInfoExposesPlaybackCapabilities(t *testing.T) {
 	server := HttpServer{mgr: fakeTorrentManager{mediaInfo: domain.MediaInfo{
 		VideoCodec:       "hevc",
@@ -414,6 +427,18 @@ func TestHandleGetHlsStatusMapsTypedErrors(t *testing.T) {
 				t.Fatalf("status = %d, want %d", rec.Code, test.want)
 			}
 		})
+	}
+}
+
+func TestHandleGetHlsStatusDoesNotExposeInternalError(t *testing.T) {
+	server := HttpServer{mgr: fakeTorrentManager{statusErr: errors.New("stat /private/cache/index.m3u8: permission denied")}}
+	req := httptest.NewRequest(http.MethodGet, "/api/hls/status/stream", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleGetHlsStatus(rec, req)
+
+	if rec.Code != http.StatusInternalServerError || strings.TrimSpace(rec.Body.String()) != "internal streaming error" {
+		t.Fatalf("response = %d %q", rec.Code, rec.Body.String())
 	}
 }
 

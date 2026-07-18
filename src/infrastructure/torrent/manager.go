@@ -109,6 +109,12 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	if err != nil {
 		return nil, fmt.Errorf("open HLS asset store: %w", err)
 	}
+	keepAssets := false
+	defer func() {
+		if !keepAssets {
+			_ = assets.Close()
+		}
+	}()
 	if err := discardPreviousHlsStreams(assets, settings.HlsPath()); err != nil {
 		return nil, fmt.Errorf("discard previous HLS streams: %w", err)
 	}
@@ -152,6 +158,7 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 		settings:    settings,
 	}
 	keepOwnership = true
+	keepAssets = true
 	keepClient = true
 	go m.viewerWatcher()
 	return m, nil
@@ -181,6 +188,7 @@ func (m *manager) Close() error {
 			m.closeErr = errors.Join(m.closeErr, errors.New("cache ownership retained because managed file handles did not close cleanly"))
 			return
 		}
+		m.closeErr = errors.Join(m.closeErr, m.assets.Close())
 		m.closeErr = errors.Join(m.closeErr, m.ownership.Close())
 	})
 	return m.closeErr

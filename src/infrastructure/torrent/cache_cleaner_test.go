@@ -295,3 +295,45 @@ func TestActiveAssetEvictionRotatesImmutableGeneration(t *testing.T) {
 		t.Fatalf("rotated master does not use version %q:\n%s", version, master)
 	}
 }
+
+func TestCacheContinuesPastFailedActiveBatch(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CINEMATOR_HLS_PATH", root)
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: 0}
+	paths := key.paths(root)
+	active := filepath.Join(paths.outDir, "chunk_000000.ts")
+	inactive := filepath.Join(root, "inactive", "chunk_000000.ts")
+	for index, path := range []string{active, inactive} {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("segment"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		stamp := time.Unix(int64(index+1), 0)
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inactiveInfo, err := os.Stat(inactive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := allocatedFileSize(inactiveInfo)
+	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", strconv.FormatInt(target, 10))
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream := readyCacheTestStream(paths)
+	stream.selection.SubtitleTrackIndex = 0
+	m := &manager{active: map[streamKey]*streamInfo{key: stream}, assets: assets, settings: settings.NewSettings()}
+	m.enforceCacheLimit()
+
+	if _, err := os.Stat(active); err != nil {
+		t.Fatalf("failed active batch unexpectedly removed its segment: %v", err)
+	}
+	if _, err := os.Stat(inactive); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cache did not continue to the later reclaimable candidate: %v", err)
+	}
+}

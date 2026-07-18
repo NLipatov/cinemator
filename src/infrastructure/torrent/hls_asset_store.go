@@ -18,7 +18,8 @@ var errHlsAssetsBusy = errors.New("HLS assets are still in use")
 // hlsAssetStore is the only owner allowed to open or remove published HLS
 // files. Its lock makes open-and-lease linearizable with retirement and unlink.
 type hlsAssetStore struct {
-	root    string
+	path    string
+	root    *os.Root
 	mu      sync.Mutex
 	files   map[string]*hlsAssetState
 	retired map[string]struct{}
@@ -35,15 +36,21 @@ func newHlsAssetStore(root string) (*hlsAssetStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	path := filepath.Clean(abs)
+	rootHandle, err := os.OpenRoot(path)
+	if err != nil {
+		return nil, err
+	}
 	return &hlsAssetStore{
-		root:    filepath.Clean(abs),
+		path:    path,
+		root:    rootHandle,
 		files:   make(map[string]*hlsAssetState),
 		retired: make(map[string]struct{}),
 	}, nil
 }
 
 func (s *hlsAssetStore) Open(path string) (application.HlsAsset, error) {
-	path, err := s.managedPath(path)
+	path, name, err := s.managedPath(path)
 	if err != nil {
 		return application.HlsAsset{}, err
 	}
@@ -57,15 +64,15 @@ func (s *hlsAssetStore) Open(path string) (application.HlsAsset, error) {
 	if state != nil && state.retiring {
 		return application.HlsAsset{}, fs.ErrNotExist
 	}
-	linkInfo, err := os.Lstat(path)
+	linkInfo, err := s.root.Lstat(name)
 	if err != nil {
 		return application.HlsAsset{}, err
 	}
-	if linkInfo.Mode()&os.ModeSymlink != 0 {
-		return application.HlsAsset{}, fmt.Errorf("HLS asset is a symbolic link: %s", path)
+	if err := validateHlsAsset(path, linkInfo); err != nil {
+		return application.HlsAsset{}, err
 	}
 
-	file, err := os.Open(path)
+	file, err := openHlsAssetFile(s.root, name)
 	if err != nil {
 		return application.HlsAsset{}, err
 	}
@@ -78,6 +85,10 @@ func (s *hlsAssetStore) Open(path string) (application.HlsAsset, error) {
 		_ = file.Close()
 		return application.HlsAsset{}, err
 	}
+	if !os.SameFile(linkInfo, info) {
+		_ = file.Close()
+		return application.HlsAsset{}, fmt.Errorf("HLS asset changed while opening: %s", path)
+	}
 	state, err = s.bindState(path, info)
 	if err != nil {
 		_ = file.Close()
@@ -85,7 +96,7 @@ func (s *hlsAssetStore) Open(path string) (application.HlsAsset, error) {
 	}
 	state.readers++
 	return application.HlsAsset{
-		ReadSeekCloser: &leasedHlsFile{File: file, store: s, path: path, state: state},
+		ReadSeekCloser: &leasedHlsFile{File: file, store: s, path: path, name: name, state: state},
 		ModTime:        info.ModTime(),
 	}, nil
 }
@@ -99,13 +110,13 @@ func (s *hlsAssetStore) TryEvict(path string) (bool, error) {
 // CanEvict is used while the presentation generation lock blocks new opens.
 // A true result therefore remains valid until the caller invokes TryEvict.
 func (s *hlsAssetStore) CanEvict(path string) (bool, error) {
-	path, err := s.managedPath(path)
+	path, name, err := s.managedPath(path)
 	if err != nil {
 		return false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	state, err := s.stateForExisting(path)
+	state, err := s.stateForExisting(path, name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return false, nil
@@ -126,11 +137,15 @@ func (s *hlsAssetStore) hasReaders() bool {
 	return false
 }
 
+func (s *hlsAssetStore) Close() error {
+	return s.root.Close()
+}
+
 // RetireTree prevents new opens before enumerating the tree. Files with active
 // readers are unlinked by their final Close; the directory remains visible
 // until then.
 func (s *hlsAssetStore) RetireTree(root string) error {
-	root, err := s.managedPath(root)
+	root, name, err := s.managedPath(root)
 	if err != nil {
 		return err
 	}
@@ -139,7 +154,7 @@ func (s *hlsAssetStore) RetireTree(root string) error {
 	s.mu.Unlock()
 
 	var paths []string
-	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+	walkErr := fs.WalkDir(s.root.FS(), filepath.ToSlash(name), func(path string, entry fs.DirEntry, err error) error {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
 		}
@@ -147,7 +162,7 @@ func (s *hlsAssetStore) RetireTree(root string) error {
 			return err
 		}
 		if !entry.IsDir() {
-			paths = append(paths, path)
+			paths = append(paths, filepath.Join(s.path, filepath.FromSlash(path)))
 		}
 		return nil
 	})
@@ -163,9 +178,12 @@ func (s *hlsAssetStore) RetireTree(root string) error {
 		busy = busy || !removed
 	}
 	if !busy {
-		if err := os.RemoveAll(root); err != nil {
+		if err := s.root.RemoveAll(name); err != nil {
 			return err
 		}
+		s.mu.Lock()
+		delete(s.retired, root)
+		s.mu.Unlock()
 	}
 	if busy {
 		return errHlsAssetsBusy
@@ -174,7 +192,7 @@ func (s *hlsAssetStore) RetireTree(root string) error {
 }
 
 func (s *hlsAssetStore) ResetTree(root string) error {
-	root, err := s.managedPath(root)
+	root, name, err := s.managedPath(root)
 	if err != nil {
 		return err
 	}
@@ -184,17 +202,17 @@ func (s *hlsAssetStore) ResetTree(root string) error {
 	s.mu.Lock()
 	delete(s.retired, root)
 	s.mu.Unlock()
-	return os.MkdirAll(root, 0755)
+	return s.root.MkdirAll(name, 0755)
 }
 
 func (s *hlsAssetStore) remove(path string, retireBusy bool) (bool, error) {
-	path, err := s.managedPath(path)
+	path, name, err := s.managedPath(path)
 	if err != nil {
 		return false, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	state, err := s.stateForExisting(path)
+	state, err := s.stateForExisting(path, name)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return true, nil
@@ -208,7 +226,7 @@ func (s *hlsAssetStore) remove(path string, retireBusy bool) (bool, error) {
 		return false, nil
 	}
 	state.retiring = true
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := s.root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		state.retiring = false
 		return false, err
 	}
@@ -216,8 +234,8 @@ func (s *hlsAssetStore) remove(path string, retireBusy bool) (bool, error) {
 	return true, nil
 }
 
-func (s *hlsAssetStore) stateForExisting(path string) (*hlsAssetState, error) {
-	info, err := os.Lstat(path)
+func (s *hlsAssetStore) stateForExisting(path, name string) (*hlsAssetState, error) {
+	info, err := s.root.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
@@ -255,16 +273,20 @@ func (s *hlsAssetStore) bindState(path string, info os.FileInfo) (*hlsAssetState
 	return state, nil
 }
 
-func (s *hlsAssetStore) managedPath(path string) (string, error) {
+func (s *hlsAssetStore) managedPath(path string) (string, string, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	abs = filepath.Clean(abs)
-	if abs != s.root && !strings.HasPrefix(abs, s.root+string(os.PathSeparator)) {
-		return "", fmt.Errorf("path is outside HLS cache: %s", path)
+	if abs != s.path && !strings.HasPrefix(abs, s.path+string(os.PathSeparator)) {
+		return "", "", fmt.Errorf("path is outside HLS cache: %s", path)
 	}
-	return abs, nil
+	name, err := filepath.Rel(s.path, abs)
+	if err != nil {
+		return "", "", err
+	}
+	return abs, name, nil
 }
 
 func (s *hlsAssetStore) pathRetired(path string) bool {
@@ -276,7 +298,7 @@ func (s *hlsAssetStore) pathRetired(path string) bool {
 	return false
 }
 
-func (s *hlsAssetStore) release(path string, state *hlsAssetState, closeErr error) {
+func (s *hlsAssetStore) release(path, name string, state *hlsAssetState, closeErr error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if closeErr != nil {
@@ -290,29 +312,46 @@ func (s *hlsAssetStore) release(path string, state *hlsAssetState, closeErr erro
 	if state.readers != 0 || !state.retiring {
 		return
 	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err := s.root.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		log.Printf("failed to remove retired HLS asset: path=%s err=%v", path, err)
 		return
 	}
 	if s.files[path] == state {
 		delete(s.files, path)
 	}
-	s.pruneRetiredDirs(filepath.Dir(path))
+	s.pruneRetiredTrees(path)
 }
 
-func (s *hlsAssetStore) pruneRetiredDirs(dir string) {
+func (s *hlsAssetStore) pruneRetiredTrees(path string) {
 	for root := range s.retired {
-		if dir != root && !strings.HasPrefix(dir, root+string(os.PathSeparator)) {
+		if path != root && !strings.HasPrefix(path, root+string(os.PathSeparator)) {
 			continue
 		}
-		for current := dir; current != filepath.Dir(root); current = filepath.Dir(current) {
-			if err := os.Remove(current); err != nil {
+		busy := false
+		for assetPath, state := range s.files {
+			if (assetPath == root || strings.HasPrefix(assetPath, root+string(os.PathSeparator))) && state.readers != 0 {
+				busy = true
 				break
 			}
 		}
-		if _, err := os.Stat(root); errors.Is(err, fs.ErrNotExist) {
-			delete(s.retired, root)
+		if busy {
+			continue
 		}
+		_, name, err := s.managedPath(root)
+		if err != nil {
+			log.Printf("failed to resolve retired HLS tree: path=%s err=%v", root, err)
+			continue
+		}
+		if err := s.root.RemoveAll(name); err != nil {
+			log.Printf("failed to remove retired HLS tree: path=%s err=%v", root, err)
+			continue
+		}
+		for assetPath := range s.files {
+			if assetPath == root || strings.HasPrefix(assetPath, root+string(os.PathSeparator)) {
+				delete(s.files, assetPath)
+			}
+		}
+		delete(s.retired, root)
 	}
 }
 
@@ -320,6 +359,7 @@ type leasedHlsFile struct {
 	*os.File
 	store *hlsAssetStore
 	path  string
+	name  string
 	state *hlsAssetState
 	once  sync.Once
 	err   error
@@ -329,7 +369,7 @@ func (f *leasedHlsFile) Close() error {
 	f.once.Do(func() {
 		f.err = f.File.Close()
 		// Close must complete before the lease can reach zero.
-		f.store.release(f.path, f.state, f.err)
+		f.store.release(f.path, f.name, f.state, f.err)
 	})
 	return f.err
 }

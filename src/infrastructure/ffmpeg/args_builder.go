@@ -264,7 +264,7 @@ func buildRemuxStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 	if CopiesAudio(info, sel) {
 		return append(args, "-c:a", "copy")
 	}
-	return append(args, "-c:a", "aac", "-b:a", "128k")
+	return append(args, "-c:a", "aac", "-b:a", strconv.FormatInt(compatibilityAudioBitrate, 10))
 }
 
 func selectedAudioIndex(info domain.MediaInfo, sel StreamSelection) int {

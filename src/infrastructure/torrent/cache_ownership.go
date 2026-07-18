@@ -38,23 +38,7 @@ func acquireCacheOwnership(roots ...string) (*cacheOwnership, error) {
 
 	ownership := &cacheOwnership{}
 	for _, root := range ordered {
-		lockPath := filepath.Join(root, cacheOwnerLockName)
-		if info, err := os.Lstat(lockPath); err == nil && (!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Sys() != nil && fileLinkCount(info) != 1) {
-			_ = ownership.Close()
-			return nil, fmt.Errorf("cache owner lock is not a private regular file: %s", lockPath)
-		} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-			_ = ownership.Close()
-			return nil, err
-		}
-		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
-		if err == nil {
-			info, statErr := file.Stat()
-			if statErr != nil || !info.Mode().IsRegular() || info.Sys() != nil && fileLinkCount(info) != 1 {
-				err = errors.Join(statErr, errors.New("cache owner lock has unexpected identity"))
-			} else {
-				err = lockCacheOwner(file)
-			}
-		}
+		file, err := openCacheOwnerLock(root)
 		if err != nil {
 			if file != nil {
 				_ = file.Close()
@@ -65,6 +49,42 @@ func acquireCacheOwnership(roots ...string) (*cacheOwnership, error) {
 		ownership.files = append(ownership.files, file)
 	}
 	return ownership, nil
+}
+
+func openCacheOwnerLock(rootPath string) (*os.File, error) {
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+
+	before, err := root.Lstat(cacheOwnerLockName)
+	if err == nil && (!before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Sys() != nil && fileLinkCount(before) != 1) {
+		return nil, fmt.Errorf("cache owner lock is not a private regular file: %s", filepath.Join(rootPath, cacheOwnerLockName))
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	file, err := openCacheOwnerFile(root)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Sys() != nil && fileLinkCount(info) != 1 {
+		_ = file.Close()
+		return nil, errors.Join(err, errors.New("cache owner lock has unexpected identity"))
+	}
+	if err := lockCacheOwner(file); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	after, err := root.Lstat(cacheOwnerLockName)
+	if err != nil || !os.SameFile(info, after) {
+		_ = file.Close()
+		return nil, errors.Join(err, errors.New("cache owner lock changed while acquiring ownership"))
+	}
+	return file, nil
 }
 
 func (o *cacheOwnership) Close() error {

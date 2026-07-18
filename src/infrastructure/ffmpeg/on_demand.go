@@ -881,10 +881,11 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 }
 
 func publishFileWithoutReplacement(source, target string) error {
-	if _, err := os.Stat(target); err == nil {
-		return os.Remove(source)
-	} else if !errors.Is(err, os.ErrNotExist) {
+	if err := os.Link(source, target); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return os.Remove(source)
+		}
 		return err
 	}
-	return os.Rename(source, target)
+	return os.Remove(source)
 }

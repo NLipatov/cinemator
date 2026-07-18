@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -161,6 +162,70 @@ func TestOpenHlsPlaylistBlocksReplacementUntilClose(t *testing.T) {
 		t.Fatal("playlist writer did not resume after response close")
 	}
 }
+
+func TestLockedHlsAssetUnlocksPlaylistAfterCloseError(t *testing.T) {
+	want := errors.New("close failed")
+	var playlist sync.RWMutex
+	playlist.RLock()
+	asset := &lockedHlsAsset{
+		ReadSeekCloser: &failingReadSeekCloser{Reader: strings.NewReader("playlist"), err: want},
+		unlock:         playlist.RUnlock,
+	}
+	if err := asset.Close(); !errors.Is(err, want) {
+		t.Fatalf("Close() error = %v, want %v", err, want)
+	}
+	if err := asset.Close(); !errors.Is(err, want) {
+		t.Fatalf("second Close() error = %v, want %v", err, want)
+	}
+	locked := make(chan struct{})
+	go func() {
+		playlist.Lock()
+		close(locked)
+		playlist.Unlock()
+	}()
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("playlist remained locked after asset close failure")
+	}
+}
+
+func TestPublishProgressiveSubtitleRetriesAfterPlaylistWriteFailure(t *testing.T) {
+	root := t.TempDir()
+	playlist := filepath.Join(root, "missing", "subs.m3u8")
+	stream := &streamInfo{
+		paths:                 streamPaths{subtitlePlaylist: playlist},
+		assetVersion:          "v1",
+		progressiveAdvertised: 1,
+	}
+	manager := &manager{settings: settings.NewSettings()}
+	if err := manager.publishProgressiveSubtitle(stream, 0); err == nil {
+		t.Fatal("subtitle publication unexpectedly succeeded without its directory")
+	}
+	if stream.progressiveSubtitles != 0 {
+		t.Fatalf("subtitle progress advanced after failed write: %d", stream.progressiveSubtitles)
+	}
+	if err := os.Mkdir(filepath.Dir(playlist), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.publishProgressiveSubtitle(stream, 0); err != nil {
+		t.Fatalf("subtitle retry failed: %v", err)
+	}
+	if stream.progressiveSubtitles != 1 {
+		t.Fatalf("subtitle progress after retry = %d", stream.progressiveSubtitles)
+	}
+	data, err := os.ReadFile(playlist)
+	if err != nil || !strings.Contains(string(data), "subs_000000.vtt?v=v1") {
+		t.Fatalf("subtitle playlist = %q, %v", data, err)
+	}
+}
+
+type failingReadSeekCloser struct {
+	*strings.Reader
+	err error
+}
+
+func (f *failingReadSeekCloser) Close() error { return f.err }
 
 func TestStartedSegmentJobSurvivesDisconnectedWaiter(t *testing.T) {
 	canceled := false
