@@ -163,9 +163,14 @@ func TestActiveAssetEvictionRotatesImmutableGeneration(t *testing.T) {
 	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	segment := filepath.Join(paths.outDir, "chunk_000000.ts")
-	if err := os.WriteFile(segment, []byte("segment"), 0644); err != nil {
-		t.Fatal(err)
+	segments := []string{
+		filepath.Join(paths.outDir, "chunk_000000.ts"),
+		filepath.Join(paths.outDir, "chunk_000001.ts"),
+	}
+	for _, segment := range segments {
+		if err := os.WriteFile(segment, []byte("segment"), 0644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	ready := make(chan struct{})
 	close(ready)
@@ -183,8 +188,10 @@ func TestActiveAssetEvictionRotatesImmutableGeneration(t *testing.T) {
 	}
 	m := &manager{active: map[streamKey]*streamInfo{key: stream}, assets: assets, settings: settings.NewSettings()}
 	m.enforceCacheLimit()
-	if _, err := os.Stat(segment); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("segment was not evicted: %v", err)
+	for _, segment := range segments {
+		if _, err := os.Stat(segment); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("segment was not evicted: %v", err)
+		}
 	}
 	stream.mtx.Lock()
 	version := stream.assetVersion

@@ -230,16 +230,26 @@ func (a *lockedHlsAsset) Close() error {
 	return a.err
 }
 
-func (m *manager) evictActiveHlsAsset(streamDir, assetPath string) (bool, error) {
+func (m *manager) evictActiveHlsAssets(streamDir string, assetPaths []string) (map[string]struct{}, error) {
+	removed := make(map[string]struct{}, len(assetPaths))
 	key, err := parseStreamDir(streamDir)
 	if err != nil {
-		return false, err
+		return removed, err
 	}
 	m.mu.Lock()
 	stream := m.active[key]
 	m.mu.Unlock()
 	if stream == nil {
-		return m.assets.TryEvict(assetPath)
+		for _, assetPath := range assetPaths {
+			ok, removeErr := m.assets.TryEvict(assetPath)
+			if removeErr != nil {
+				return removed, removeErr
+			}
+			if ok {
+				removed[assetPath] = struct{}{}
+			}
+		}
+		return removed, nil
 	}
 
 	// OpenHlsAsset takes the read side of this lock. Holding the write side
@@ -249,23 +259,33 @@ func (m *manager) evictActiveHlsAsset(streamDir, assetPath string) (bool, error)
 	defer stream.generationMtx.Unlock()
 	stream.playlistMtx.Lock()
 	defer stream.playlistMtx.Unlock()
-	evictable, err := m.assets.CanEvict(assetPath)
-	if err != nil || !evictable {
-		return false, err
+	evictable := make([]string, 0, len(assetPaths))
+	evictedOwners := make(map[int]struct{})
+	for _, assetPath := range assetPaths {
+		ok, canEvictErr := m.assets.CanEvict(assetPath)
+		if canEvictErr != nil {
+			return removed, canEvictErr
+		}
+		if !ok {
+			continue
+		}
+		evictable = append(evictable, assetPath)
+		name := filepath.Base(assetPath)
+		if owner, ok := parseDirectSegmentOwner(name); ok {
+			evictedOwners[owner] = struct{}{}
+		}
+		if owner, ok := parseDirectInitOwner(name); ok {
+			evictedOwners[owner] = struct{}{}
+		}
+	}
+	if len(evictable) == 0 {
+		return removed, nil
 	}
 
 	stream.mtx.Lock()
 	if stream.closing || stream.fatalErr != nil || stream.assetVersion == "" {
 		stream.mtx.Unlock()
-		return false, nil
-	}
-	evictedOwners := make(map[int]struct{}, 1)
-	name := filepath.Base(assetPath)
-	if owner, ok := parseDirectSegmentOwner(name); ok {
-		evictedOwners[owner] = struct{}{}
-	}
-	if owner, ok := parseDirectInitOwner(name); ok {
-		evictedOwners[owner] = struct{}{}
+		return removed, nil
 	}
 	version := fmt.Sprintf("%x", time.Now().UnixNano())
 	info := stream.mediaInfo
@@ -294,7 +314,7 @@ func (m *manager) evictActiveHlsAsset(streamDir, assetPath string) (bool, error)
 			stream.status.Message = publicStreamError(err)
 			stream.status.LastProgress = time.Now()
 			stream.mtx.Unlock()
-			return false, err
+			return removed, err
 		}
 		defer reservation.Release()
 	}
@@ -340,14 +360,22 @@ func (m *manager) evictActiveHlsAsset(streamDir, assetPath string) (bool, error)
 		stream.status.Message = publicStreamError(stream.fatalErr)
 		stream.status.LastProgress = time.Now()
 		stream.mtx.Unlock()
-		return false, stream.fatalErr
+		return removed, stream.fatalErr
 	}
 	stream.directWindows = directWindows
 	stream.assetVersion = version
 	stream.mtx.Unlock()
 
-	removed, removeErr := m.assets.TryEvict(assetPath)
-	return removed, removeErr
+	for _, assetPath := range evictable {
+		ok, removeErr := m.assets.TryEvict(assetPath)
+		if removeErr != nil {
+			return removed, removeErr
+		}
+		if ok {
+			removed[assetPath] = struct{}{}
+		}
+	}
+	return removed, nil
 }
 
 func (m *manager) ensureHlsAsset(ctx context.Context, streamDir, assetName, version string) error {
@@ -619,10 +647,7 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 	log.Printf("Generating HLS video window: dir=%s, segments=[%d,%d) mode=%s", filepath.Base(s.paths.outDir), job.begin, job.end, ffmpeg.HLSMode(info, selection))
 	segmentCount := job.end - job.begin
 	generationDuration := time.Duration(segmentCount) * m.settings.HlsSegmentDuration()
-	bitrate := info.Bitrate
-	if bitrate <= 0 && info.Duration > 0 {
-		bitrate = int64(float64(s.file.Length()*8) / info.Duration)
-	}
+	bitrate := ffmpeg.HLSReservationBitrate(info, selection)
 	if directPlay {
 		generationDuration = ffmpeg.DirectWindowGenerationDuration(segmentCount, m.settings.HlsSegmentDuration())
 	}
@@ -631,7 +656,7 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 		job.err = err
 		return
 	}
-	defer release()
+	defer func() { release() }()
 	ctx, stopResourceGuard := context.WithCancelCause(ctx)
 	resourceGuard := m.monitorHlsResources(ctx, stopResourceGuard)
 	defer func() {
@@ -705,7 +730,15 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 			s.markSegmentProgress(job, job.begin)
 		} else if errors.Is(directErr, ffmpeg.ErrRemuxNeedsTranscode) {
 			log.Printf("Direct HLS window fell back to transcoding: dir=%s segments=[%d,%d): %v", filepath.Base(s.paths.outDir), job.begin, job.end, directErr)
-			job.err = m.switchToTranscode(s, job)
+			release()
+			selection.ForceTranscode = true
+			nextRelease, reserveErr := m.reserveHlsGeneration(time.Duration(segmentCount)*m.settings.HlsSegmentDuration(), ffmpeg.HLSReservationBitrate(info, selection))
+			if reserveErr != nil {
+				job.err = reserveErr
+			} else {
+				release = nextRelease
+				job.err = m.switchToTranscode(s, job)
+			}
 			if job.err == nil {
 				job.err = m.withTranscodeSlot(ctx, generateTranscoded)
 			}

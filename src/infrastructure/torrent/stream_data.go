@@ -59,6 +59,7 @@ type streamInfo struct {
 	subtitleJobs          map[*segmentJob]struct{}
 	playlistMtx           sync.RWMutex
 	generationMtx         sync.RWMutex
+	cleanupDone           chan struct{}
 	closing               bool
 }
 

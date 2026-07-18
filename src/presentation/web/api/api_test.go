@@ -525,6 +525,31 @@ func TestReadMediaPlaylistWithWaitWaitsForSegment(t *testing.T) {
 	}
 }
 
+func TestReadHlsAssetWithWaitReturnsTerminalErrorImmediately(t *testing.T) {
+	want := errors.New("generation failed")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := readHlsAssetWithWait(ctx, func() (application.HlsAsset, error) {
+		return application.HlsAsset{}, want
+	}, time.Hour, true)
+	if !errors.Is(err, want) {
+		t.Fatalf("readHlsAssetWithWait() error = %v, want %v", err, want)
+	}
+}
+
+func TestHandleGetHlsPlaylistReportsTerminalBackendError(t *testing.T) {
+	dir := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0_a0_s-1"
+	server := HttpServer{mgr: fakeTorrentManager{ensureErr: errors.New("generation failed")}}
+	req := httptest.NewRequest(http.MethodGet, "/"+dir+"/index.m3u8", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleGetHlsChunk(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
+	}
+}
+
 func TestHandleGetHlsChunkEnsuresOnDemandAsset(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)

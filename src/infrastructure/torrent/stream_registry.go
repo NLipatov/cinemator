@@ -39,51 +39,68 @@ func (m *manager) cleanupIfCurrent(key streamKey, expected *streamInfo) {
 
 func (m *manager) cleanupMatching(key streamKey, expected *streamInfo) {
 	m.mu.Lock()
-	stream, shouldDrop, cleaned := m.cleanupMatchingLocked(key, expected)
+	stream, done, clean := m.beginStreamCleanupLocked(key, expected)
 	m.mu.Unlock()
-	if cleaned {
-		m.finishStreamCleanup(key, stream, shouldDrop)
+	if !clean {
+		if done != nil {
+			<-done
+		}
+		return
 	}
+	m.finishStreamCleanup(key, stream)
+	m.unregisterCleanedStream(key, stream)
 }
 
-func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo) (*streamInfo, bool, bool) {
+func (m *manager) beginStreamCleanupLocked(key streamKey, expected *streamInfo) (*streamInfo, <-chan struct{}, bool) {
 	stream, ok := m.active[key]
 	if !ok || expected != nil && stream != expected {
-		return nil, false, false
+		return nil, nil, false
 	}
 	stream.mtx.Lock()
+	if stream.closing {
+		done := stream.cleanupDone
+		stream.mtx.Unlock()
+		return stream, done, false
+	}
+	if stream.cleanupDone == nil {
+		stream.cleanupDone = make(chan struct{})
+	}
 	stream.closing = true
 	if stream.cancel != nil {
 		stream.cancel()
 	}
 	stream.mtx.Unlock()
-	shouldDrop := false
-	if count := m.torrents[key.InfoHash]; count <= 1 {
-		delete(m.torrents, key.InfoHash)
-		shouldDrop = true
-	} else {
-		m.torrents[key.InfoHash] = count - 1
-	}
-	delete(m.active, key)
-	return stream, shouldDrop, true
+	return stream, stream.cleanupDone, true
 }
 
-func (m *manager) finishStreamCleanup(key streamKey, stream *streamInfo, shouldDrop bool) {
+func (m *manager) finishStreamCleanup(key streamKey, stream *streamInfo) {
 	waitForStreamWorkers(stream)
 	stream.source.Close()
 	log.Printf("Cleaning up stream: key=%v, dir=%s", key, stream.paths.outDir)
+	stream.generationMtx.Lock()
+	stream.playlistMtx.Lock()
 	if err := m.assets.RetireTree(stream.paths.outDir); err != nil && !errors.Is(err, errHlsAssetsBusy) {
 		log.Printf("Failed to cleanup directory: %s, err=%v", stream.paths.outDir, err)
 	}
+	stream.playlistMtx.Unlock()
+	stream.generationMtx.Unlock()
 	if stream.file != nil {
 		stream.file.SetPriority(torrent.PiecePriorityNone)
 	}
 	m.notifyDownloadsChanged()
 	log.Printf("Stream cleaned up: key=%v", key)
-	if shouldDrop && stream.torrent != nil {
-		log.Printf("Dropping torrent: %s", key.InfoHash)
-		stream.torrent.Drop()
+}
+
+func (m *manager) unregisterCleanedStream(key streamKey, stream *streamInfo) {
+	m.mu.Lock()
+	if m.active[key] != stream {
+		m.mu.Unlock()
+		close(stream.cleanupDone)
+		return
 	}
+	delete(m.active, key)
+	m.mu.Unlock()
+	close(stream.cleanupDone)
 }
 
 func waitForStreamWorkers(stream *streamInfo) {

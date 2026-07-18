@@ -3,8 +3,12 @@ package ffmpeg
 import (
 	"cinemator/domain"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 )
+
+const minimumHLSBitrate = int64(5_500_000)
 
 // StreamSelection specifies which audio/subtitle tracks to include.
 type StreamSelection struct {
@@ -96,6 +100,41 @@ func HLSMode(info domain.MediaInfo, sel StreamSelection) string {
 	return "hybrid"
 }
 
+// HLSReservationBitrate returns the enforced compatibility peak or a
+// conservative source peak for direct remux. It scales with the source frame
+// size and rate; it never changes direct-play bytes or resolution.
+func HLSReservationBitrate(info domain.MediaInfo, sel StreamSelection) int64 {
+	bitsPerPixel := 0.0625
+	if !CanRemuxHLS(info, sel) {
+		bitsPerPixel = 0.125
+	}
+	return hlsPeakBitrate(info, bitsPerPixel)
+}
+
+func compatibilityHLSBitrate(info domain.MediaInfo) int64 {
+	return hlsPeakBitrate(info, 0.125)
+}
+
+func hlsPeakBitrate(info domain.MediaInfo, bitsPerPixel float64) int64 {
+	width := max(1, info.Width)
+	height := max(1, info.Height)
+	frameRate := info.FrameRate
+	if frameRate <= 0 || math.IsNaN(frameRate) || math.IsInf(frameRate, 0) {
+		frameRate = 30
+	}
+	pixelBound := float64(width) * float64(height) * frameRate * bitsPerPixel
+	if pixelBound >= float64(math.MaxInt64) {
+		return math.MaxInt64
+	}
+	sourceBound := info.Bitrate
+	if sourceBound > math.MaxInt64/2 {
+		sourceBound = math.MaxInt64
+	} else {
+		sourceBound *= 2
+	}
+	return max(minimumHLSBitrate, sourceBound, int64(math.Ceil(pixelBound)))
+}
+
 // isBitmapSubtitle returns true for image-based subtitle formats
 func isBitmapSubtitle(codec string) bool {
 	switch codec {
@@ -160,6 +199,17 @@ func buildStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
 		"-crf", "18",
+	)
+	peakBitrate := compatibilityHLSBitrate(info)
+	bufferSize := peakBitrate
+	if bufferSize <= math.MaxInt64/2 {
+		bufferSize *= 2
+	} else {
+		bufferSize = math.MaxInt64
+	}
+	args = append(args,
+		"-maxrate", strconv.FormatInt(peakBitrate, 10),
+		"-bufsize", strconv.FormatInt(bufferSize, 10),
 	)
 	if !bitmapSubtitle && len(videoFilters) > 0 {
 		args = append(args, "-vf", strings.Join(videoFilters, ","))

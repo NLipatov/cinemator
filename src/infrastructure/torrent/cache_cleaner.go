@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -84,8 +85,26 @@ func estimatedHlsWindowBytes(duration time.Duration, bitrate int64) int64 {
 		return 0
 	}
 	bitrate = max(bitrate, maxMuxedBitsPerSecond)
-	base := bitrate / 8 * int64(duration/time.Second)
-	return base + base/4
+	seconds := int64(math.Ceil(duration.Seconds()))
+	bytesPerSecond := bitrate / 8
+	if bitrate%8 != 0 {
+		bytesPerSecond++
+	}
+	if seconds > math.MaxInt64/bytesPerSecond {
+		return math.MaxInt64
+	}
+	base := bytesPerSecond * seconds
+	// Compatibility output uses a two-second VBV buffer. The remaining 25%
+	// covers muxing, init data and filesystem allocation granularity.
+	buffer := bytesPerSecond * 2
+	overhead := base / 4
+	if base%4 != 0 {
+		overhead++
+	}
+	if base > math.MaxInt64-buffer || base+buffer > math.MaxInt64-overhead {
+		return math.MaxInt64
+	}
+	return base + buffer + overhead
 }
 
 func estimatedHlsWindowInodes(duration, segmentDuration time.Duration) uint64 {
@@ -153,26 +172,49 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].last.Before(candidates[j].last)
 	})
-	var removedFiles int
-	var unlinkedBytes int64
+	selected := make([]hlsCacheItem, 0, len(candidates))
+	projected := total
 	for _, item := range candidates {
-		if total <= target {
+		if projected <= target {
 			break
 		}
-		var removed bool
-		var err error
+		selected = append(selected, item)
+		projected -= item.size
+	}
+	type activeEvictionBatch struct {
+		dir   string
+		items []hlsCacheItem
+	}
+	activeBatches := make(map[string]*activeEvictionBatch)
+	var batchOrder []*activeEvictionBatch
+	var standalone []hlsCacheItem
+	for _, item := range selected {
 		rel, relErr := filepath.Rel(root, item.path)
 		parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
 		if relErr == nil && len(parts) == 2 {
 			_, isActive := active[parts[0]]
 			if isActive && isImmutableHlsAsset(filepath.Base(item.path)) {
-				removed, err = m.evictActiveHlsAsset(parts[0], item.path)
-			} else {
-				removed, err = m.assets.TryEvict(item.path)
+				batch := activeBatches[parts[0]]
+				if batch == nil {
+					batch = &activeEvictionBatch{dir: parts[0]}
+					activeBatches[parts[0]] = batch
+					batchOrder = append(batchOrder, batch)
+				}
+				batch.items = append(batch.items, item)
+				continue
 			}
-		} else {
-			removed, err = m.assets.TryEvict(item.path)
 		}
+		standalone = append(standalone, item)
+	}
+	var removedFiles int
+	var unlinkedBytes int64
+	recordRemoved := func(item hlsCacheItem) {
+		total -= item.size
+		removedFiles++
+		unlinkedBytes += item.size
+	}
+	for _, item := range standalone {
+		removed, err := m.assets.TryEvict(item.path)
 		if err != nil {
 			log.Printf("enforceCacheLimit: failed to remove %s: %v", item.path, err)
 			continue
@@ -180,9 +222,23 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 		if !removed {
 			continue
 		}
-		total -= item.size
-		removedFiles++
-		unlinkedBytes += item.size
+		recordRemoved(item)
+	}
+	for _, batch := range batchOrder {
+		paths := make([]string, len(batch.items))
+		for index, item := range batch.items {
+			paths[index] = item.path
+		}
+		removed, err := m.evictActiveHlsAssets(batch.dir, paths)
+		for _, item := range batch.items {
+			if _, ok := removed[item.path]; ok {
+				recordRemoved(item)
+			}
+		}
+		if err != nil {
+			log.Printf("enforceCacheLimit: failed to rotate stream %s: %v", batch.dir, err)
+			continue
+		}
 	}
 	if removedFiles > 0 {
 		log.Printf("enforceCacheLimit: unlinked %d closed files (%d allocated bytes removed from logical cache accounting)", removedFiles, unlinkedBytes)

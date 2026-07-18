@@ -26,7 +26,6 @@ type manager struct {
 	client      *torrent.Client
 	active      map[streamKey]*streamInfo
 	mediaInfo   map[mediaKey]domain.MediaInfo
-	torrents    map[string]int
 	sources     *rangeServer
 	downloads   *downloadStore
 	assets      *hlsAssetStore
@@ -128,7 +127,6 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 		client:      client,
 		active:      make(map[streamKey]*streamInfo),
 		mediaInfo:   make(map[mediaKey]domain.MediaInfo),
-		torrents:    make(map[string]int),
 		sources:     sources,
 		downloads:   downloads,
 		assets:      assets,
@@ -393,6 +391,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			videoJobs:     make(map[*segmentJob]struct{}),
 			subtitleJobs:  make(map[*segmentJob]struct{}),
 			directWindows: make(map[int][]ffmpeg.HLSFragment),
+			cleanupDone:   make(chan struct{}),
 		}
 
 		m.mu.Lock()
@@ -418,7 +417,6 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			}
 			s = candidate
 			m.active[key] = s
-			m.torrents[hash]++
 			m.mu.Unlock()
 			go m.initializeOnDemandStream(key, s)
 			m.notifyDownloadsChanged()
@@ -475,7 +473,6 @@ func (m *manager) DeleteDownload(ctx context.Context, id string) error {
 	}
 
 	m.mu.Lock()
-	delete(m.torrents, id)
 	for key := range m.mediaInfo {
 		if key.InfoHash == id {
 			delete(m.mediaInfo, key)

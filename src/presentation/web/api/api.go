@@ -14,6 +14,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -434,7 +435,16 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "playlist changed", http.StatusConflict)
 				return
 			}
-			http.Error(w, "playlist not found", 404)
+			if !errors.Is(err, context.Canceled) {
+				log.Printf("prepare HLS playlist %s: %v", clean, err)
+			}
+			if errors.Is(err, os.ErrNotExist) {
+				http.Error(w, "playlist not found", http.StatusNotFound)
+			} else if errors.Is(err, context.DeadlineExceeded) {
+				http.Error(w, "playlist preparation timed out", http.StatusGatewayTimeout)
+			} else {
+				http.Error(w, "playlist unavailable", http.StatusServiceUnavailable)
+			}
 			return
 		}
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
@@ -513,6 +523,9 @@ func readHlsAssetWithWait(ctx context.Context, open func() (application.HlsAsset
 		if errors.Is(err, domain.ErrHlsPlaylistChanged) {
 			return nil, err
 		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 		if err == nil {
 			data, readErr := io.ReadAll(asset)
 			closeErr := asset.Close()
@@ -520,9 +533,9 @@ func readHlsAssetWithWait(ctx context.Context, open func() (application.HlsAsset
 				return data, nil
 			}
 			if readErr != nil {
-				err = readErr
+				return nil, readErr
 			} else if closeErr != nil {
-				err = closeErr
+				return nil, closeErr
 			}
 		}
 		if time.Now().After(deadline) {

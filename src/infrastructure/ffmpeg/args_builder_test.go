@@ -2,6 +2,7 @@ package ffmpeg
 
 import (
 	"cinemator/domain"
+	"math"
 	"slices"
 	"strings"
 	"testing"
@@ -83,18 +84,42 @@ func TestBuildStreamArgsToneMapsHDRBeforeBitmapSubtitles(t *testing.T) {
 	}
 }
 
-func TestBuildStreamArgsPreservesResolutionAndUsesQualityMode(t *testing.T) {
+func TestBuildStreamArgsPreservesResolutionAndBoundsPeakRate(t *testing.T) {
 	args := buildStreamArgs(domain.MediaInfo{VideoCodec: "hevc", Width: 3840, Height: 2160}, StreamSelection{})
 	joined := strings.Join(args, " ")
-	for _, want := range []string{"-crf 18", "format=yuv420p"} {
+	for _, want := range []string{"-crf 18", "format=yuv420p", "-maxrate 31104000", "-bufsize 62208000"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("buildStreamArgs() missing %q: %v", want, args)
 		}
 	}
-	for _, unwanted := range []string{"scale=", "-b:v", "-maxrate", "-bufsize"} {
+	for _, unwanted := range []string{"scale=", "-b:v"} {
 		if strings.Contains(joined, unwanted) {
 			t.Fatalf("buildStreamArgs() contains %q: %v", unwanted, args)
 		}
+	}
+}
+
+func TestHLSReservationBitrateKeepsDirectVideoUntouched(t *testing.T) {
+	info := domain.MediaInfo{VideoCodec: "av1", VideoProfile: "Main", PixelFormat: "yuv420p10le", Duration: 60, Width: 7680, Height: 4320, FrameRate: 60, Bitrate: 80_000_000}
+	if !CanRemuxHLS(info, StreamSelection{}) {
+		t.Fatal("8K source unexpectedly requires transcoding")
+	}
+	if got := HLSReservationBitrate(info, StreamSelection{}); got != 160_000_000 {
+		t.Fatalf("HLSReservationBitrate() = %d, want source peak 160000000", got)
+	}
+	if got := HLSReservationBitrate(info, StreamSelection{ForceTranscode: true}); got != 248_832_000 {
+		t.Fatalf("forced HLSReservationBitrate() = %d, want compatibility peak 248832000", got)
+	}
+	args := strings.Join(buildRemuxStreamArgs(info, StreamSelection{}), " ")
+	if strings.Contains(args, "maxrate") || !strings.Contains(args, "-c:v copy") {
+		t.Fatalf("direct args alter source video: %s", args)
+	}
+}
+
+func TestHLSReservationBitrateSaturates(t *testing.T) {
+	info := domain.MediaInfo{Width: 1, Height: 1, FrameRate: math.MaxFloat64}
+	if got := HLSReservationBitrate(info, StreamSelection{}); got != math.MaxInt64 {
+		t.Fatalf("HLSReservationBitrate() = %d, want saturation at %d", got, int64(math.MaxInt64))
 	}
 }
 
