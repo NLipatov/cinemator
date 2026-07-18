@@ -65,6 +65,10 @@ func newRangeServer() (*rangeServer, error) {
 	return rs, nil
 }
 
+func (rs *rangeServer) Close(ctx context.Context) error {
+	return rs.srv.Shutdown(ctx)
+}
+
 func (rs *rangeServer) register(file *torrent.File, readahead int64, onRead func(string, int64), onError func(error)) (token, sourceURL string, err error) {
 	for {
 		token, err = randomToken()

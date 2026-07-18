@@ -14,6 +14,7 @@ import (
 
 	"cinemator/application"
 	"cinemator/domain"
+	"cinemator/infrastructure/cli"
 	"cinemator/infrastructure/ffmpeg"
 	"cinemator/presentation/settings"
 
@@ -28,16 +29,58 @@ type manager struct {
 	torrents    map[string]int
 	sources     *rangeServer
 	downloads   *downloadStore
+	assets      *hlsAssetStore
+	pieces      *pieceCacheProvider
 	events      *downloadEventBroadcaster
 	mu          sync.Mutex
 	cacheMu     sync.Mutex
 	hlsReserved int64
+	hlsDisk     *diskBudget
+	ownership   *cacheOwnership
+	cleanupWG   sync.WaitGroup
+	watcherStop chan struct{}
+	watcherDone chan struct{}
+	closeOnce   sync.Once
+	closeErr    error
 	transcodes  chan struct{}
 	jobs        chan struct{}
 	settings    settings.Settings
 }
 
 func NewManager(settings settings.Settings) (application.TorrentManager, error) {
+	if err := os.MkdirAll(settings.HlsPath(), 0700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(settings.HlsPath(), 0700); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(settings.DownloadPath(), 0700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(settings.DownloadPath(), 0700); err != nil {
+		return nil, err
+	}
+	if err := validateCacheRoots(settings.HlsPath(), settings.DownloadPath()); err != nil {
+		return nil, err
+	}
+	ownership, err := acquireCacheOwnership(settings.HlsPath(), settings.DownloadPath())
+	if err != nil {
+		return nil, err
+	}
+	keepOwnership := false
+	defer func() {
+		if !keepOwnership {
+			_ = ownership.Close()
+		}
+	}()
+	diskBudgets, err := newDiskBudgets(
+		[]string{settings.HlsPath(), settings.DownloadPath()},
+		settings.MinFreeBytes(),
+		settings.MinFreeInodes(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("configure disk admission: %w", err)
+	}
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DataDir = settings.DownloadPath()
 	cfg.ListenPort = settings.TorrentPort()
@@ -48,24 +91,17 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	// A capped cache can evict a piece after the torrent was briefly complete.
 	// Keep seed connections so a later seek can fetch that piece again.
 	cfg.DropMutuallyCompletePeers = false
-	pieceCache, err := newPieceCache(settings.DownloadPath(), settings.MaxTorrentCacheBytes())
+	pieceCache, err := newPieceCache(settings.DownloadPath(), settings.MaxTorrentCacheBytes(), diskBudgets[settings.DownloadPath()])
 	if err != nil {
 		return nil, err
 	}
 	cfg.DefaultStorage = pieceCache
-	client, err := torrent.NewClient(cfg)
+	assets, err := newHlsAssetStore(settings.HlsPath())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("open HLS asset store: %w", err)
 	}
-	if mkdirErr := os.MkdirAll(settings.HlsPath(), 0755); mkdirErr != nil {
-		return nil, mkdirErr
-	}
-	if mkdirErr := os.MkdirAll(settings.DownloadPath(), 0755); mkdirErr != nil {
-		return nil, mkdirErr
-	}
-	sources, err := newRangeServer()
-	if err != nil {
-		return nil, err
+	if err := discardPreviousHlsStreams(assets, settings.HlsPath()); err != nil {
+		return nil, fmt.Errorf("discard previous HLS streams: %w", err)
 	}
 	downloads, err := newDownloadStore(settings.DownloadPath())
 	if err != nil {
@@ -74,20 +110,130 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	if err := downloads.discardLegacyPayloads(); err != nil {
 		return nil, fmt.Errorf("discard legacy torrent cache: %w", err)
 	}
-	m := &manager{
-		client:     client,
-		active:     make(map[streamKey]*streamInfo),
-		mediaInfo:  make(map[mediaKey]domain.MediaInfo),
-		torrents:   make(map[string]int),
-		sources:    sources,
-		downloads:  downloads,
-		events:     newDownloadEventBroadcaster(),
-		transcodes: make(chan struct{}, settings.MaxTranscodes()),
-		jobs:       make(chan struct{}, settings.MaxQueuedJobs()),
-		settings:   settings,
+	client, err := torrent.NewClient(cfg)
+	if err != nil {
+		return nil, err
 	}
+	keepClient := false
+	defer func() {
+		if !keepClient {
+			client.Close()
+		}
+	}()
+	sources, err := newRangeServer()
+	if err != nil {
+		return nil, err
+	}
+	m := &manager{
+		client:      client,
+		active:      make(map[streamKey]*streamInfo),
+		mediaInfo:   make(map[mediaKey]domain.MediaInfo),
+		torrents:    make(map[string]int),
+		sources:     sources,
+		downloads:   downloads,
+		assets:      assets,
+		pieces:      pieceCache.provider,
+		hlsDisk:     diskBudgets[settings.HlsPath()],
+		ownership:   ownership,
+		watcherStop: make(chan struct{}),
+		watcherDone: make(chan struct{}),
+		events:      newDownloadEventBroadcaster(),
+		transcodes:  make(chan struct{}, settings.MaxTranscodes()),
+		jobs:        make(chan struct{}, settings.MaxQueuedJobs()),
+		settings:    settings,
+	}
+	keepOwnership = true
+	keepClient = true
 	go m.viewerWatcher()
 	return m, nil
+}
+
+func (m *manager) Close() error {
+	m.closeOnce.Do(func() {
+		close(m.watcherStop)
+		<-m.watcherDone
+
+		m.mu.Lock()
+		keys := make([]streamKey, 0, len(m.active))
+		for key := range m.active {
+			keys = append(keys, key)
+		}
+		m.mu.Unlock()
+		for _, key := range keys {
+			m.cleanup(key)
+		}
+		m.cleanupWG.Wait()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		m.closeErr = errors.Join(m.closeErr, m.sources.Close(ctx))
+		m.closeErr = errors.Join(m.closeErr, errors.Join(m.client.Close()...))
+		if m.assets.hasReaders() || m.pieces.hasLeases() {
+			m.closeErr = errors.Join(m.closeErr, errors.New("cache ownership retained because managed file handles did not close cleanly"))
+			return
+		}
+		m.closeErr = errors.Join(m.closeErr, m.ownership.Close())
+	})
+	return m.closeErr
+}
+
+func validateCacheRoots(hls, download string) error {
+	hls, err := canonicalCacheRoot(hls)
+	if err != nil {
+		return err
+	}
+	download, err = canonicalCacheRoot(download)
+	if err != nil {
+		return err
+	}
+	separator := string(os.PathSeparator)
+	if hls == download || strings.HasPrefix(hls, download+separator) || strings.HasPrefix(download, hls+separator) {
+		return errors.New("HLS and torrent cache roots must be disjoint")
+	}
+	return nil
+}
+
+func canonicalCacheRoot(root string) (string, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	current := filepath.Clean(abs)
+	var missing []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for index := len(missing) - 1; index >= 0; index-- {
+				resolved = filepath.Join(resolved, missing[index])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return filepath.Clean(abs), nil
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
+func discardPreviousHlsStreams(assets *hlsAssetStore, root string) error {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if err := assets.RetireTree(filepath.Join(root, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
@@ -150,7 +296,7 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 		return domain.MediaInfo{}, err
 	}
 	defer source.Close()
-	info, err := source.Probe(ctx)
+	info, err := source.Probe(cli.WithProcessGuards(ctx, m.ownership.guardFiles()...))
 	if err == nil && info.VideoCodec == "" {
 		return domain.MediaInfo{}, errors.New("selected file has no video stream")
 	}
@@ -217,7 +363,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			return "", sourceErr
 		}
 
-		streamCtx, cancel := context.WithCancel(context.Background())
+		streamCtx, cancel := context.WithCancel(cli.WithProcessGuards(context.Background(), m.ownership.guardFiles()...))
 		now := time.Now()
 		candidate = &streamInfo{
 			cancel:         cancel,
@@ -264,7 +410,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			// Remove playlists from an earlier process before publishing the
 			// stream. Otherwise a recovering player can read a stale master
 			// while initialization is still probing the torrent.
-			if resetErr := resetStreamOutput(paths); resetErr != nil {
+			if resetErr := m.resetStreamOutput(paths); resetErr != nil {
 				m.mu.Unlock()
 				cancel()
 				source.Close()
@@ -433,7 +579,7 @@ func (m *manager) removeDownloadHlsDirs(id string) error {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
 			continue
 		}
-		if err := os.RemoveAll(filepath.Join(m.settings.HlsPath(), entry.Name())); err != nil {
+		if err := m.assets.RetireTree(filepath.Join(m.settings.HlsPath(), entry.Name())); err != nil && !errors.Is(err, errHlsAssetsBusy) {
 			return err
 		}
 	}

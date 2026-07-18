@@ -1,8 +1,6 @@
 package torrent
 
 import (
-	"cinemator/domain"
-	"cinemator/infrastructure/ffmpeg"
 	"context"
 	"errors"
 	"fmt"
@@ -11,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"cinemator/domain"
+	"cinemator/infrastructure/ffmpeg"
 
 	"github.com/anacrolix/torrent"
 )
@@ -56,7 +57,8 @@ type streamInfo struct {
 	progressiveRetry      bool
 	videoJobs             map[*segmentJob]struct{}
 	subtitleJobs          map[*segmentJob]struct{}
-	playlistMtx           sync.Mutex
+	playlistMtx           sync.RWMutex
+	generationMtx         sync.RWMutex
 	closing               bool
 }
 
@@ -227,7 +229,9 @@ func publicStreamError(err error) string {
 		return "Preparing this media window timed out"
 	case strings.Contains(message, "no space left"):
 		return "The server ran out of disk space while preparing video"
-	case strings.Contains(message, "reserve") && strings.Contains(message, "hls cache"):
+	case strings.Contains(message, "insufficient disk") || strings.Contains(message, "free-space floor") || strings.Contains(message, "free-inode"):
+		return "The server is preserving its emergency disk reserve; free space or lower the configured cache budgets"
+	case strings.Contains(message, "hls cache") && (strings.Contains(message, "reserve") || strings.Contains(message, "hard limit")):
 		return "The configured HLS cache is too small for a transcoding window"
 	case errors.Is(err, errStreamJobQueueFull), errors.Is(err, errStreamJobLimit), strings.Contains(message, "active stream limit"):
 		return "The server is at its configured streaming capacity; retry shortly"

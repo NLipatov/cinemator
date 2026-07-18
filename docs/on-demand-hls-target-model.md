@@ -1019,6 +1019,7 @@ and resource invariants have tests.
 
 ## References
 
+- [Cache asset lifecycle and disk admission](cache-asset-lifecycle.md)
 - [RFC 8216: HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216.html)
 - [RFC 6381: MIME codecs and profiles](https://www.rfc-editor.org/rfc/rfc6381.html)
 - [W3C Media Capabilities](https://www.w3.org/TR/media-capabilities/)

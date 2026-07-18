@@ -4,9 +4,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"cinemator/domain"
+	"cinemator/infrastructure/ffmpeg"
 	"cinemator/presentation/settings"
 )
 
@@ -43,9 +46,10 @@ func TestEnforceCacheLimitEvictsActiveGeneratedAssetsButProtectsManifestsAndWork
 	}
 
 	m := &manager{
-		active:   map[streamKey]*streamInfo{key: {paths: paths}},
+		active:   map[streamKey]*streamInfo{key: readyCacheTestStream(paths)},
 		settings: settings.NewSettings(),
 	}
+	m.assets, _ = newHlsAssetStore(root)
 	m.enforceCacheLimit()
 
 	if _, err := os.Stat(filepath.Join(paths.outDir, "chunk_000000.ts")); !errors.Is(err, os.ErrNotExist) {
@@ -72,7 +76,11 @@ func TestReserveHlsGenerationCreatesAndReleasesHardHeadroom(t *testing.T) {
 	if err := os.Truncate(old, 6<<20); err != nil {
 		t.Fatal(err)
 	}
-	m := &manager{active: make(map[streamKey]*streamInfo), settings: settings.NewSettings()}
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &manager{active: make(map[streamKey]*streamInfo), assets: assets, settings: settings.NewSettings()}
 
 	release, err := m.reserveHlsGeneration(6*time.Second, 0)
 	if err != nil {
@@ -98,7 +106,7 @@ func TestEstimatedHlsWindowBytesUsesSourceBitrate(t *testing.T) {
 	}
 }
 
-func TestCacheDoesNotEvictJustRequestedActiveSegment(t *testing.T) {
+func TestCacheDoesNotUnlinkLeasedActiveSegment(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "1")
@@ -111,9 +119,84 @@ func TestCacheDoesNotEvictJustRequestedActiveSegment(t *testing.T) {
 	if err := os.WriteFile(segment, []byte("recent"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	m := &manager{active: map[streamKey]*streamInfo{key: {paths: paths}}, settings: settings.NewSettings()}
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asset, err := assets.Open(segment)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &manager{active: map[streamKey]*streamInfo{key: readyCacheTestStream(paths)}, assets: assets, settings: settings.NewSettings()}
 	m.enforceCacheLimit()
 	if _, err := os.Stat(segment); err != nil {
-		t.Fatalf("recent active segment was evicted: %v", err)
+		t.Fatalf("leased active segment was evicted: %v", err)
+	}
+	if err := asset.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m.enforceCacheLimit()
+	if _, err := os.Stat(segment); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("released segment was not evicted: %v", err)
+	}
+}
+
+func readyCacheTestStream(paths streamPaths) *streamInfo {
+	ready := make(chan struct{})
+	close(ready)
+	return &streamInfo{
+		paths:         paths,
+		ready:         ready,
+		assetVersion:  "old",
+		mediaInfo:     domain.MediaInfo{Duration: 12},
+		selection:     ffmpeg.StreamSelection{SubtitleTrackIndex: -1},
+		directWindows: make(map[int][]ffmpeg.HLSFragment),
+	}
+}
+
+func TestActiveAssetEvictionRotatesImmutableGeneration(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CINEMATOR_HLS_PATH", root)
+	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "1")
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
+	paths := key.paths(root)
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	segment := filepath.Join(paths.outDir, "chunk_000000.ts")
+	if err := os.WriteFile(segment, []byte("segment"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	close(ready)
+	stream := &streamInfo{
+		paths:         paths,
+		ready:         ready,
+		assetVersion:  "old",
+		mediaInfo:     domain.MediaInfo{Duration: 12},
+		selection:     ffmpeg.StreamSelection{SubtitleTrackIndex: -1},
+		directWindows: make(map[int][]ffmpeg.HLSFragment),
+	}
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &manager{active: map[streamKey]*streamInfo{key: stream}, assets: assets, settings: settings.NewSettings()}
+	m.enforceCacheLimit()
+	if _, err := os.Stat(segment); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("segment was not evicted: %v", err)
+	}
+	stream.mtx.Lock()
+	version := stream.assetVersion
+	stream.mtx.Unlock()
+	if version == "old" || version == "" {
+		t.Fatalf("asset version was not rotated: %q", version)
+	}
+	playlist, err := os.ReadFile(paths.videoPlaylist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(playlist), "?v="+version) {
+		t.Fatalf("rotated playlist does not use version %q:\n%s", version, playlist)
 	}
 }

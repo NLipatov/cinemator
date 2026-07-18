@@ -3,6 +3,7 @@ package torrent
 import (
 	"cinemator/domain"
 	"cinemator/infrastructure/ffmpeg"
+	"cinemator/presentation/settings"
 	"context"
 	"errors"
 	"os"
@@ -130,6 +131,67 @@ func TestIndependentSegmentJobsDoNotCancelEachOther(t *testing.T) {
 	}
 	if got := findSegmentJob(stream.videoJobs, 22); got != second {
 		t.Fatalf("findSegmentJob() = %p, want second job %p", got, second)
+	}
+}
+
+func TestEnsureHlsAssetRejectsStaleGeneration(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	ready := make(chan struct{})
+	close(ready)
+	stream := &streamInfo{ready: ready, assetVersion: "current"}
+	manager := &manager{active: map[streamKey]*streamInfo{key: stream}}
+	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), "index.m3u8", "stale"); !errors.Is(err, domain.ErrHlsPlaylistChanged) {
+		t.Fatalf("stale generation error = %v", err)
+	}
+	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), "master.m3u8", ""); err != nil {
+		t.Fatalf("master playlist without version error = %v", err)
+	}
+}
+
+func TestOpenHlsPlaylistBlocksReplacementUntilClose(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CINEMATOR_HLS_PATH", root)
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	paths := key.paths(root)
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.videoPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	close(ready)
+	stream := &streamInfo{ready: ready, assetVersion: "current", paths: paths}
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, assets: assets, settings: settings.NewSettings()}
+	asset, err := manager.OpenHlsAsset(context.Background(), key.dirName(), "index.m3u8", "current")
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempted := make(chan struct{})
+	locked := make(chan struct{})
+	go func() {
+		close(attempted)
+		stream.playlistMtx.Lock()
+		close(locked)
+		stream.playlistMtx.Unlock()
+	}()
+	<-attempted
+	select {
+	case <-locked:
+		t.Fatal("playlist writer passed an active response lease")
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := asset.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("playlist writer did not resume after response close")
 	}
 }
 

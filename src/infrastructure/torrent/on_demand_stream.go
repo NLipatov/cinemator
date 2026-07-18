@@ -1,7 +1,6 @@
 package torrent
 
 import (
-	"cinemator/domain"
 	"context"
 	"errors"
 	"fmt"
@@ -11,8 +10,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"cinemator/application"
+	"cinemator/domain"
 	"cinemator/infrastructure/ffmpeg"
 )
 
@@ -88,17 +90,30 @@ func (m *manager) initializeOnDemandStream(key streamKey, s *streamInfo) {
 	}
 	directPlay := err == nil && ffmpeg.CanRemuxHLS(info, s.selection)
 	if err == nil {
-		err = ffmpeg.PrepareOnDemandHLS(
-			s.paths.outDir,
-			s.paths.videoPlaylist,
-			s.paths.subtitlePlaylist,
-			s.paths.masterPlaylist,
-			info,
-			s.selection,
-			m.settings.HlsSegmentDuration(),
-			m.settings.HlsWindowSegments(),
-			s.assetVersion,
-		)
+		err = func() error {
+			s.playlistMtx.Lock()
+			defer s.playlistMtx.Unlock()
+			var reservation *diskReservation
+			if m.hlsDisk != nil {
+				var reserveErr error
+				reservation, reserveErr = m.hlsDisk.Reserve(estimatedHlsMetadataBytes(info.Duration, m.settings.HlsSegmentDuration(), s.selection.SubtitleTrackIndex >= 0), 8)
+				if reserveErr != nil {
+					return reserveErr
+				}
+				defer reservation.Release()
+			}
+			return ffmpeg.PrepareOnDemandHLS(
+				s.paths.outDir,
+				s.paths.videoPlaylist,
+				s.paths.subtitlePlaylist,
+				s.paths.masterPlaylist,
+				info,
+				s.selection,
+				m.settings.HlsSegmentDuration(),
+				m.settings.HlsWindowSegments(),
+				s.assetVersion,
+			)
+		}()
 	}
 
 	s.mtx.Lock()
@@ -131,7 +146,211 @@ func (m *manager) initializeOnDemandStream(key streamKey, s *streamInfo) {
 	}
 }
 
-func (m *manager) EnsureHlsAsset(ctx context.Context, streamDir, assetName string) error {
+func estimatedHlsMetadataBytes(duration float64, segmentDuration time.Duration, subtitles bool) uint64 {
+	const base = uint64(1 << 20)
+	if duration <= 0 || segmentDuration <= 0 {
+		return base
+	}
+	entries := math.Ceil(duration / segmentDuration.Seconds())
+	if subtitles {
+		entries *= 2
+	}
+	if entries >= float64((math.MaxInt64-base)/128) {
+		return math.MaxInt64
+	}
+	return base + uint64(entries)*128
+}
+
+func (m *manager) OpenHlsAsset(ctx context.Context, streamDir, assetName, version string) (application.HlsAsset, error) {
+	if assetName == "" || filepath.Base(assetName) != assetName {
+		return application.HlsAsset{}, errors.New("bad HLS asset name")
+	}
+	key, err := parseStreamDir(streamDir)
+	if err != nil {
+		return application.HlsAsset{}, fmt.Errorf("bad stream: %w", err)
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := m.ensureHlsAsset(ctx, streamDir, assetName, version); err != nil {
+			return application.HlsAsset{}, err
+		}
+		m.mu.Lock()
+		stream := m.active[key]
+		m.mu.Unlock()
+		if stream == nil {
+			return application.HlsAsset{}, errors.New("stream not found")
+		}
+		stream.generationMtx.RLock()
+		var unlockPlaylist func()
+		if strings.HasSuffix(assetName, ".m3u8") {
+			stream.playlistMtx.RLock()
+			unlockPlaylist = stream.playlistMtx.RUnlock
+		}
+		stream.mtx.Lock()
+		currentVersion := stream.assetVersion
+		stream.mtx.Unlock()
+		if assetName != "master.m3u8" && version != currentVersion {
+			if unlockPlaylist != nil {
+				unlockPlaylist()
+			}
+			stream.generationMtx.RUnlock()
+			return application.HlsAsset{}, domain.ErrHlsPlaylistChanged
+		}
+		asset, err := m.assets.Open(filepath.Join(m.settings.HlsPath(), streamDir, assetName))
+		stream.generationMtx.RUnlock()
+		if err == nil {
+			if unlockPlaylist != nil {
+				asset.ReadSeekCloser = &lockedHlsAsset{ReadSeekCloser: asset.ReadSeekCloser, unlock: unlockPlaylist}
+			}
+			return asset, nil
+		}
+		if unlockPlaylist != nil {
+			unlockPlaylist()
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return application.HlsAsset{}, err
+		}
+	}
+	return application.HlsAsset{}, os.ErrNotExist
+}
+
+type lockedHlsAsset struct {
+	application.ReadSeekCloser
+	unlock func()
+	once   sync.Once
+	err    error
+}
+
+func (a *lockedHlsAsset) Close() error {
+	a.once.Do(func() {
+		a.err = a.ReadSeekCloser.Close()
+		if a.err == nil {
+			a.unlock()
+		}
+	})
+	return a.err
+}
+
+func (m *manager) evictActiveHlsAsset(streamDir, assetPath string) (bool, error) {
+	key, err := parseStreamDir(streamDir)
+	if err != nil {
+		return false, err
+	}
+	m.mu.Lock()
+	stream := m.active[key]
+	m.mu.Unlock()
+	if stream == nil {
+		return m.assets.TryEvict(assetPath)
+	}
+
+	// OpenHlsAsset takes the read side of this lock. Holding the write side
+	// makes playlist rollover, generation invalidation and unlink one atomic
+	// operation from the HTTP layer's point of view.
+	stream.generationMtx.Lock()
+	defer stream.generationMtx.Unlock()
+	stream.playlistMtx.Lock()
+	defer stream.playlistMtx.Unlock()
+	evictable, err := m.assets.CanEvict(assetPath)
+	if err != nil || !evictable {
+		return false, err
+	}
+
+	stream.mtx.Lock()
+	if stream.closing || stream.fatalErr != nil || stream.assetVersion == "" {
+		stream.mtx.Unlock()
+		return false, nil
+	}
+	evictedOwners := make(map[int]struct{}, 1)
+	name := filepath.Base(assetPath)
+	if owner, ok := parseDirectSegmentOwner(name); ok {
+		evictedOwners[owner] = struct{}{}
+	}
+	if owner, ok := parseDirectInitOwner(name); ok {
+		evictedOwners[owner] = struct{}{}
+	}
+	version := fmt.Sprintf("%x", time.Now().UnixNano())
+	info := stream.mediaInfo
+	selection := stream.selection
+	directPlay := stream.directPlay
+	progressiveCount := stream.progressiveAdvertised
+	progressiveLast := stream.progressiveLast
+	progressiveEnded := stream.progressiveEnded
+	directWindows := make(map[int][]ffmpeg.HLSFragment, len(stream.directWindows))
+	fragments := make([]ffmpeg.HLSFragment, 0)
+	for owner, window := range stream.directWindows {
+		if _, evicted := evictedOwners[owner]; evicted {
+			continue
+		}
+		directWindows[owner] = window
+		fragments = append(fragments, window...)
+	}
+	stream.mtx.Unlock()
+	var reservation *diskReservation
+	if m.hlsDisk != nil {
+		reservation, err = m.hlsDisk.Reserve(estimatedHlsMetadataBytes(info.Duration, m.settings.HlsSegmentDuration(), selection.SubtitleTrackIndex >= 0), 4)
+		if err != nil {
+			stream.mtx.Lock()
+			stream.fatalErr = err
+			stream.status.Phase = "error"
+			stream.status.Message = publicStreamError(err)
+			stream.status.LastProgress = time.Now()
+			stream.mtx.Unlock()
+			return false, err
+		}
+		defer reservation.Release()
+	}
+
+	err = ffmpeg.PrepareOnDemandHLS(
+		stream.paths.outDir,
+		stream.paths.videoPlaylist,
+		stream.paths.subtitlePlaylist,
+		stream.paths.masterPlaylist,
+		info,
+		selection,
+		m.settings.HlsSegmentDuration(),
+		m.settings.HlsWindowSegments(),
+		version,
+	)
+	if err == nil && directPlay {
+		err = ffmpeg.UpdateDirectHLS(
+			stream.paths.videoPlaylist,
+			info,
+			selection,
+			m.settings.HlsSegmentDuration(),
+			m.settings.HlsWindowSegments(),
+			version,
+			fragments,
+		)
+	} else if err == nil && info.Duration <= 0 {
+		err = ffmpeg.UpdateProgressiveHLS(
+			stream.paths.videoPlaylist,
+			stream.paths.subtitlePlaylist,
+			ffmpeg.UsesTextSubtitles(info, selection),
+			m.settings.HlsSegmentDuration(),
+			m.settings.HlsWindowSegments(),
+			version,
+			progressiveCount,
+			progressiveLast,
+			progressiveEnded,
+		)
+	}
+	stream.mtx.Lock()
+	if err != nil {
+		stream.fatalErr = fmt.Errorf("rotate HLS generation: %w", err)
+		stream.status.Phase = "error"
+		stream.status.Message = publicStreamError(stream.fatalErr)
+		stream.status.LastProgress = time.Now()
+		stream.mtx.Unlock()
+		return false, stream.fatalErr
+	}
+	stream.directWindows = directWindows
+	stream.assetVersion = version
+	stream.mtx.Unlock()
+
+	removed, removeErr := m.assets.TryEvict(assetPath)
+	return removed, removeErr
+}
+
+func (m *manager) ensureHlsAsset(ctx context.Context, streamDir, assetName, version string) error {
 	key, err := parseStreamDir(streamDir)
 	if err != nil {
 		return fmt.Errorf("bad stream: %w", err)
@@ -148,7 +367,22 @@ func (m *manager) EnsureHlsAsset(ctx context.Context, streamDir, assetName strin
 
 	s.mtx.Lock()
 	s.lastView = time.Now()
+	fatalErr := s.fatalErr
+	closing := s.closing
+	currentVersion := s.assetVersion
 	s.mtx.Unlock()
+	if closing {
+		return context.Canceled
+	}
+	if fatalErr != nil {
+		return fatalErr
+	}
+	if assetName != "master.m3u8" && version != currentVersion {
+		return domain.ErrHlsPlaylistChanged
+	}
+	if strings.HasSuffix(assetName, ".m3u8") {
+		return nil
+	}
 	if index, ok := parseSeekAsset(assetName); ok {
 		if err := m.ensureVideoSegment(ctx, s, index); err != nil {
 			return err
@@ -372,6 +606,7 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 		delete(s.videoJobs, job)
 		s.mtx.Unlock()
 		m.releaseJobSlot(job)
+		m.enforceCacheLimit()
 	}()
 	ctx, cancel := context.WithTimeout(ctx, windowGenerationTimeout)
 	defer cancel()
@@ -397,6 +632,18 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 		return
 	}
 	defer release()
+	ctx, stopResourceGuard := context.WithCancelCause(ctx)
+	resourceGuard := m.monitorHlsResources(ctx, stopResourceGuard)
+	defer func() {
+		stopResourceGuard(context.Canceled)
+		resourceErr := <-resourceGuard
+		if cause := context.Cause(ctx); resourceErr == nil && cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
+			resourceErr = cause
+		}
+		if resourceErr != nil && (job.err == nil || errors.Is(job.err, context.Canceled)) {
+			job.err = resourceErr
+		}
+	}()
 	s.markJobStarted(job)
 
 	generateTranscoded := func() error {
@@ -409,13 +656,18 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 			job.begin,
 			job.end-job.begin,
 			m.settings.HlsSegmentDuration(),
-			func(index int) {
+			func(index int) error {
 				s.markSegmentProgress(job, index)
 				if info.Duration <= 0 {
 					if err := m.publishProgressiveSegment(s, index); err != nil {
 						log.Printf("Update progressive HLS after segment %d: %v", index, err)
 					}
 				}
+				if err := m.checkHlsCacheLimit(); err != nil {
+					stopResourceGuard(err)
+					return err
+				}
+				return nil
 			},
 		)
 		return job.err
@@ -441,6 +693,12 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 			directErr = generateDirect()
 		} else {
 			directErr = m.withTranscodeSlot(ctx, generateDirect)
+		}
+		if directErr == nil {
+			if err := m.checkHlsCacheLimit(); err != nil {
+				stopResourceGuard(err)
+				directErr = err
+			}
 		}
 		if directErr == nil {
 			job.fragments = direct.Fragments
@@ -851,9 +1109,29 @@ func (m *manager) runSubtitleJob(s *streamInfo, ctx context.Context, job *segmen
 		delete(s.subtitleJobs, job)
 		s.mtx.Unlock()
 		m.releaseJobSlot(job)
+		m.enforceCacheLimit()
 	}()
 	ctx, cancel := context.WithTimeout(ctx, windowGenerationTimeout)
 	defer cancel()
+	duration := time.Duration(job.end-job.begin) * m.settings.HlsSegmentDuration()
+	release, err := m.reserveHlsGeneration(duration, 0)
+	if err != nil {
+		job.err = err
+		return
+	}
+	defer release()
+	ctx, stopResourceGuard := context.WithCancelCause(ctx)
+	resourceGuard := m.monitorHlsResources(ctx, stopResourceGuard)
+	defer func() {
+		stopResourceGuard(context.Canceled)
+		resourceErr := <-resourceGuard
+		if cause := context.Cause(ctx); resourceErr == nil && cause != nil && !errors.Is(cause, context.Canceled) && !errors.Is(cause, context.DeadlineExceeded) {
+			resourceErr = cause
+		}
+		if resourceErr != nil && (job.err == nil || errors.Is(job.err, context.Canceled)) {
+			job.err = resourceErr
+		}
+	}()
 	job.err = m.withTranscodeSlot(ctx, func() error {
 		s.markJobStarted(job)
 		for index := job.begin; index < job.end; index++ {
@@ -869,6 +1147,10 @@ func (m *manager) runSubtitleJob(s *streamInfo, ctx context.Context, job *segmen
 				index,
 				m.settings.HlsSegmentDuration(),
 			); err != nil {
+				return err
+			}
+			if err := m.checkHlsCacheLimit(); err != nil {
+				stopResourceGuard(err)
 				return err
 			}
 			s.markSegmentProgress(job, index)

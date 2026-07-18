@@ -14,7 +14,6 @@ import (
 	"log"
 	"math"
 	"net/http"
-	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -44,7 +43,8 @@ func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
 	}, nil
 }
 
-func (s *HttpServer) Run() error {
+func (s *HttpServer) Run(ctx context.Context) (result error) {
+	defer func() { result = errors.Join(result, s.mgr.Close()) }()
 	port := s.settings.HttpPort()
 	if port < 0 || port > 65535 {
 		return errors.New("invalid port")
@@ -59,7 +59,25 @@ func (s *HttpServer) Run() error {
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
 	}
-	return server.ListenAndServe()
+	serveResult := make(chan error, 1)
+	go func() { serveResult <- server.ListenAndServe() }()
+	select {
+	case err := <-serveResult:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+	}
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		result = errors.Join(err, server.Close())
+	}
+	if err := <-serveResult; !errors.Is(err, http.ErrServerClosed) {
+		result = errors.Join(result, err)
+	}
+	return result
 }
 
 func (s *HttpServer) handler() http.Handler {
@@ -392,31 +410,30 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	fullPath := filepath.Join(s.settings.HlsPath(), clean)
-	hlsRoot := filepath.Clean(s.settings.HlsPath()) + string(os.PathSeparator)
-	if !strings.HasPrefix(fullPath, hlsRoot) {
+	parts := strings.SplitN(clean, "/", 2)
+	if len(parts) != 2 || filepath.Base(parts[1]) != parts[1] {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-
-	parts := strings.SplitN(clean, "/", 2)
 	streamDir := parts[0]
-	assetName := ""
-	if len(parts) == 2 {
-		assetName = parts[1]
-	}
+	assetName := parts[1]
+	version := r.URL.Query().Get("v")
 
 	if strings.HasSuffix(clean, ".m3u8") {
-		s.mgr.TouchStream(r.Context(), streamDir)
 		w.Header().Set("Cache-Control", "no-store")
-		var data []byte
-		var err error
-		if path.Base(clean) == "master.m3u8" {
-			data, err = readWithWait(r.Context(), fullPath, waitTimeout)
-		} else {
-			data, err = readMediaPlaylistWithWait(r.Context(), fullPath, waitTimeout)
-		}
+		data, err := readHlsAssetWithWait(
+			r.Context(),
+			func() (application.HlsAsset, error) {
+				return s.mgr.OpenHlsAsset(r.Context(), streamDir, assetName, version)
+			},
+			waitTimeout,
+			path.Base(clean) != "master.m3u8",
+		)
 		if err != nil {
+			if errors.Is(err, domain.ErrHlsPlaylistChanged) {
+				http.Error(w, "playlist changed", http.StatusConflict)
+				return
+			}
 			http.Error(w, "playlist not found", 404)
 			return
 		}
@@ -427,41 +444,21 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	var file *os.File
-	var openErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		if err := s.mgr.EnsureHlsAsset(r.Context(), streamDir, assetName); err != nil {
-			if errors.Is(err, domain.ErrHlsPlaylistChanged) {
-				w.Header().Set("Cache-Control", "no-store")
-				http.Error(w, "playlist changed", http.StatusConflict)
-				return
-			}
-			if !errors.Is(err, context.Canceled) {
-				log.Printf("prepare HLS asset %s: %v", clean, err)
-			}
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, "chunk not available", http.StatusServiceUnavailable)
+	asset, err := s.mgr.OpenHlsAsset(r.Context(), streamDir, assetName, version)
+	if err != nil {
+		if errors.Is(err, domain.ErrHlsPlaylistChanged) {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "playlist changed", http.StatusConflict)
 			return
 		}
-		file, openErr = os.Open(fullPath)
-		if openErr == nil {
-			break
+		if !errors.Is(err, context.Canceled) {
+			log.Printf("prepare HLS asset %s: %v", clean, err)
 		}
-		if !errors.Is(openErr, os.ErrNotExist) {
-			http.Error(w, "chunk not found", http.StatusNotFound)
-			return
-		}
-	}
-	if file == nil {
-		http.Error(w, "chunk not found", http.StatusNotFound)
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "chunk not available", http.StatusServiceUnavailable)
 		return
 	}
-	defer file.Close()
-	info, statErr := file.Stat()
-	if statErr != nil {
-		http.Error(w, "chunk not found", http.StatusNotFound)
-		return
-	}
+	defer asset.Close()
 	switch filepath.Ext(assetName) {
 	case ".m4s", ".mp4":
 		w.Header().Set("Content-Type", "video/mp4")
@@ -471,45 +468,67 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	}
 	w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
-	http.ServeContent(w, r, assetName, info.ModTime(), file)
+	response := newIdleDeadlineWriter(w, 2*time.Minute)
+	defer response.clearDeadline()
+	http.ServeContent(response, r, assetName, asset.ModTime, asset)
 }
 
-func waitForPath(ctx context.Context, path string, timeout time.Duration) error {
+type idleDeadlineWriter struct {
+	http.ResponseWriter
+	controller *http.ResponseController
+	timeout    time.Duration
+}
+
+func newIdleDeadlineWriter(response http.ResponseWriter, timeout time.Duration) *idleDeadlineWriter {
+	writer := &idleDeadlineWriter{
+		ResponseWriter: response,
+		controller:     http.NewResponseController(response),
+		timeout:        timeout,
+	}
+	writer.refreshDeadline()
+	return writer
+}
+
+func (w *idleDeadlineWriter) Write(data []byte) (int, error) {
+	w.refreshDeadline()
+	return w.ResponseWriter.Write(data)
+}
+
+func (w *idleDeadlineWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+func (w *idleDeadlineWriter) refreshDeadline() {
+	_ = w.controller.SetWriteDeadline(time.Now().Add(w.timeout))
+}
+
+func (w *idleDeadlineWriter) clearDeadline() {
+	_ = w.controller.SetWriteDeadline(time.Time{})
+}
+
+func readHlsAssetWithWait(ctx context.Context, open func() (application.HlsAsset, error), timeout time.Duration, requireSegment bool) ([]byte, error) {
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(120 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if _, err := os.Stat(path); err == nil {
-			return nil
+		asset, err := open()
+		if errors.Is(err, domain.ErrHlsPlaylistChanged) {
+			return nil, err
+		}
+		if err == nil {
+			data, readErr := io.ReadAll(asset)
+			closeErr := asset.Close()
+			if readErr == nil && closeErr == nil && (!requireSegment || hls.HasSegment(string(data))) {
+				return data, nil
+			}
+			if readErr != nil {
+				err = readErr
+			} else if closeErr != nil {
+				err = closeErr
+			}
 		}
 		if time.Now().After(deadline) {
-			return errors.New("timeout")
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
-func readWithWait(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
-	if err := waitForPath(ctx, path, timeout); err != nil {
-		return nil, err
-	}
-	return os.ReadFile(path)
-}
-
-func readMediaPlaylistWithWait(ctx context.Context, path string, timeout time.Duration) ([]byte, error) {
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(120 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		data, err := os.ReadFile(path)
-		if err == nil && hls.HasSegment(string(data)) {
-			return data, nil
-		}
-		if time.Now().After(deadline) {
+			if err != nil {
+				return nil, err
+			}
 			return nil, errors.New("playlist segment not ready")
 		}
 		select {

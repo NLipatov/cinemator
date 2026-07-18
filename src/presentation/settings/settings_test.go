@@ -12,6 +12,8 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	t.Setenv("CINEMATOR_TORRENT_PORT", "0")
 	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "12345")
 	t.Setenv("CINEMATOR_MAX_TORRENT_CACHE_BYTES", "23456")
+	t.Setenv("CINEMATOR_MIN_FREE_BYTES", "45678")
+	t.Setenv("CINEMATOR_MIN_FREE_INODES", "567")
 	t.Setenv("CINEMATOR_TORRENT_READAHEAD_BYTES", "34567")
 	t.Setenv("CINEMATOR_HLS_SEGMENT_SECONDS", "12")
 	t.Setenv("CINEMATOR_HLS_WINDOW_SEGMENTS", "7")
@@ -40,6 +42,9 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	}
 	if settings.MaxTorrentCacheBytes() != 23456 {
 		t.Fatalf("MaxTorrentCacheBytes() = %d", settings.MaxTorrentCacheBytes())
+	}
+	if settings.MinFreeBytes() != 45678 || settings.MinFreeInodes() != 567 {
+		t.Fatalf("disk floors = %d bytes, %d inodes", settings.MinFreeBytes(), settings.MinFreeInodes())
 	}
 	if settings.TorrentReadaheadBytes() != 5864 {
 		t.Fatalf("TorrentReadaheadBytes() = %d, want cache-aware limit", settings.TorrentReadaheadBytes())
@@ -86,6 +91,8 @@ func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	t.Setenv("CINEMATOR_TORRENT_PORT", "bad")
 	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "bad")
 	t.Setenv("CINEMATOR_MAX_TORRENT_CACHE_BYTES", "bad")
+	t.Setenv("CINEMATOR_MIN_FREE_BYTES", "bad")
+	t.Setenv("CINEMATOR_MIN_FREE_INODES", "bad")
 	t.Setenv("CINEMATOR_TORRENT_READAHEAD_BYTES", "bad")
 	t.Setenv("CINEMATOR_HLS_SEGMENT_SECONDS", "bad")
 	t.Setenv("CINEMATOR_HLS_WINDOW_SEGMENTS", "bad")
@@ -106,6 +113,9 @@ func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	}
 	if settings.MaxTorrentCacheBytes() != defaultMaxTorrentCacheBytes {
 		t.Fatalf("MaxTorrentCacheBytes() = %d, want %d", settings.MaxTorrentCacheBytes(), defaultMaxTorrentCacheBytes)
+	}
+	if settings.MinFreeBytes() != defaultMinFreeBytes || settings.MinFreeInodes() != defaultMinFreeInodes {
+		t.Fatalf("bad numeric disk floors did not fall back")
 	}
 	if settings.TorrentReadaheadBytes() != defaultTorrentReadahead {
 		t.Fatalf("TorrentReadaheadBytes() = %d, want %d", settings.TorrentReadaheadBytes(), defaultTorrentReadahead)

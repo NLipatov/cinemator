@@ -1,8 +1,6 @@
 package ffmpeg
 
 import (
-	"cinemator/domain"
-	"cinemator/infrastructure/cli"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"cinemator/domain"
+	"cinemator/infrastructure/cli"
 )
 
 const (
@@ -459,14 +460,14 @@ func GenerateDirectWindow(
 	initName := ""
 	if fmp4 {
 		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, firstSegment)
-		if err := os.Rename(filepath.Join(workDir, "init.mp4"), filepath.Join(outDir, initName)); err != nil {
+		if err := publishFileWithoutReplacement(filepath.Join(workDir, "init.mp4"), filepath.Join(outDir, initName)); err != nil {
 			return DirectWindowResult{}, fmt.Errorf("publish direct HLS init segment: %w", err)
 		}
 	}
 	cursor = firstPTS
 	for index := 0; index <= last; index++ {
 		name := fmt.Sprintf("%s%0*d_%04d%s", directSegmentPrefix, segmentNumberWidth, firstSegment, index, segmentExtension)
-		if err := os.Rename(filepath.Join(workDir, fmt.Sprintf("part_%06d%s", index, segmentExtension)), filepath.Join(outDir, name)); err != nil {
+		if err := publishFileWithoutReplacement(filepath.Join(workDir, fmt.Sprintf("part_%06d%s", index, segmentExtension)), filepath.Join(outDir, name)); err != nil {
 			return DirectWindowResult{}, fmt.Errorf("publish direct HLS segment: %w", err)
 		}
 		result.Fragments = append(result.Fragments, HLSFragment{
@@ -523,7 +524,7 @@ func GenerateVideoWindow(
 	selection StreamSelection,
 	firstSegment, segmentCount int,
 	segmentDuration time.Duration,
-	onPublished func(int),
+	onPublished func(int) error,
 ) (VideoWindowResult, error) {
 	if firstSegment < 0 || segmentCount <= 0 {
 		return VideoWindowResult{}, fmt.Errorf("invalid HLS window")
@@ -610,7 +611,7 @@ func GenerateVideoWindow(
 	return result, nil
 }
 
-func publishVideoSegments(ctx context.Context, workDir, outDir string, begin, end int, generationDone <-chan struct{}, onPublished func(int)) (int, error) {
+func publishVideoSegments(ctx context.Context, workDir, outDir string, begin, end int, generationDone <-chan struct{}, onPublished func(int) error) (int, error) {
 	ticker := time.NewTicker(generationPollInterval)
 	defer ticker.Stop()
 	next := begin
@@ -635,13 +636,15 @@ func publishVideoSegments(ctx context.Context, workDir, outDir string, begin, en
 				break
 			}
 			target := filepath.Join(outDir, videoSegmentPrefix+fmt.Sprintf("%06d.ts", next))
-			if err := os.Rename(source, target); err != nil {
+			if err := publishFileWithoutReplacement(source, target); err != nil {
 				return false, err
 			}
-			if onPublished != nil {
-				onPublished(next)
-			}
 			next++
+			if onPublished != nil {
+				if err := onPublished(next - 1); err != nil {
+					return false, err
+				}
+			}
 		}
 		return false, nil
 	}
@@ -800,7 +803,7 @@ func GenerateSubtitleSegment(
 	if err := addWebVTTTimestampMap(tmp, time.Duration(segmentIndex)*segmentDuration); err != nil {
 		return err
 	}
-	return os.Rename(tmp, outputPath)
+	return publishFileWithoutReplacement(tmp, outputPath)
 }
 
 func addWebVTTTimestampMap(path string, mediaOffset time.Duration) error {
@@ -888,4 +891,13 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+func publishFileWithoutReplacement(source, target string) error {
+	if _, err := os.Stat(target); err == nil {
+		return os.Remove(source)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Rename(source, target)
 }

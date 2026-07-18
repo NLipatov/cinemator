@@ -3,6 +3,7 @@ package ffmpeg
 import (
 	"cinemator/domain"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,28 @@ import (
 	"testing"
 	"time"
 )
+
+func TestPublishFileWithoutReplacementKeepsPublishedAsset(t *testing.T) {
+	dir := t.TempDir()
+	source := filepath.Join(dir, "source")
+	target := filepath.Join(dir, "target")
+	if err := os.WriteFile(source, []byte("new"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("published"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishFileWithoutReplacement(source, target); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(target)
+	if err != nil || string(data) != "published" {
+		t.Fatalf("published asset = %q, %v", data, err)
+	}
+	if _, err := os.Stat(source); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary source remains: %v", err)
+	}
+}
 
 func TestBuildOnDemandMediaPlaylistCoversWholeDuration(t *testing.T) {
 	got := buildOnDemandMediaPlaylist(25.5, 10, 2, "chunk_", ".ts", "")

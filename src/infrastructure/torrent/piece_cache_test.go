@@ -18,7 +18,7 @@ func TestNewPieceCacheTrimsExistingDataToCapacity(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := newPieceCache(root, 1024); err != nil {
+	if _, err := newPieceCache(root, 1024, nil); err != nil {
 		t.Fatalf("newPieceCache() error = %v", err)
 	}
 	if _, err := os.Stat(oversized); !errors.Is(err, os.ErrNotExist) {
@@ -26,11 +26,22 @@ func TestNewPieceCacheTrimsExistingDataToCapacity(t *testing.T) {
 	}
 }
 
-func TestValidatePieceCacheCapacityRejectsPieceLargerThanCache(t *testing.T) {
+func TestValidatePieceCacheCapacityRequiresPromotionHeadroom(t *testing.T) {
 	if err := validatePieceCacheCapacity(2<<20, 1<<20); err == nil {
 		t.Fatal("validatePieceCacheCapacity() error = nil")
 	}
 	if err := validatePieceCacheCapacity(1<<20, 2<<20); err != nil {
 		t.Fatalf("validatePieceCacheCapacity() error = %v", err)
+	}
+}
+
+func TestNewPieceCacheRejectsSymlinkRoot(t *testing.T) {
+	root := t.TempDir()
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(root, pieceCacheDirName)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := newPieceCache(root, 1024, nil); err == nil {
+		t.Fatal("symbolic-link piece cache root was accepted")
 	}
 }

@@ -47,7 +47,12 @@ func TestResetStreamOutputRemovesStaleHLSFiles(t *testing.T) {
 	if err := os.WriteFile(stale, []byte("stale"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := resetStreamOutput(paths); err != nil {
+	assets, err := newHlsAssetStore(filepath.Dir(paths.outDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := manager{assets: assets}
+	if err := m.resetStreamOutput(paths); err != nil {
 		t.Fatalf("resetStreamOutput() error = %v", err)
 	}
 	if _, err := os.Stat(stale); !errors.Is(err, os.ErrNotExist) {

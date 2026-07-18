@@ -124,8 +124,16 @@ The defaults reserve 12 GiB for torrent pieces and 2 GiB for generated HLS asset
 ```dotenv
 CINEMATOR_MAX_TORRENT_CACHE_BYTES=12884901888
 CINEMATOR_MAX_CACHE_BYTES=2147483648
+CINEMATOR_MIN_FREE_BYTES=2147483648
+CINEMATOR_MIN_FREE_INODES=4096
 CINEMATOR_TORRENT_READAHEAD_BYTES=67108864
 ```
+
+The free-space and inode floors are checked atomically across HLS and torrent
+writes on the same filesystem. A new window or piece is rejected before it can
+spend that emergency reserve. Cache eviction never unlinks an HLS asset or
+torrent piece while Cinemator is reading it, so slow clients can temporarily
+cause admission to fail but cannot create disk blocks hidden from `du`.
 
 The generated HLS window is controlled separately:
 
@@ -140,13 +148,13 @@ CINEMATOR_MAX_ACTIVE_STREAMS=16
 
 Larger windows reduce regeneration after short seeks but use more temporary disk space. Direct-play output uses the source GOP boundaries inside this nominal window. Cinemator reserves cache headroom before starting each window and limits concurrent FFmpeg jobs; keep `CINEMATOR_MAX_TRANSCODES=1` on a small VPS. Evicted torrent pieces are downloaded again from currently available peers; piece hashes verify their contents but cannot guarantee that a peer will still be available later.
 
-The 64 MiB readahead keeps enough torrent work queued for sequential FFmpeg reads without fetching hundreds of unused megabytes after a seek; it is also capped at one quarter of the torrent cache budget. Compatible H.264 video is remuxed from the previous source keyframe without video transcoding; AAC is copied too, while other audio is converted to AAC independently. Audio conversion shares the same concurrency limit as video transcoding. The playlist keeps the requested playhead exact and hides the short keyframe preroll. Video is transcoded to bounded 1080p H.264 only when a browser-incompatible codec, pixel format, HDR, interlace, rotation, bitmap subtitle overlay, oversized frame, or unusually distant keyframe requires it. Unknown-duration inputs retain the progressive transcoding path because they cannot expose a stable sparse VOD timeline.
+The 64 MiB readahead keeps enough torrent work queued for sequential FFmpeg reads without fetching hundreds of unused megabytes after a seek; it is also capped at one quarter of the torrent cache budget. Compatible H.264, HEVC, and AV1 video is remuxed at its source resolution and bitrate; AAC is copied too, while other audio is converted to AAC independently. Audio conversion shares the same concurrency limit as video transcoding. The playlist keeps the requested playhead exact and hides the short keyframe preroll. Video is converted to H.264 at its source dimensions only when the selected client path cannot accept the original codec/profile or when deinterlacing, rotation, HDR tone mapping, or a bitmap subtitle overlay requires new pixels. Unknown-duration inputs retain the progressive transcoding path because they cannot expose a stable sparse VOD timeline.
 
 When a container exposes a reliable duration, Cinemator publishes a full VOD timeline and supports arbitrary seeks. If duration cannot be determined without reading to the end, it publishes a progressive HLS `EVENT` playlist instead. Playback starts at the beginning, the discovered timeline grows as windows are generated, and the playlist becomes final when FFmpeg reaches the end. In that mode, seeking is limited to the part already present in the playlist; Cinemator does not guess duration from bitrate.
 
 When upgrading from the previous full-file storage layout, Cinemator removes legacy torrent payload files only from hash directories that contain valid Cinemator metadata. Saved magnet links and file metadata are preserved, and payloads are fetched into the bounded piece cache if watched again.
 
-On-demand stream workers and their job queues live in the Cinemator process. Run a single application replica, or configure the reverse proxy/load balancer with session affinity so every request for one playback session reaches the same replica; a shared cache volume alone is not enough. Idle workers are released after 30 minutes. After cleanup or a process restart the web player prepares a replacement stream at the current position. An HLS window that already reached FFmpeg continues in the background if an HTTP client or proxy disconnects, so a retry can reuse it instead of restarting the work.
+On-demand stream workers and their job queues live in the Cinemator process. Run a single application replica per cache root. Cinemator takes an exclusive filesystem lock and rejects a second process that points at the same HLS or download root; use disjoint roots and statically partitioned budgets if replicas share a physical filesystem. Managed FFmpeg and FFprobe children inherit that ownership fence, so an instance cannot clean an old cache while a child from a crashed process may still hold its files. Idle workers are released after 30 minutes. After cleanup or a process restart the web player prepares a replacement stream at the current position. An HLS window that already reached FFmpeg continues in the background if an HTTP client or proxy disconnects, so a retry can reuse it instead of restarting the work.
 
 The web UI loads its pinned `hls.js` version from `cdn.jsdelivr.net`; clients must be able to reach that CDN unless their browser supports HLS natively. If it is blocked, the player shows an explicit library-load error.
 Browsers that fall back to native HLS receive the static transcoded playlist because native players cannot participate in the on-demand sparse-playlist reload handshake.

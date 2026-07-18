@@ -2,6 +2,7 @@ package api
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -9,9 +10,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"cinemator/application"
 	"cinemator/domain"
 	"cinemator/presentation/settings"
 )
@@ -27,6 +30,7 @@ type fakeTorrentManager struct {
 	mediaInfo domain.MediaInfo
 	ensured   chan [2]string
 	ensure    func(streamDir, assetName string) error
+	open      func(streamDir, assetName, version string) (application.HlsAsset, error)
 }
 
 func (m fakeTorrentManager) GetTorrentFiles(context.Context, string) ([]domain.FileInfo, error) {
@@ -41,14 +45,55 @@ func (m fakeTorrentManager) PrepareHlsStream(_ context.Context, _ string, _, _, 
 	return m.prepare, nil
 }
 
-func (m fakeTorrentManager) EnsureHlsAsset(_ context.Context, streamDir, assetName string) error {
-	if m.ensured != nil {
-		m.ensured <- [2]string{streamDir, assetName}
+func (m fakeTorrentManager) OpenHlsAsset(_ context.Context, streamDir, assetName, version string) (application.HlsAsset, error) {
+	if m.open != nil {
+		return m.open(streamDir, assetName, version)
 	}
-	if m.ensure != nil {
-		return m.ensure(streamDir, assetName)
+	for attempt := 0; attempt < 2; attempt++ {
+		if m.ensured != nil {
+			m.ensured <- [2]string{streamDir, assetName}
+		}
+		if m.ensure != nil {
+			if err := m.ensure(streamDir, assetName); err != nil {
+				return application.HlsAsset{}, err
+			}
+		} else if m.ensureErr != nil {
+			return application.HlsAsset{}, m.ensureErr
+		}
+		path := filepath.Join(settings.NewSettings().HlsPath(), streamDir, assetName)
+		file, err := os.Open(path)
+		if err == nil {
+			info, statErr := file.Stat()
+			if statErr != nil {
+				_ = file.Close()
+				return application.HlsAsset{}, statErr
+			}
+			return application.HlsAsset{ReadSeekCloser: file, ModTime: info.ModTime()}, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return application.HlsAsset{}, err
+		}
 	}
-	return m.ensureErr
+	return application.HlsAsset{}, os.ErrNotExist
+}
+
+type blockingAsset struct {
+	*bytes.Reader
+	started chan struct{}
+	release chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (a *blockingAsset) Read(data []byte) (int, error) {
+	a.once.Do(func() { close(a.started) })
+	<-a.release
+	return a.Reader.Read(data)
+}
+
+func (a *blockingAsset) Close() error {
+	close(a.closed)
+	return nil
 }
 
 func (m fakeTorrentManager) GetHlsStatus(context.Context, string, float64) (domain.HlsStatus, error) {
@@ -85,6 +130,8 @@ func (m fakeTorrentManager) SubscribeDownloadEvents(ctx context.Context) <-chan 
 }
 
 func (m fakeTorrentManager) CleanupStreams() {}
+
+func (m fakeTorrentManager) Close() error { return nil }
 
 func TestHandleDownloadActionStatusMapping(t *testing.T) {
 	tests := []struct {
@@ -458,9 +505,20 @@ func TestReadMediaPlaylistWithWaitWaitsForSegment(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	data, err := readMediaPlaylistWithWait(ctx, playlist, time.Second)
+	data, err := readHlsAssetWithWait(ctx, func() (application.HlsAsset, error) {
+		file, err := os.Open(playlist)
+		if err != nil {
+			return application.HlsAsset{}, err
+		}
+		info, err := file.Stat()
+		if err != nil {
+			_ = file.Close()
+			return application.HlsAsset{}, err
+		}
+		return application.HlsAsset{ReadSeekCloser: file, ModTime: info.ModTime()}, nil
+	}, time.Second, true)
 	if err != nil {
-		t.Fatalf("readMediaPlaylistWithWait() error = %v", err)
+		t.Fatalf("readHlsAssetWithWait() error = %v", err)
 	}
 	if !strings.Contains(string(data), "subs_00000.vtt") {
 		t.Fatalf("playlist = %q, want segment uri", data)
@@ -492,13 +550,52 @@ func TestHandleGetHlsChunkEnsuresOnDemandAsset(t *testing.T) {
 		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
 	}
 	if got := <-ensured; got != [2]string{dir, asset} {
-		t.Fatalf("EnsureHlsAsset() args = %q", got)
+		t.Fatalf("OpenHlsAsset() args = %q", got)
 	}
 	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "immutable") {
 		t.Fatalf("Cache-Control = %q", got)
 	}
 	if got := rec.Header().Get("Content-Type"); got != "video/mp4" {
 		t.Fatalf("Content-Type = %q, want video/mp4", got)
+	}
+}
+
+func TestHandleGetHlsChunkKeepsLeaseThroughResponse(t *testing.T) {
+	dir := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0_a0_s-1"
+	asset := &blockingAsset{
+		Reader:  bytes.NewReader([]byte("segment")),
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	opened := make(chan [3]string, 1)
+	server := HttpServer{mgr: fakeTorrentManager{open: func(streamDir, assetName, version string) (application.HlsAsset, error) {
+		opened <- [3]string{streamDir, assetName, version}
+		return application.HlsAsset{ReadSeekCloser: asset, ModTime: time.Now()}, nil
+	}}}
+	req := httptest.NewRequest(http.MethodGet, "/"+dir+"/chunk_000003.ts?v=generation", nil)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		server.handleGetHlsChunk(rec, req)
+		close(done)
+	}()
+
+	<-asset.started
+	select {
+	case <-asset.closed:
+		t.Fatal("asset lease closed before response read completed")
+	default:
+	}
+	close(asset.release)
+	<-done
+	if got := <-opened; got != [3]string{dir, "chunk_000003.ts", "generation"} {
+		t.Fatalf("OpenHlsAsset() args = %q", got)
+	}
+	select {
+	case <-asset.closed:
+	default:
+		t.Fatal("asset lease was not closed after response")
 	}
 }
 
@@ -531,7 +628,7 @@ func TestHandleGetHlsChunkRetriesWhenCacheEvictsAssetBeforeOpen(t *testing.T) {
 		t.Fatalf("response = %d %q", rec.Code, rec.Body.String())
 	}
 	if ensureCalls != 2 {
-		t.Fatalf("EnsureHlsAsset() calls = %d, want 2", ensureCalls)
+		t.Fatalf("OpenHlsAsset() generation calls = %d, want 2", ensureCalls)
 	}
 }
 

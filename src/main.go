@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
+	"log"
+	"os/signal"
+	"syscall"
+
 	"cinemator/presentation/settings"
 	"cinemator/presentation/web/api"
-	"log"
 )
 
 func main() {
@@ -13,7 +17,9 @@ func main() {
 		log.Fatalf("failed to init server: %v", newServerErr)
 	}
 
-	serveErr := server.Run()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	serveErr := server.Run(ctx)
 	if serveErr != nil {
 		log.Fatalf("server stopped: %v", serveErr)
 	}

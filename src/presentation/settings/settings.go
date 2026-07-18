@@ -12,6 +12,8 @@ const (
 	defaultViewerTimeout        = 30 * time.Minute
 	defaultMaxCacheBytes        = 2 << 30  // 2 GiB cap for generated HLS assets
 	defaultMaxTorrentCacheBytes = 12 << 30 // 12 GiB cap for verified torrent pieces
+	defaultMinFreeBytes         = 2 << 30  // emergency floor shared by all Cinemator cache writers
+	defaultMinFreeInodes        = 4096
 	defaultTorrentReadahead     = 64 << 20
 	defaultHlsSegmentDuration   = 6 * time.Second
 	defaultHlsWindowSegments    = 5
@@ -29,6 +31,8 @@ type Settings struct {
 	viewerTimeout        time.Duration
 	maxCacheBytes        int64
 	maxTorrentCacheBytes int64
+	minFreeBytes         int64
+	minFreeInodes        uint64
 	torrentReadahead     int64
 	hlsSegmentDuration   time.Duration
 	hlsWindowSegments    int
@@ -57,6 +61,8 @@ func NewSettings() Settings {
 		viewerTimeout:        defaultViewerTimeout,
 		maxCacheBytes:        int64Env("CINEMATOR_MAX_CACHE_BYTES", defaultMaxCacheBytes),
 		maxTorrentCacheBytes: maxTorrentCacheBytes,
+		minFreeBytes:         int64Env("CINEMATOR_MIN_FREE_BYTES", defaultMinFreeBytes),
+		minFreeInodes:        uint64(max(0, intEnv("CINEMATOR_MIN_FREE_INODES", defaultMinFreeInodes))),
 		torrentReadahead:     torrentReadahead,
 		hlsSegmentDuration:   time.Duration(intEnv("CINEMATOR_HLS_SEGMENT_SECONDS", int(defaultHlsSegmentDuration/time.Second))) * time.Second,
 		hlsWindowSegments:    intEnv("CINEMATOR_HLS_WINDOW_SEGMENTS", defaultHlsWindowSegments),
@@ -89,6 +95,14 @@ func (s Settings) MaxCacheBytes() int64 {
 
 func (s Settings) MaxTorrentCacheBytes() int64 {
 	return s.maxTorrentCacheBytes
+}
+
+func (s Settings) MinFreeBytes() int64 {
+	return max(0, s.minFreeBytes)
+}
+
+func (s Settings) MinFreeInodes() uint64 {
+	return s.minFreeInodes
 }
 
 func (s Settings) TorrentReadaheadBytes() int64 {

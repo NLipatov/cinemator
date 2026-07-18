@@ -2,8 +2,8 @@ package torrent
 
 import (
 	"context"
+	"errors"
 	"log"
-	"os"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -17,7 +17,11 @@ func (m *manager) CleanupStreams() {
 		noViewers := now.Sub(stream.lastView) > m.settings.ViewerTimeout()
 		stream.mtx.Unlock()
 		if noViewers {
-			go m.cleanup(key)
+			m.cleanupWG.Add(1)
+			go func() {
+				defer m.cleanupWG.Done()
+				m.cleanup(key)
+			}()
 		}
 	}
 	m.mu.Unlock()
@@ -68,7 +72,7 @@ func (m *manager) finishStreamCleanup(key streamKey, stream *streamInfo, shouldD
 	waitForStreamWorkers(stream)
 	stream.source.Close()
 	log.Printf("Cleaning up stream: key=%v, dir=%s", key, stream.paths.outDir)
-	if err := os.RemoveAll(stream.paths.outDir); err != nil {
+	if err := m.assets.RetireTree(stream.paths.outDir); err != nil && !errors.Is(err, errHlsAssetsBusy) {
 		log.Printf("Failed to cleanup directory: %s, err=%v", stream.paths.outDir, err)
 	}
 	if stream.file != nil {
@@ -100,11 +104,8 @@ func waitForStreamWorkers(stream *streamInfo) {
 	}
 }
 
-func resetStreamOutput(paths streamPaths) error {
-	if err := os.RemoveAll(paths.outDir); err != nil {
-		return err
-	}
-	return os.MkdirAll(paths.outDir, 0755)
+func (m *manager) resetStreamOutput(paths streamPaths) error {
+	return m.assets.ResetTree(paths.outDir)
 }
 
 func (m *manager) TouchStream(_ context.Context, dirName string) {
@@ -122,9 +123,15 @@ func (m *manager) TouchStream(_ context.Context, dirName string) {
 }
 
 func (m *manager) viewerWatcher() {
+	defer close(m.watcherDone)
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		m.CleanupStreams()
+	for {
+		select {
+		case <-ticker.C:
+			m.CleanupStreams()
+		case <-m.watcherStop:
+			return
+		}
 	}
 }
