@@ -94,11 +94,13 @@ func (m *manager) finishStreamCleanup(key streamKey, stream *streamInfo) {
 func (m *manager) unregisterCleanedStream(key streamKey, stream *streamInfo) {
 	m.mu.Lock()
 	if m.active[key] != stream {
+		m.releaseTorrentUseLocked(key.InfoHash, true)
 		m.mu.Unlock()
 		close(stream.cleanupDone)
 		return
 	}
 	delete(m.active, key)
+	m.releaseTorrentUseLocked(key.InfoHash, true)
 	m.mu.Unlock()
 	close(stream.cleanupDone)
 }

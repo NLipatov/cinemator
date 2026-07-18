@@ -230,8 +230,8 @@ func (a *lockedHlsAsset) Close() error {
 	return a.err
 }
 
-func (m *manager) evictActiveHlsAssets(streamDir string, assetPaths []string) (map[string]struct{}, error) {
-	removed := make(map[string]struct{}, len(assetPaths))
+func (m *manager) evictActiveHlsAssets(streamDir string, items []hlsCacheItem, bytesNeeded int64) (map[string]struct{}, error) {
+	removed := make(map[string]struct{}, len(items))
 	key, err := parseStreamDir(streamDir)
 	if err != nil {
 		return removed, err
@@ -240,13 +240,18 @@ func (m *manager) evictActiveHlsAssets(streamDir string, assetPaths []string) (m
 	stream := m.active[key]
 	m.mu.Unlock()
 	if stream == nil {
-		for _, assetPath := range assetPaths {
-			ok, removeErr := m.assets.TryEvict(assetPath)
+		var removedBytes int64
+		for _, item := range items {
+			if removedBytes >= bytesNeeded {
+				break
+			}
+			ok, removeErr := m.assets.TryEvict(item.path)
 			if removeErr != nil {
 				return removed, removeErr
 			}
 			if ok {
-				removed[assetPath] = struct{}{}
+				removed[item.path] = struct{}{}
+				removedBytes += item.size
 			}
 		}
 		return removed, nil
@@ -259,18 +264,23 @@ func (m *manager) evictActiveHlsAssets(streamDir string, assetPaths []string) (m
 	defer stream.generationMtx.Unlock()
 	stream.playlistMtx.Lock()
 	defer stream.playlistMtx.Unlock()
-	evictable := make([]string, 0, len(assetPaths))
+	evictable := make([]string, 0, len(items))
 	evictedOwners := make(map[int]struct{})
-	for _, assetPath := range assetPaths {
-		ok, canEvictErr := m.assets.CanEvict(assetPath)
+	var evictableBytes int64
+	for _, item := range items {
+		if evictableBytes >= bytesNeeded {
+			break
+		}
+		ok, canEvictErr := m.assets.CanEvict(item.path)
 		if canEvictErr != nil {
 			return removed, canEvictErr
 		}
 		if !ok {
 			continue
 		}
-		evictable = append(evictable, assetPath)
-		name := filepath.Base(assetPath)
+		evictable = append(evictable, item.path)
+		evictableBytes += item.size
+		name := filepath.Base(item.path)
 		if owner, ok := parseDirectSegmentOwner(name); ok {
 			evictedOwners[owner] = struct{}{}
 		}

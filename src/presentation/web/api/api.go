@@ -539,10 +539,7 @@ func readHlsAssetWithWait(ctx context.Context, open func() (application.HlsAsset
 			}
 		}
 		if time.Now().After(deadline) {
-			if err != nil {
-				return nil, err
-			}
-			return nil, errors.New("playlist segment not ready")
+			return nil, context.DeadlineExceeded
 		}
 		select {
 		case <-ctx.Done():

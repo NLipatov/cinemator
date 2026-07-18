@@ -172,23 +172,13 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].last.Before(candidates[j].last)
 	})
-	selected := make([]hlsCacheItem, 0, len(candidates))
-	projected := total
-	for _, item := range candidates {
-		if projected <= target {
-			break
-		}
-		selected = append(selected, item)
-		projected -= item.size
-	}
-	type activeEvictionBatch struct {
+	type hlsEvictionBatch struct {
 		dir   string
 		items []hlsCacheItem
 	}
-	activeBatches := make(map[string]*activeEvictionBatch)
-	var batchOrder []*activeEvictionBatch
-	var standalone []hlsCacheItem
-	for _, item := range selected {
+	activeBatches := make(map[string]*hlsEvictionBatch)
+	var batches []*hlsEvictionBatch
+	for _, item := range candidates {
 		rel, relErr := filepath.Rel(root, item.path)
 		parts := strings.SplitN(filepath.ToSlash(rel), "/", 2)
 		if relErr == nil && len(parts) == 2 {
@@ -196,15 +186,15 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 			if isActive && isImmutableHlsAsset(filepath.Base(item.path)) {
 				batch := activeBatches[parts[0]]
 				if batch == nil {
-					batch = &activeEvictionBatch{dir: parts[0]}
+					batch = &hlsEvictionBatch{dir: parts[0]}
 					activeBatches[parts[0]] = batch
-					batchOrder = append(batchOrder, batch)
+					batches = append(batches, batch)
 				}
 				batch.items = append(batch.items, item)
 				continue
 			}
 		}
-		standalone = append(standalone, item)
+		batches = append(batches, &hlsEvictionBatch{items: []hlsCacheItem{item}})
 	}
 	var removedFiles int
 	var unlinkedBytes int64
@@ -213,23 +203,23 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 		removedFiles++
 		unlinkedBytes += item.size
 	}
-	for _, item := range standalone {
-		removed, err := m.assets.TryEvict(item.path)
-		if err != nil {
-			log.Printf("enforceCacheLimit: failed to remove %s: %v", item.path, err)
+	for _, batch := range batches {
+		if total <= target {
+			break
+		}
+		if batch.dir == "" {
+			item := batch.items[0]
+			removed, err := m.assets.TryEvict(item.path)
+			if err != nil {
+				log.Printf("enforceCacheLimit: failed to remove %s: %v", item.path, err)
+				continue
+			}
+			if removed {
+				recordRemoved(item)
+			}
 			continue
 		}
-		if !removed {
-			continue
-		}
-		recordRemoved(item)
-	}
-	for _, batch := range batchOrder {
-		paths := make([]string, len(batch.items))
-		for index, item := range batch.items {
-			paths[index] = item.path
-		}
-		removed, err := m.evictActiveHlsAssets(batch.dir, paths)
+		removed, err := m.evictActiveHlsAssets(batch.dir, batch.items, total-target)
 		for _, item := range batch.items {
 			if _, ok := removed[item.path]; ok {
 				recordRemoved(item)

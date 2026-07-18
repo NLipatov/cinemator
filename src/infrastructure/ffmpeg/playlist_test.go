@@ -73,3 +73,19 @@ func TestBuildMasterPlaylistDropsSourceCodecForFallback(t *testing.T) {
 		t.Fatalf("fallback master advertises source capabilities: %s", got)
 	}
 }
+
+func TestBuildMasterPlaylistAdvertisesCompatibilityPeak(t *testing.T) {
+	info := domain.MediaInfo{
+		Duration:    60,
+		VideoCodec:  "hevc",
+		Width:       3840,
+		Height:      2160,
+		FrameRate:   30,
+		Bitrate:     10_000_000,
+		AudioTracks: []domain.AudioTrack{{Codec: "aac"}},
+	}
+	got := buildMasterPlaylist("index.m3u8", "", false, "", "", info, StreamSelection{ForceTranscode: true})
+	if !strings.Contains(got, "BANDWIDTH=31232000") {
+		t.Fatalf("buildMasterPlaylist() does not advertise compatibility peak: %s", got)
+	}
+}

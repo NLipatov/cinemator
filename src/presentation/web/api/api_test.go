@@ -537,6 +537,15 @@ func TestReadHlsAssetWithWaitReturnsTerminalErrorImmediately(t *testing.T) {
 	}
 }
 
+func TestReadHlsAssetWithWaitReportsPreparationTimeout(t *testing.T) {
+	_, err := readHlsAssetWithWait(context.Background(), func() (application.HlsAsset, error) {
+		return application.HlsAsset{}, os.ErrNotExist
+	}, 0, true)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("readHlsAssetWithWait() error = %v, want deadline exceeded", err)
+	}
+}
+
 func TestHandleGetHlsPlaylistReportsTerminalBackendError(t *testing.T) {
 	dir := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0_a0_s-1"
 	server := HttpServer{mgr: fakeTorrentManager{ensureErr: errors.New("generation failed")}}

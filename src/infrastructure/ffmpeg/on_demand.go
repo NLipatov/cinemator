@@ -835,6 +835,12 @@ func formatSeconds(value float64) string {
 
 func buildMasterPlaylist(videoList, subList string, withSubs bool, lang, assetVersion string, info domain.MediaInfo, selection StreamSelection) string {
 	bandwidth := max(info.Bitrate, int64(5_500_000))
+	if !CanRemuxHLS(info, selection) {
+		bandwidth = compatibilityHLSBitrate(info)
+		if selectedAudioIndex(info, selection) >= 0 && bandwidth <= math.MaxInt64-128_000 {
+			bandwidth += 128_000
+		}
+	}
 	streamAttributes := []string{fmt.Sprintf("BANDWIDTH=%d", bandwidth)}
 	if CanRemuxHLS(info, selection) {
 		codec := info.VideoCodecString

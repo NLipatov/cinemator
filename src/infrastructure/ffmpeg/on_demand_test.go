@@ -74,7 +74,7 @@ func TestPrepareOnDemandHLSWritesStaticManifests(t *testing.T) {
 		t.Fatalf("PrepareOnDemandHLS() error = %v", err)
 	}
 	assertFileContains(t, dir+"/master.m3u8", "SUBTITLES=\"subs\"")
-	assertFileContains(t, dir+"/master.m3u8", "BANDWIDTH=50000000")
+	assertFileContains(t, dir+"/master.m3u8", "BANDWIDTH=100000000")
 	assertFileContains(t, dir+"/index.m3u8", "chunk_000002.ts")
 	assertFileContains(t, dir+"/index.m3u8", "chunk_000002.ts?v=v1")
 	assertFileContains(t, dir+"/master.m3u8", "index.m3u8?v=v1")

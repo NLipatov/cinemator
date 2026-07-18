@@ -26,6 +26,7 @@ type manager struct {
 	client      *torrent.Client
 	active      map[streamKey]*streamInfo
 	mediaInfo   map[mediaKey]domain.MediaInfo
+	torrentUses map[string]*torrentUse
 	sources     *rangeServer
 	downloads   *downloadStore
 	assets      *hlsAssetStore
@@ -44,6 +45,13 @@ type manager struct {
 	transcodes  chan struct{}
 	jobs        chan struct{}
 	settings    settings.Settings
+}
+
+type torrentUse struct {
+	torrent      *torrent.Torrent
+	refs         int
+	dropWhenIdle bool
+	lastUsed     time.Time
 }
 
 func NewManager(settings settings.Settings) (application.TorrentManager, error) {
@@ -127,6 +135,7 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 		client:      client,
 		active:      make(map[streamKey]*streamInfo),
 		mediaInfo:   make(map[mediaKey]domain.MediaInfo),
+		torrentUses: make(map[string]*torrentUse),
 		sources:     sources,
 		downloads:   downloads,
 		assets:      assets,
@@ -235,10 +244,11 @@ func discardPreviousHlsStreams(assets *hlsAssetStore, root string) error {
 }
 
 func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
-	t, err := addMagnet(m.client, magnet)
+	t, hash, err := m.acquireTorrent(magnet)
 	if err != nil {
 		return nil, err
 	}
+	defer m.releaseTorrentUse(hash, false)
 
 	select {
 	case <-ctx.Done():
@@ -260,11 +270,12 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 }
 
 func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int) (domain.MediaInfo, error) {
-	t, err := addMagnet(m.client, magnet)
+	t, hash, err := m.acquireTorrent(magnet)
 	if err != nil {
 		return domain.MediaInfo{}, err
 	}
-	key := mediaKey{InfoHash: t.InfoHash().HexString(), Index: fileIndex}
+	defer m.releaseTorrentUse(hash, false)
+	key := mediaKey{InfoHash: hash, Index: fileIndex}
 	m.mu.Lock()
 	cached, ok := m.mediaInfo[key]
 	m.mu.Unlock()
@@ -307,11 +318,17 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 }
 
 func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int, startSeconds float64, forceTranscode bool) (string, error) {
-	t, err := addMagnet(m.client, magnet)
+	t, hash, err := m.acquireTorrent(magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
 		return "", err
 	}
+	keepTorrent := false
+	defer func() {
+		if !keepTorrent {
+			m.releaseTorrentUse(hash, false)
+		}
+	}()
 	select {
 	case <-t.GotInfo():
 	case <-ctx.Done():
@@ -326,7 +343,6 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		return "", err
 	}
 	file := files[fileIndex]
-	hash := t.InfoHash().HexString()
 	m.touchDownload(ctx, hash)
 	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack, Transcode: forceTranscode}
 	probeKey := mediaKey{InfoHash: hash, Index: fileIndex}
@@ -417,6 +433,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			}
 			s = candidate
 			m.active[key] = s
+			keepTorrent = true
 			m.mu.Unlock()
 			go m.initializeOnDemandStream(key, s)
 			m.notifyDownloadsChanged()
@@ -468,11 +485,15 @@ func (m *manager) DeleteDownload(ctx context.Context, id string) error {
 	for _, key := range keys {
 		m.cleanup(key)
 	}
+	m.mu.Lock()
+	if use := m.torrentUses[id]; use != nil && use.refs > 0 {
+		m.mu.Unlock()
+		return fmt.Errorf("download is in use")
+	}
+	delete(m.torrentUses, id)
 	if t, ok := m.client.Torrent(metainfo.NewHashFromHex(id)); ok {
 		t.Drop()
 	}
-
-	m.mu.Lock()
 	for key := range m.mediaInfo {
 		if key.InfoHash == id {
 			delete(m.mediaInfo, key)
@@ -539,12 +560,85 @@ func (m *manager) streamKeysForDownload(id string) []streamKey {
 func (m *manager) downloadActive(id string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if use := m.torrentUses[id]; use != nil && use.refs > 0 {
+		return true
+	}
 	for key := range m.active {
 		if key.InfoHash == id {
 			return true
 		}
 	}
 	return false
+}
+
+func (m *manager) acquireTorrent(magnet string) (*torrent.Torrent, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, err := addMagnet(m.client, magnet)
+	if err != nil {
+		return nil, "", err
+	}
+	hash := t.InfoHash().HexString()
+	use := m.torrentUses[hash]
+	if use == nil {
+		use = &torrentUse{}
+		m.torrentUses[hash] = use
+	}
+	use.torrent = t
+	use.refs++
+	use.lastUsed = time.Now()
+	return t, hash, nil
+}
+
+func (m *manager) releaseTorrentUse(hash string, dropWhenIdle bool) {
+	m.mu.Lock()
+	m.releaseTorrentUseLocked(hash, dropWhenIdle)
+	m.mu.Unlock()
+}
+
+func (m *manager) releaseTorrentUseLocked(hash string, dropWhenIdle bool) {
+	use := m.torrentUses[hash]
+	if use == nil || use.refs <= 0 {
+		return
+	}
+	use.dropWhenIdle = use.dropWhenIdle || dropWhenIdle
+	use.refs--
+	use.lastUsed = time.Now()
+	if use.refs != 0 {
+		return
+	}
+	if use.dropWhenIdle {
+		delete(m.torrentUses, hash)
+		if use.torrent != nil {
+			use.torrent.Drop()
+		}
+		return
+	}
+	m.trimIdleTorrentUsesLocked()
+}
+
+func (m *manager) trimIdleTorrentUsesLocked() {
+	limit := m.settings.MaxActiveStreams()
+	idle := 0
+	oldestHash := ""
+	var oldest *torrentUse
+	for hash, use := range m.torrentUses {
+		if use.refs != 0 || use.dropWhenIdle {
+			continue
+		}
+		idle++
+		if oldest == nil || use.lastUsed.Before(oldest.lastUsed) {
+			oldestHash = hash
+			oldest = use
+		}
+	}
+	if idle <= limit || oldest == nil {
+		return
+	}
+	delete(m.torrentUses, oldestHash)
+	if oldest.torrent != nil {
+		oldest.torrent.Drop()
+	}
 }
 
 func (m *manager) cleanupExpiredDownloads(ctx context.Context) {

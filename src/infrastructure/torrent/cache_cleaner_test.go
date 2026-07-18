@@ -106,17 +106,21 @@ func TestEstimatedHlsWindowBytesUsesSourceBitrate(t *testing.T) {
 	}
 }
 
-func TestCacheDoesNotUnlinkLeasedActiveSegment(t *testing.T) {
+func TestCacheSkipsLeasedActiveSegmentAndContinuesEviction(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "1")
 	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
 	paths := key.paths(root)
 	segment := filepath.Join(paths.outDir, "chunk_000000.ts")
+	reclaimable := filepath.Join(paths.outDir, "chunk_000001.ts")
 	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(segment, []byte("recent"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(reclaimable, []byte("reclaimable"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	assets, err := newHlsAssetStore(root)
@@ -131,6 +135,9 @@ func TestCacheDoesNotUnlinkLeasedActiveSegment(t *testing.T) {
 	m.enforceCacheLimit()
 	if _, err := os.Stat(segment); err != nil {
 		t.Fatalf("leased active segment was evicted: %v", err)
+	}
+	if _, err := os.Stat(reclaimable); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("eviction stopped behind leased segment: %v", err)
 	}
 	if err := asset.Close(); err != nil {
 		t.Fatal(err)
