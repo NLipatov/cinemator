@@ -19,10 +19,18 @@ import (
 )
 
 const (
-	downloadStoreDirName  = ".cinemator"
-	downloadDefaultTTL    = 7 * 24 * time.Hour
-	downloadTouchInterval = time.Minute
+	downloadStoreDirName   = ".cinemator"
+	downloadDefaultTTL     = 7 * 24 * time.Hour
+	downloadTouchInterval  = time.Minute
+	mediaDescriptorVersion = 1
 )
+
+type storedMediaDescriptor struct {
+	Version         int              `json:"version"`
+	Info            domain.MediaInfo `json:"info"`
+	VideoTrackIndex int              `json:"videoTrackIndex"`
+	NeedFilter      bool             `json:"needFilter"`
+}
 
 type downloadStore struct {
 	root string
@@ -404,12 +412,89 @@ func (s *downloadStore) writeLocked(download domain.Download) error {
 	return nil
 }
 
+func (s *downloadStore) readMediaInfo(ctx context.Context, id string, index int) (domain.MediaInfo, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.MediaInfo{}, false, err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return domain.MediaInfo{}, false, err
+	}
+	if index < 0 {
+		return domain.MediaInfo{}, false, fmt.Errorf("invalid media index")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data, err := os.ReadFile(s.mediaInfoPath(id, index))
+	if errors.Is(err, os.ErrNotExist) {
+		return domain.MediaInfo{}, false, nil
+	}
+	if err != nil {
+		return domain.MediaInfo{}, false, err
+	}
+	var descriptor storedMediaDescriptor
+	if err := json.Unmarshal(data, &descriptor); err != nil {
+		return domain.MediaInfo{}, false, err
+	}
+	if descriptor.Version != mediaDescriptorVersion || descriptor.Info.VideoCodec == "" {
+		return domain.MediaInfo{}, false, nil
+	}
+	descriptor.Info.VideoTrackIndex = descriptor.VideoTrackIndex
+	descriptor.Info.NeedFilter = descriptor.NeedFilter
+	return descriptor.Info, true, nil
+}
+
+func (s *downloadStore) writeMediaInfo(ctx context.Context, id string, index int, info domain.MediaInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+	if index < 0 || info.VideoCodec == "" {
+		return fmt.Errorf("invalid media descriptor")
+	}
+	descriptor := storedMediaDescriptor{
+		Version:         mediaDescriptorVersion,
+		Info:            info,
+		VideoTrackIndex: info.VideoTrackIndex,
+		NeedFilter:      info.NeedFilter,
+	}
+	data, err := json.Marshal(descriptor)
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dir := filepath.Join(s.downloadDir(id), downloadStoreDirName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	path := s.mediaInfoPath(id, index)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 func (s *downloadStore) downloadDir(id string) string {
 	return filepath.Join(s.root, id)
 }
 
 func (s *downloadStore) metadataPath(id string) string {
 	return filepath.Join(s.downloadDir(id), downloadStoreDirName, "metadata.json")
+}
+
+func (s *downloadStore) mediaInfoPath(id string, index int) string {
+	return filepath.Join(s.downloadDir(id), downloadStoreDirName, fmt.Sprintf("media-%d.json", index))
 }
 
 func (s *downloadStore) diskSizeLocked(id string) int64 {

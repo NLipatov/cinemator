@@ -30,11 +30,13 @@ type rangeServer struct {
 }
 
 type rangeSource struct {
-	file      rangeFile
-	readahead int64
-	jobID     string
-	onRead    func(string, int64)
-	onError   func(error)
+	file         rangeFile
+	readahead    int64
+	readaheadFor func(string) int64
+	jobID        string
+	onRequest    func(string, int64, int64)
+	onRead       func(string, int64, int64)
+	onError      func(error)
 }
 
 type rangeFile interface {
@@ -69,7 +71,7 @@ func (rs *rangeServer) Close(ctx context.Context) error {
 	return rs.srv.Shutdown(ctx)
 }
 
-func (rs *rangeServer) register(file *torrent.File, readahead int64, onRead func(string, int64), onError func(error)) (token, sourceURL string, err error) {
+func (rs *rangeServer) register(file *torrent.File, readahead int64, readaheadFor func(string) int64, onRequest func(string, int64, int64), onRead func(string, int64, int64), onError func(error)) (token, sourceURL string, err error) {
 	for {
 		token, err = randomToken()
 		if err != nil {
@@ -78,7 +80,7 @@ func (rs *rangeServer) register(file *torrent.File, readahead int64, onRead func
 
 		rs.mu.Lock()
 		if _, exists := rs.sources[token]; !exists {
-			rs.sources[token] = rangeSource{file: file, readahead: readahead, onRead: onRead, onError: onError}
+			rs.sources[token] = rangeSource{file: file, readahead: readahead, readaheadFor: readaheadFor, onRequest: onRequest, onRead: onRead, onError: onError}
 			rs.mu.Unlock()
 			name := url.PathEscape(filepath.Base(file.DisplayPath()))
 			return token, rs.baseURL + "/source/" + token + "/" + name, nil
@@ -139,6 +141,9 @@ func serveTorrentRange(w http.ResponseWriter, r *http.Request, src rangeSource) 
 	if len(src.jobID) > 128 {
 		src.jobID = ""
 	}
+	if src.readaheadFor != nil {
+		src.readahead = min(src.readahead, max(int64(1), src.readaheadFor(src.jobID)))
+	}
 	size := src.file.Length()
 	start, end, partial, err := parseByteRange(r.Header.Get("Range"), size)
 	if err != nil {
@@ -165,6 +170,9 @@ func serveTorrentRange(w http.ResponseWriter, r *http.Request, src rangeSource) 
 	}
 	if r.Method == http.MethodHead {
 		return nil
+	}
+	if src.onRequest != nil {
+		src.onRequest(src.jobID, start, min(length, max(int64(1), src.readahead)))
 	}
 
 	return copyTorrentRange(r.Context(), w, src, start, length)
@@ -240,9 +248,15 @@ func readTorrentRangeAttempt(ctx context.Context, dst io.Writer, src rangeSource
 	if _, err := reader.Seek(start, io.SeekStart); err != nil {
 		return 0, err
 	}
+	readOffset := start
+	readEnd := start + length
 	writer = &progressWriter{Writer: dst, onWrite: func(written int64) {
 		if src.onRead != nil {
-			src.onRead(src.jobID, written)
+			src.onRead(src.jobID, readOffset, written)
+		}
+		readOffset += written
+		if src.onRequest != nil && readOffset < readEnd {
+			src.onRequest(src.jobID, readOffset, min(readEnd-readOffset, max(int64(1), src.readahead)))
 		}
 	}}
 	_, err = io.CopyN(writer, reader, length)

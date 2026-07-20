@@ -20,3 +20,9 @@
 - Do not add production APIs, branches, hooks, or abstractions solely for tests.
 - Test through public behavior whenever possible.
 - Keep test-only helpers package-private.
+
+# Streaming performance
+
+- Streaming changes must not regress the startup and playback-continuity SLOs in
+  `docs/playback-qoe.md`; run the required QoE tests when changing the playback
+  critical path.

@@ -3,9 +3,24 @@ package torrent
 import (
 	"reflect"
 	"testing"
+	"time"
 
 	anacrolix "github.com/anacrolix/torrent"
 )
+
+func TestPlaybackReadaheadIsPieceAlignedAndStageBounded(t *testing.T) {
+	const maximum = int64(128 << 20)
+	const piece = int64(4 << 20)
+	if got := playbackReadaheadBytes(maximum, piece, 40_000_000, 4*time.Second, 16<<20); got != 16<<20 {
+		t.Fatalf("startup readahead = %d, want 16 MiB", got)
+	}
+	if got := playbackReadaheadBytes(maximum, piece, 40_000_000, 15*time.Second, 0); got != 72<<20 {
+		t.Fatalf("foreground readahead = %d, want 72 MiB", got)
+	}
+	if got := playbackReadaheadBytes(32<<20, piece, 40_000_000, 30*time.Second, 0); got != 32<<20 {
+		t.Fatalf("bounded readahead = %d, want 32 MiB", got)
+	}
+}
 
 func TestClampRange(t *testing.T) {
 	tests := []struct {

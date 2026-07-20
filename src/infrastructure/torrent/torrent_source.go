@@ -18,17 +18,18 @@ import (
 const (
 	initialProbeBytes = 1 << 20
 	maxProbeBytes     = 16 << 20
-	probeTailBytes    = 1 << 20
 	urlProbeTimeout   = 20 * time.Second
 )
 
 type torrentSource struct {
 	file      *torrent.File
 	registry  *rangeServer
+	demand    *pieceDemand
 	token     string
 	url       string
 	readahead int64
-	onRead    func(string, int64)
+	onRequest func(string, int64, int64)
+	onRead    func(string, int64, int64)
 }
 
 type filePieceWindow struct {
@@ -36,18 +37,20 @@ type filePieceWindow struct {
 	state torrent.PieceState
 }
 
-func newTorrentSource(file *torrent.File, registry *rangeServer, readaheadLimit int64, onRead func(string, int64), onError func(error)) (*torrentSource, error) {
+func newTorrentSource(file *torrent.File, registry *rangeServer, demand *pieceDemand, readaheadLimit int64, readaheadFor func(string) int64, onRequest func(string, int64, int64), onRead func(string, int64, int64), onError func(error)) (*torrentSource, error) {
 	readahead := targetReadaheadBytes(file, readaheadLimit)
-	token, sourceURL, err := registry.register(file, readahead, onRead, onError)
+	token, sourceURL, err := registry.register(file, readahead, readaheadFor, onRequest, onRead, onError)
 	if err != nil {
 		return nil, err
 	}
 	return &torrentSource{
 		file:      file,
 		registry:  registry,
+		demand:    demand,
 		token:     token,
 		url:       sourceURL,
 		readahead: readahead,
+		onRequest: onRequest,
 		onRead:    onRead,
 	}, nil
 }
@@ -79,7 +82,6 @@ func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err e
 		}
 	}()
 	probeBytes := min(int64(initialProbeBytes), s.readahead)
-	s.PrefetchRange(0, probeBytes)
 	if err := s.WaitRange(ctx, 0, probeBytes); err != nil {
 		return domain.MediaInfo{}, err
 	}
@@ -95,7 +97,7 @@ func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err e
 		reader.SetReadahead(min(int64(maxProbeBytes), s.readahead))
 		return (ffmpeg.SampleAnalyzer{}).Analyze(ctx, sourceProgressReader{Reader: reader, onRead: func(n int64) {
 			if s.onRead != nil {
-				s.onRead("", n)
+				s.onRead("", 0, n)
 			}
 		}})
 	}()
@@ -103,46 +105,30 @@ func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err e
 		return domain.MediaInfo{}, ctx.Err()
 	}
 
-	tailBytes := min(int64(probeTailBytes), s.readahead)
-	if tailOffset := s.file.Length() - tailBytes; tailOffset > 0 {
-		s.PrefetchRange(tailOffset, tailBytes)
-	}
-	if sampleErr == nil && sampleInfo.Duration > 0 {
-		return s.refineDurationFromTail(ctx, sampleInfo), nil
+	if sampleErr == nil && sampleInfo.VideoCodec != "" {
+		return sampleInfo, nil
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, urlProbeTimeout)
 	defer cancel()
 	info, urlErr := (ffmpeg.SampleAnalyzer{}).AnalyzeURL(probeCtx, s.url)
 	if urlErr == nil {
-		return s.refineDurationFromTail(ctx, info), nil
-	}
-	// A valid head sample is enough for progressive HLS even when the container
-	// cannot expose a duration without an expensive scan to EOF.
-	if sampleErr == nil && sampleInfo.VideoCodec != "" {
-		tailCtx, cancelTail := context.WithTimeout(ctx, urlProbeTimeout)
-		tailDuration, tailErr := (ffmpeg.SampleAnalyzer{}).AnalyzeTailDurationURL(tailCtx, s.url, sampleInfo.VideoTrackIndex)
-		cancelTail()
-		if tailErr == nil {
-			sampleInfo.Duration = tailDuration
-			sampleInfo.Seekable = true
-			return sampleInfo, nil
-		}
-		sampleInfo.Duration = 0
-		sampleInfo.Seekable = false
-		return sampleInfo, nil
+		return info, nil
 	}
 	return domain.MediaInfo{}, urlErr
 }
 
-func (s *torrentSource) refineDurationFromTail(ctx context.Context, info domain.MediaInfo) domain.MediaInfo {
+func (s *torrentSource) refineDurationFromTail(ctx context.Context, info domain.MediaInfo) (domain.MediaInfo, error) {
 	tailCtx, cancel := context.WithTimeout(ctx, urlProbeTimeout)
 	defer cancel()
 	tailDuration, err := (ffmpeg.SampleAnalyzer{}).AnalyzeTailDurationURL(tailCtx, s.url, info.VideoTrackIndex)
-	if err == nil && math.Abs(tailDuration-info.Duration) > 0.25 {
+	if err != nil {
+		return info, err
+	}
+	if math.Abs(tailDuration-info.Duration) > 0.25 {
 		info.Duration = tailDuration
 		info.Seekable = true
 	}
-	return info
+	return info, nil
 }
 
 type sourceProgressReader struct {
@@ -167,21 +153,21 @@ func closeTorrentReader(reader torrent.Reader) (err error) {
 	return reader.Close()
 }
 
-func (s *torrentSource) PrefetchRange(offset, length int64) {
-	windows := s.rangeWindows(offset, length)
-	if len(windows) == 0 {
-		return
-	}
-	s.file.Torrent().DownloadPieces(windows[0].index, windows[len(windows)-1].index+1)
-}
-
 func (s *torrentSource) WaitRange(ctx context.Context, offset, length int64) error {
 	offset, length = clampRange(offset, length, s.file.Length())
 	if length <= 0 {
 		return nil
 	}
 
-	s.PrefetchRange(offset, length)
+	windows := s.rangeWindows(offset, length)
+	if len(windows) == 0 {
+		return nil
+	}
+	release := func() {}
+	if s.demand != nil {
+		release = s.demand.acquire(s.file.Torrent(), windows[0].index, windows[len(windows)-1].index+1)
+	}
+	defer release()
 	if err := s.verifyRangeOnce(ctx, offset, length); err != nil {
 		return err
 	}
@@ -218,6 +204,36 @@ func (s *torrentSource) rangeComplete(offset, length int64) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+func (s *torrentSource) rangePieceCounts(offset, length int64) (missing, total int) {
+	for _, window := range s.rangeWindows(offset, length) {
+		total++
+		if !window.state.Ok || !window.state.Complete {
+			missing++
+		}
+	}
+	return missing, total
+}
+
+func (s *torrentSource) requestedPieceBytes(pieces map[int]bool) (cacheBytes, peerBytes int64) {
+	if s == nil {
+		return 0, 0
+	}
+	for index, initiallyComplete := range pieces {
+		piece := s.file.Torrent().Piece(index)
+		state := piece.State()
+		if !state.Ok || !state.Complete {
+			continue
+		}
+		length := piece.Info().Length()
+		if initiallyComplete {
+			cacheBytes += length
+		} else {
+			peerBytes += length
+		}
+	}
+	return cacheBytes, peerBytes
 }
 
 func (s *torrentSource) verifyRangeOnce(ctx context.Context, offset, length int64) error {

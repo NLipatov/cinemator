@@ -178,6 +178,29 @@
         this.statusController = null;
         this.statusSeq = 0;
         this.statusTarget = null;
+        this.frameCallback = null;
+        this.frameTimer = null;
+        this.lastPresentedFrameAt = 0;
+        this.hasPresentedFrame = false;
+        this.playIntent = false;
+        this.autoplayBlocked = false;
+        this.presentationAttemptSeq = 0;
+        this.presentationAttempt = null;
+        this.stallStartedAt = 0;
+        this.stallWasUnderrun = false;
+        this.presentedFrameCount = 0;
+        this.qoe = {
+          attempts: [],
+          playbackStallCount: 0,
+          playbackStallDurationMs: 0,
+          rebufferCount: 0,
+          rebufferDurationMs: 0,
+          intendedPlayingMs: 0,
+          intendedPlayingStartedAt: 0,
+          stalls: [],
+          lastPublishedAt: 0,
+          publishTimer: null,
+        };
       }
       isStale(id) { return id !== this.requestSeq; }
       cancelRequest() {
@@ -227,6 +250,17 @@
     ];
     function destroyVideoAndHls({ resetLayout = true } = {}) {
       if (playback.events) { playback.events.abort(); playback.events = null; }
+      if (playback.frameCallback !== null && $('video')?.cancelVideoFrameCallback) {
+        $('video').cancelVideoFrameCallback(playback.frameCallback);
+      }
+      playback.frameCallback = null;
+      if (playback.frameTimer) clearInterval(playback.frameTimer);
+      playback.frameTimer = null;
+      finishPlaybackStall(performance.now());
+      playback.playIntent = false;
+      playback.autoplayBlocked = false;
+      if (hasQoeData()) publishQoeSummary();
+      playback.stallStartedAt = 0;
       if (playback.hls) { playback.hls.destroy(); playback.hls = null; }
       playback.stopStatusPolling();
       playback.streamDir = null;
@@ -340,6 +374,15 @@
         : status.mode === 'hybrid'
           ? 'copying video and converting audio'
           : 'transcoding';
+      const progress = [];
+      if (status.peerBytes) progress.push(`${formatBytes(status.peerBytes)} from peers`);
+      if (status.sourceRateBitsPerSecond) progress.push(`${formatBitrate(status.sourceRateBitsPerSecond)} source rate`);
+      if (status.cacheBytes) progress.push(`${formatBytes(status.cacheBytes)} cached`);
+      if (status.bytesRead) progress.push(`${formatBytes(status.bytesRead)} fed to media worker`);
+      if (status.publishedBytes) progress.push(`${formatBytes(status.publishedBytes)} published`);
+      if (status.rangePieces) progress.push(`${status.missingPieces || 0}/${status.rangePieces} pieces missing`);
+      progress.push(peerText);
+      const progressText = `${progress.join(' · ')}${suffix}`;
       if (staleReady) {
         showWarning(
           `Requesting ${formatPlaybackTime(target)}`,
@@ -351,8 +394,8 @@
       if (status.phase === 'no_peers') {
         showWarning(
           `Waiting for peers at ${formatPlaybackTime(target)}`,
-          'There are no active peers for the required torrent pieces. Peer discovery is still running.',
-          `${peerText}${suffix}`,
+          status.message || 'There are no active peers for the required torrent pieces. Peer discovery is still running.',
+          progressText,
         );
         return;
       }
@@ -360,7 +403,7 @@
         showWarning(
           `Stalled at ${formatPlaybackTime(target)}`,
           status.message || 'Connected peers and the transcoder have not produced data recently.',
-          `${peerText}${suffix} · still retrying`,
+          `${progressText} · still retrying`,
         );
         return;
       }
@@ -368,7 +411,7 @@
         showWarning(
           `Stream failed at ${formatPlaybackTime(target)}`,
           status.message || 'The server could not generate the requested segment.',
-          `Preparation stopped · ${peerText}${suffix}`,
+          `Preparation stopped · ${progressText}`,
         );
         return;
       }
@@ -376,22 +419,48 @@
         showWarning(
           `Position ${formatPlaybackTime(target)} is ready`,
           'The requested segment is prepared. Connecting it to the player.',
-          `${formatBytes(status.bytesRead || 0)} read · ${peerText}`,
+          progressText,
+        );
+        return;
+      }
+      if (status.stage === 'waiting_source' || status.stage === 'source_blocked') {
+        showWarning(
+          `Waiting for source at ${formatPlaybackTime(target)}`,
+          status.stage === 'source_blocked'
+            ? 'The media worker is briefly waiting for required torrent pieces and will yield its slot automatically if they do not arrive.'
+            : 'The media worker yielded its slot while the required torrent pieces are downloaded and verified.',
+          progressText,
+        );
+        return;
+      }
+      if (status.stage === 'waiting_cpu' || status.stage === 'queued') {
+        showWarning(
+          `Queued for playback at ${formatPlaybackTime(target)}`,
+          status.message || 'Waiting for foreground media-worker capacity.',
+          progressText,
+        );
+        return;
+      }
+      if (status.stage === 'publishing') {
+        showWarning(
+          `Publishing ${formatPlaybackTime(target)}`,
+          'A complete media fragment is being added to the HLS presentation.',
+          progressText,
         );
         return;
       }
       if (status.phase === 'waiting') {
         showWarning(
           `Starting ${formatPlaybackTime(target)}`,
-          'Media information is ready. Waiting for the server to publish the first HLS segment.',
-          `${peerText}${suffix}`,
+          'Media information is ready. Waiting for the first complete HLS fragment.',
+          progressText,
         );
         return;
       }
       showWarning(
         `Preparing ${formatPlaybackTime(target)}`,
-        `Downloading the required torrent pieces and ${preparation} only for the requested window.`,
-        `${formatBytes(status.bytesRead || 0)} read · ${peerText}${suffix}`,
+        `The source data is ready; the server is ${preparation} the requested fragment.`,
+        progressText,
       );
     }
 
@@ -465,6 +534,10 @@
           throw new Error((await response.text()).trim() || `Status request failed (${response.status})`);
         }
         const status = await response.json();
+        const attempt = playback.presentationAttempt;
+        if (attempt?.kind === 'seek' && attempt.seekClass === 'pending') {
+          attempt.seekClass = status.phase === 'ready' ? 'cached' : 'cold';
+        }
         renderHlsStatus(status, targetSeconds);
         if (status.phase === 'ready') return status;
         if (status.phase === 'error') {
@@ -1114,7 +1187,7 @@
       }
     };
 
-    async function startPlayback(resumeTime = 0, { keepPlayerVisible = false } = {}) {
+    async function startPlayback(resumeTime = 0, { keepPlayerVisible = false, attemptKind = '' } = {}) {
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
       const audio = $('audioSelect').value || '0';
@@ -1134,6 +1207,8 @@
       } else {
         destroyVideoAndHls({ resetLayout: !wasPlaying });
       }
+      const kind = attemptKind || (wasPlaying ? 'seek' : 'startup');
+      beginPresentationAttempt(kind, start, kind === 'seek' ? 'pending' : '');
       $('player-block').style.display = keepPlayerVisible ? '' : 'none';
       removeWarning();
       showWarning();
@@ -1200,6 +1275,7 @@
         playHls(m3u8, subtitleSelected, {
           segmentSeconds,
           windowSegments,
+          bitrate: Number(playback.mediaInfo?.bitrate),
           duration,
           sourceStart: start,
           presentationOrigin,
@@ -1207,6 +1283,8 @@
       } catch (e) {
         if (e.name === 'AbortError') return;
         if (playback.isStale(requestId)) return;
+        finishPresentationAttempt('error');
+        publishQoeSummary();
         removeWarning();
         const msg = e.message || 'Could not start stream';
         if (keepPlayerVisible) {
@@ -1306,7 +1384,7 @@
         playback.forcedRecoveryAttempts++;
       }
       const resumeTime = playback.timeline.sourceTime(video?.currentTime);
-      startPlayback(resumeTime, { keepPlayerVisible: true }).finally(() => {
+      startPlayback(resumeTime, { keepPlayerVisible: true, attemptKind: 'recovery' }).finally(() => {
         playback.recoveryInFlight = false;
       });
       return true;
@@ -1317,7 +1395,7 @@
       playback.recoveryTimer = setTimeout(() => {
         playback.recoveryTimer = null;
         const video = $('video');
-        if (!video || video.paused) return;
+        if (!video || !playback.playIntent) return;
         if (force || video.readyState < 3) {
           requestPlaybackRecovery(reason, force);
         }
@@ -1329,9 +1407,198 @@
       showMsg('playerMsg', 'Playback error: ' + (details || 'Fatal error'), true);
     }
 
+    function beginPresentationAttempt(kind, target, seekClass = '') {
+      const now = performance.now();
+      updateQoePlayingTime(now);
+      finishPresentationAttempt('cancelled', now);
+      playback.presentationAttempt = {
+        id: ++playback.presentationAttemptSeq,
+        kind,
+        target,
+        startedAt: now,
+        ...(seekClass ? { seekClass } : {}),
+      };
+    }
+
+    function finishPresentationAttempt(result, now = performance.now()) {
+      const attempt = playback.presentationAttempt;
+      if (!attempt) return false;
+      attempt.result = result;
+      attempt.latencyMs = now - attempt.startedAt;
+      recordQoe(playback.qoe.attempts, attempt);
+      playback.presentationAttempt = null;
+      return true;
+    }
+
+    function recordQoe(records, value) {
+      records.push(value);
+      if (records.length > 100) records.shift();
+    }
+
+    function qoePresentationEligible(video) {
+      return playback.playIntent && document.visibilityState !== 'hidden' &&
+        !video?.seeking && !playback.requestController;
+    }
+
+    function qoePlayingEligible(video) {
+      return playback.hasPresentedFrame && !playback.presentationAttempt && qoePresentationEligible(video);
+    }
+
+    function hasQoeData() {
+      return playback.qoe.attempts.length > 0 || playback.qoe.playbackStallCount > 0 ||
+        playback.qoe.intendedPlayingMs > 0 || playback.qoe.intendedPlayingStartedAt > 0;
+    }
+
+    function updateQoePlayingTime(now = performance.now()) {
+      const eligible = qoePlayingEligible($('video'));
+      if (!eligible && playback.qoe.intendedPlayingStartedAt) {
+        playback.qoe.intendedPlayingMs += now - playback.qoe.intendedPlayingStartedAt;
+        playback.qoe.intendedPlayingStartedAt = 0;
+      } else if (eligible && !playback.qoe.intendedPlayingStartedAt) {
+        playback.qoe.intendedPlayingStartedAt = now;
+      }
+    }
+
+    function publishQoeSummary(now = performance.now()) {
+      updateQoePlayingTime(now);
+      if (!hasQoeData()) return;
+      const remaining = playback.qoe.lastPublishedAt ? 5000 - (now - playback.qoe.lastPublishedAt) : 0;
+      if (remaining > 0) {
+        if (!playback.qoe.publishTimer) {
+          playback.qoe.publishTimer = setTimeout(() => {
+            playback.qoe.publishTimer = null;
+            publishQoeSummary();
+          }, remaining);
+        }
+        return;
+      }
+      playback.qoe.lastPublishedAt = now;
+      const intendedPlayingMs = playback.qoe.intendedPlayingMs +
+        (playback.qoe.intendedPlayingStartedAt ? now - playback.qoe.intendedPlayingStartedAt : 0);
+      const denominator = Math.max(1, intendedPlayingMs);
+      window.dispatchEvent(new CustomEvent('cinemator:qoe', { detail: {
+        attempts: playback.qoe.attempts.slice(),
+        playbackStallCount: playback.qoe.playbackStallCount,
+        playbackStallDurationSeconds: playback.qoe.playbackStallDurationMs / 1000,
+        playbackStallRatio: playback.qoe.playbackStallDurationMs / denominator,
+        rebufferCount: playback.qoe.rebufferCount,
+        rebufferDurationSeconds: playback.qoe.rebufferDurationMs / 1000,
+        rebufferRatio: playback.qoe.rebufferDurationMs / denominator,
+        stallFreeSession: playback.qoe.playbackStallCount === 0,
+        intendedPlayingSeconds: intendedPlayingMs / 1000,
+        stalls: playback.qoe.stalls.slice(),
+      } }));
+    }
+
+    function observePresentedFrame(now) {
+      playback.lastPresentedFrameAt = now;
+      playback.lastActivityAt = Date.now();
+      playback.hasPresentedFrame = true;
+      playback.presentedFrameCount++;
+      playback.forcedRecoveryAttempts = 0;
+      const video = $('video');
+      if (playback.presentationAttempt && qoePresentationEligible(video)) {
+        finishPresentationAttempt('presented', now);
+      }
+      const presentedForPlayback = qoePlayingEligible(video);
+      if (playback.stallStartedAt && presentedForPlayback) {
+        finishPlaybackStall(now);
+        if (!playback.requestController) {
+          removeWarning();
+          showPlaybackNotice();
+        }
+      }
+      publishQoeSummary(now);
+    }
+
+    function finishPlaybackStall(now = performance.now()) {
+      if (!playback.stallStartedAt) return;
+      const durationMs = now - playback.stallStartedAt;
+      playback.qoe.playbackStallDurationMs += durationMs;
+      if (playback.stallWasUnderrun) playback.qoe.rebufferDurationMs += durationMs;
+      playback.stallStartedAt = 0;
+      playback.stallWasUnderrun = false;
+    }
+
+    function startFrameObservation(video, signal) {
+      playback.lastPresentedFrameAt = performance.now();
+      playback.hasPresentedFrame = false;
+      playback.presentedFrameCount = 0;
+      playback.stallStartedAt = 0;
+      let decodedFrames = 0;
+      const observe = now => observePresentedFrame(Number.isFinite(now) ? now : performance.now());
+      if (video.requestVideoFrameCallback) {
+        const next = () => {
+          playback.frameCallback = video.requestVideoFrameCallback((now) => {
+            if (signal.aborted) return;
+            observe(now);
+            next();
+          });
+        };
+        next();
+      } else if (video.getVideoPlaybackQuality) {
+        decodedFrames = Number(video.getVideoPlaybackQuality()?.totalVideoFrames) || 0;
+      }
+
+      const frameRate = Number(playback.mediaInfo?.frameRate);
+      const stallThresholdMs = Math.max(500, frameRate > 0 ? 2000 / frameRate : 500);
+      playback.frameTimer = setInterval(() => {
+        if (signal.aborted) return;
+        if (!video.requestVideoFrameCallback && video.getVideoPlaybackQuality) {
+          const nextFrames = Number(video.getVideoPlaybackQuality()?.totalVideoFrames) || 0;
+          if (nextFrames > decodedFrames) observe(performance.now());
+          decodedFrames = nextFrames;
+        }
+        if (!playback.playIntent || document.visibilityState === 'hidden' || video.seeking || playback.requestController) return;
+        const now = performance.now();
+        updateQoePlayingTime(now);
+        const minimumFrames = frameRate > 0 ? 1 : 2;
+        if (playback.presentedFrameCount < minimumFrames || now - playback.lastPresentedFrameAt < stallThresholdMs || playback.stallStartedAt) return;
+        playback.stallStartedAt = now;
+        playback.stallWasUnderrun = !playback.timeline.buffered(mediaBufferedRanges(video), video.currentTime);
+        playback.qoe.playbackStallCount++;
+        if (playback.stallWasUnderrun) playback.qoe.rebufferCount++;
+        const ranges = mediaBufferedRanges(video);
+        const currentRange = ranges.find(range => range.start <= video.currentTime && range.end > video.currentTime);
+        recordQoe(playback.qoe.stalls, {
+          at: playback.timeline.sourceTime(video.currentTime),
+          bufferedAhead: currentRange ? currentRange.end - video.currentTime : 0,
+          underrun: playback.stallWasUnderrun,
+        });
+        publishQoeSummary(now);
+        showWarning(
+          `Playback stalled at ${formatPlaybackTime(playback.timeline.sourceTime(video.currentTime))}`,
+          'Video frames stopped advancing. The player is recovering the current position.',
+          playback.stallWasUnderrun ? 'The forward buffer is empty.' : 'Buffered media is present; checking decoder and presentation state.',
+        );
+        schedulePlaybackRecovery('frozen-video', true);
+      }, 250);
+      signal.addEventListener('abort', () => {
+        if (playback.frameCallback !== null && video.cancelVideoFrameCallback) {
+          video.cancelVideoFrameCallback(playback.frameCallback);
+        }
+        playback.frameCallback = null;
+        if (playback.frameTimer) clearInterval(playback.frameTimer);
+        playback.frameTimer = null;
+      }, { once: true });
+    }
+
     function attachPlaybackRecovery(video, signal) {
       const options = { signal };
-      video.addEventListener('play', () => requestPlaybackRecovery('play'), options);
+      video.addEventListener('play', () => {
+        playback.playIntent = true;
+        if (playback.autoplayBlocked) {
+          playback.autoplayBlocked = false;
+          beginPresentationAttempt('autoplay_resume', playback.timeline.sourceTime(video.currentTime));
+        }
+        updateQoePlayingTime();
+        requestPlaybackRecovery('play');
+      }, options);
+      video.addEventListener('pause', () => {
+        finishPlaybackStall();
+        playback.playIntent = false;
+        publishQoeSummary();
+      }, options);
       video.addEventListener('playing', () => {
         playback.timeline.anchor(video.currentTime);
         showPlaybackNotice();
@@ -1343,6 +1610,8 @@
       video.addEventListener('pointerdown', markUserSeekIntent, options);
       video.addEventListener('keydown', markUserSeekIntent, options);
       video.addEventListener('seeking', () => {
+        finishPlaybackStall();
+        updateQoePlayingTime();
         const userInitiated = Date.now() <= playback.userSeekIntentUntil;
         playback.userSeekIntentUntil = 0;
         if (playback.attaching && !userInitiated) return;
@@ -1357,6 +1626,7 @@
           if (playback.isRequesting(target)) return;
           playback.cancelRequest();
           if (retained) {
+            beginPresentationAttempt('seek', target, 'retained');
             if (playback.hls?.startLoad) playback.hls.startLoad(playback.timeline.hlsTime(target));
             playback.lastActivityAt = Date.now();
             removeWarning();
@@ -1370,6 +1640,7 @@
         }
         beginHlsStatusPolling(target, true);
         if (retained) {
+          beginPresentationAttempt('seek', target, 'retained');
           return;
         }
         const duration = Number(playback.mediaInfo?.duration);
@@ -1378,12 +1649,17 @@
         }
       }, options);
       video.addEventListener('seeked', () => {
+        updateQoePlayingTime();
         if (playback.requestController) return;
         if (video.readyState >= 3) {
           removeWarning();
         } else {
           beginHlsStatusPolling(playback.timeline.sourceTime(video.currentTime));
         }
+      }, options);
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') finishPlaybackStall();
+        publishQoeSummary();
       }, options);
       video.addEventListener('waiting', () => {
         if (playback.requestController) return;
@@ -1407,11 +1683,11 @@
       }, options);
     }
 
-    function longHlsLoadPolicy() {
+    function hlsPlaylistLoadPolicy() {
       return {
         default: {
-          maxTimeToFirstByteMs: 10 * 60 * 1000,
-          maxLoadTimeMs: 10 * 60 * 1000,
+          maxTimeToFirstByteMs: 60 * 1000,
+          maxLoadTimeMs: 2 * 60 * 1000,
           timeoutRetry: {
             maxNumRetry: 2,
             retryDelayMs: 1000,
@@ -1434,6 +1710,7 @@
       const eventOptions = { signal: playback.events.signal };
       playback.lastActivityAt = Date.now();
       attachPlaybackRecovery(video, playback.events.signal);
+      startFrameObservation(video, playback.events.signal);
 
       const reapplySubtitleDelay = () => applySubtitleDelay(video, subtitleDelay);
       if (enableSubtitles) {
@@ -1459,20 +1736,25 @@
         playback.timeline.anchor(video.currentTime);
         playback.nativeRetries = 0;
         playback.lastActivityAt = Date.now();
-        playback.forcedRecoveryAttempts = 0;
         showPlaybackNotice();
         removeWarning();
         return true;
       }
       function markPlaybackProgress() {
         playback.lastActivityAt = Date.now();
-        playback.forcedRecoveryAttempts = 0;
       }
       function requestPlaybackStart() {
         if (playbackStartRequested || !video.paused) return;
         playbackStartRequested = true;
+        playback.playIntent = true;
         video.play().catch(error => {
           if (error?.name === 'NotAllowedError') {
+            playback.playIntent = false;
+            playback.autoplayBlocked = true;
+            const now = performance.now();
+            if (finishPresentationAttempt('autoplay_blocked', now)) {
+              publishQoeSummary(now);
+            }
             removeWarning();
             showMsg('playerMsg', 'Video is ready. Press Play to begin.', false, true);
           } else {
@@ -1486,8 +1768,14 @@
 
       if (window.Hls && Hls.isSupported()) {
         const segmentSeconds = Math.max(1, Number(streamConfig.segmentSeconds) || 2);
-        const windowSegments = Math.max(1, Number(streamConfig.windowSegments) || 15);
-        const forwardBuffer = Math.min(segmentSeconds * windowSegments, 12);
+        const byteCeiling = 128 * 1024 * 1024;
+        const bitrate = Math.max(1, Number(streamConfig.bitrate) || 8_000_000);
+        const byteBoundSeconds = Math.max(segmentSeconds * 2, byteCeiling * 8 / bitrate);
+        const targetBuffer = Math.min(30, byteBoundSeconds);
+        const highBuffer = Math.max(targetBuffer, Math.min(60, byteBoundSeconds));
+        let deliveryRatio = 0;
+        let deliveryJitter = 0;
+        let deliverySamples = 0;
         const duration = Number(streamConfig.duration);
         const sourceStart = Math.max(0, Number(streamConfig.sourceStart) || 0);
         const presentationStart = playback.timeline.configure({
@@ -1501,13 +1789,14 @@
           timelineOffset: playback.timeline.absolute ? presentationStart : undefined,
           initialLiveManifestSize: 1,
           liveSyncMode: 'buffered',
-          maxBufferLength: forwardBuffer,
-          maxMaxBufferLength: forwardBuffer,
-          backBufferLength: segmentSeconds * 2,
+          maxBufferLength: targetBuffer,
+          maxMaxBufferLength: highBuffer,
+          maxBufferSize: byteCeiling,
+          backBufferLength: Math.min(60, byteBoundSeconds),
           fragLoadPolicy: {
             default: {
-              maxTimeToFirstByteMs: 10 * 60 * 1000,
-              maxLoadTimeMs: 10 * 60 * 1000,
+              maxTimeToFirstByteMs: 60 * 1000,
+              maxLoadTimeMs: 2 * 60 * 1000,
               timeoutRetry: {
                 maxNumRetry: 2,
                 retryDelayMs: 0,
@@ -1520,8 +1809,8 @@
               },
             },
           },
-          manifestLoadPolicy: longHlsLoadPolicy(),
-          playlistLoadPolicy: longHlsLoadPolicy(),
+          manifestLoadPolicy: hlsPlaylistLoadPolicy(),
+          playlistLoadPolicy: hlsPlaylistLoadPolicy(),
         });
         playback.hls.on(Hls.Events.MANIFEST_PARSED, () => {
           playback.lastActivityAt = Date.now();
@@ -1565,10 +1854,44 @@
             reapplySubtitleDelay();
           });
         }
-        playback.hls.on(Hls.Events.FRAG_LOADED, markPlaybackProgress);
+        playback.hls.on(Hls.Events.FRAG_LOADED, (evt, data) => {
+          markPlaybackProgress();
+          const frag = data?.frag;
+          if (!frag || frag.type !== 'main') return;
+          const started = Number(frag.stats?.loading?.start);
+          const ended = Number(frag.stats?.loading?.end);
+          const mediaSeconds = Number(frag.duration);
+          if (!Number.isFinite(started) || !Number.isFinite(ended) || ended <= started || mediaSeconds <= 0) return;
+          const sample = Math.min(4, (ended - started) / 1000 / mediaSeconds);
+          if (deliverySamples === 0) {
+            deliveryRatio = sample;
+          } else {
+            deliveryJitter = 0.75 * deliveryJitter + 0.25 * Math.abs(sample - deliveryRatio);
+            deliveryRatio = 0.75 * deliveryRatio + 0.25 * sample;
+          }
+          deliverySamples++;
+          playback.hls.config.maxBufferLength = deliveryRatio + deliveryJitter >= 0.75
+            ? highBuffer
+            : targetBuffer;
+        });
         playback.hls.on(Hls.Events.FRAG_BUFFERED, (evt, data) => {
           if (!data?.frag || data.frag.type === 'main') {
-            if (markStreamActive()) requestPlaybackStart();
+            if (!markStreamActive()) return;
+            const ranges = mediaBufferedRanges(video);
+            const currentRange = ranges.find(range => range.start <= video.currentTime + 0.05 && range.end > video.currentTime);
+            const bufferedAhead = currentRange ? currentRange.end - video.currentTime : 0;
+            const startupReserve = deliverySamples > 0 && deliveryRatio + deliveryJitter >= 0.75
+              ? Math.min(targetBuffer, 3 * segmentSeconds)
+              : Math.min(targetBuffer, segmentSeconds);
+            if (bufferedAhead + 0.25 >= startupReserve) {
+              requestPlaybackStart();
+            } else {
+              showWarning(
+                `Building a ${Math.ceil(startupReserve)}s playback reserve`,
+                'Recent fragment delivery is marginal, so playback will start with enough data to avoid an immediate pause.',
+                `${bufferedAhead.toFixed(1)}s buffered`,
+              );
+            }
           }
         });
         playback.hls.on(Hls.Events.ERROR, (evt, data) => {

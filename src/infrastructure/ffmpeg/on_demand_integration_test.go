@@ -177,7 +177,7 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 		domain.MediaInfo{VideoCodec: "h264", Width: 160, Height: 90, AudioTracks: []domain.AudioTrack{{Codec: "aac"}}},
 		StreamSelection{AudioTrackIndex: 0},
 		0, 5, 6*time.Second,
-		func(index int) error {
+		func(index int, _ float64) error {
 			published = append(published, index)
 			return nil
 		},

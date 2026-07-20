@@ -150,9 +150,12 @@ func TestServeTorrentRangeReportsBodyProgress(t *testing.T) {
 	src := rangeSource{
 		file:      fakeRangeFile{data: []byte("0123456789")},
 		readahead: 128,
-		onRead: func(jobID string, n int64) {
+		onRead: func(jobID string, offset, n int64) {
 			if jobID != "job-7" {
 				t.Fatalf("job id = %q", jobID)
+			}
+			if offset != 2 {
+				t.Fatalf("offset = %d, want 2", offset)
 			}
 			read += n
 		},
@@ -166,6 +169,53 @@ func TestServeTorrentRangeReportsBodyProgress(t *testing.T) {
 	}
 	if read != 4 {
 		t.Fatalf("reported bytes = %d, want 4", read)
+	}
+}
+
+func TestServeTorrentRangeUsesJobSpecificReadahead(t *testing.T) {
+	var requested int64
+	src := rangeSource{
+		file:      fakeRangeFile{data: []byte("0123456789")},
+		readahead: 8,
+		readaheadFor: func(jobID string) int64 {
+			if jobID != "startup" {
+				t.Fatalf("job id = %q, want startup", jobID)
+			}
+			return 3
+		},
+		onRequest: func(_ string, _, length int64) {
+			requested = length
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/source/token/file.mkv?job=startup", nil)
+	rec := httptest.NewRecorder()
+
+	if err := serveTorrentRange(rec, req, src); err != nil {
+		t.Fatalf("serveTorrentRange() error = %v", err)
+	}
+	if requested != 3 {
+		t.Fatalf("requested readahead = %d, want 3", requested)
+	}
+}
+
+func TestServeTorrentRangeAdvancesTheReportedDemandWithTheReader(t *testing.T) {
+	data := bytes.Repeat([]byte{'x'}, 2*progressReportBytes)
+	requests := make([]int64, 0, 3)
+	src := rangeSource{
+		file:      fakeRangeFile{data: data},
+		readahead: progressReportBytes,
+		onRequest: func(_ string, offset, _ int64) {
+			requests = append(requests, offset)
+		},
+	}
+	req := httptest.NewRequest(http.MethodGet, "/source/token/file.mkv?job=streaming", nil)
+	rec := httptest.NewRecorder()
+
+	if err := serveTorrentRange(rec, req, src); err != nil {
+		t.Fatalf("serveTorrentRange() error = %v", err)
+	}
+	if len(requests) < 2 || requests[0] != 0 || requests[1] <= requests[0] {
+		t.Fatalf("reported demand offsets = %v, want a moving range", requests)
 	}
 }
 

@@ -28,6 +28,8 @@ const (
 var (
 	errStreamJobQueueFull = errors.New("stream job queue is full")
 	errStreamJobLimit     = errors.New("stream has too many pending jobs")
+	errSourceBlocked      = errors.New("packager is blocked on torrent source data")
+	errPackagerNoOutput   = errors.New("packager made no output progress")
 )
 
 func (s *streamInfo) waitReady(ctx context.Context) error {
@@ -82,9 +84,7 @@ func (m *manager) initializeOnDemandStream(key streamKey, s *streamInfo) {
 		}
 	}
 	if err == nil && !infoReady {
-		m.mu.Lock()
-		m.mediaInfo[mediaKey{InfoHash: key.InfoHash, Index: key.Index}] = info
-		m.mu.Unlock()
+		m.storeMediaDescriptor(s.ctx, mediaKey{InfoHash: key.InfoHash, Index: key.Index}, info)
 	}
 	if err == nil {
 		info.Seekable = info.Duration > 0
@@ -515,7 +515,6 @@ func (m *manager) requestVideoTarget(s *streamInfo, target playbackTarget) {
 	}
 	begin := target.segment
 	end := begin + 1
-	_, followEnd := timeline.windowForSegment(begin)
 	if total := timeline.segmentCount(); total > 0 {
 		end = min(end, total)
 	}
@@ -526,8 +525,8 @@ func (m *manager) requestVideoTarget(s *streamInfo, target playbackTarget) {
 		return
 	}
 	s.presentationTarget = target.sourceSeconds
+	s.progressiveDemand = target.segment
 	if created {
-		job.followEnd = followEnd
 		job.targetSeconds = target.sourceSeconds
 	}
 	s.mtx.Unlock()
@@ -632,14 +631,16 @@ func (m *manager) ensureVideoSegment(ctx context.Context, s *streamInfo, index i
 	return waitErr
 }
 
-// prefetchProgressiveWindow keeps one small, fully generated window ahead of
-// playback. Unknown-duration EVENT playlists can then grow without advertising
-// files that do not exist or requiring a guessed final duration.
+// prefetchProgressiveWindow restores a bounded materialized horizon. Startup
+// publishes one fragment; subsequent foreground work reaches the low watermark
+// before preemptible work grows toward the target.
 func (m *manager) prefetchProgressiveWindow(s *streamInfo, requested int) {
 	window := m.settings.HlsWindowSegments()
 	s.mtx.Lock()
-	if s.closing || s.progressiveEnded ||
-		s.progressiveRetry || !shouldPrefetchProgressiveWindow(requested, s.progressiveAdvertised) {
+	if requested >= 0 {
+		s.progressiveDemand = requested
+	}
+	if s.closing || s.progressiveEnded || s.progressiveRetry {
 		s.mtx.Unlock()
 		return
 	}
@@ -664,8 +665,12 @@ func (m *manager) prefetchProgressiveWindow(s *streamInfo, requested int) {
 			return
 		}
 	}
-	end := progressivePrefetchEnd(begin, total, window, requested < 0)
-	job, jobCtx, created, err := s.acquireJobLocked(videoSegmentJob, begin, begin, end, true, m.scheduler, m.settings.MaxJobsPerStream())
+	plan := progressivePrefetchPlan(s.progressiveDemand, begin, total, window, m.settings.HlsSegmentDuration(), s.progressiveTarget, requested < 0)
+	if !plan.ok {
+		s.mtx.Unlock()
+		return
+	}
+	job, jobCtx, created, err := s.acquireJobLocked(videoSegmentJob, begin, begin, plan.end, plan.background, m.scheduler, m.settings.MaxJobsPerStream())
 	if err != nil {
 		s.progressiveRetry = true
 		s.status.Phase = domain.HlsPhaseWaiting
@@ -687,8 +692,40 @@ func (m *manager) prefetchProgressiveWindow(s *streamInfo, requested int) {
 	go m.runVideoJob(s, jobCtx, job)
 }
 
-func shouldPrefetchProgressiveWindow(requested, advertised int) bool {
-	return requested < 0 || requested >= max(0, advertised-1)
+type progressivePlan struct {
+	end        int
+	background bool
+	ok         bool
+}
+
+func progressivePrefetchPlan(demand, advertised, total, maximum int, segmentDuration, targetReserve time.Duration, startup bool) progressivePlan {
+	if startup {
+		end := advertised + 1
+		if total > 0 {
+			end = min(end, total)
+		}
+		return progressivePlan{end: end, ok: end > advertised}
+	}
+	seconds := max(1.0, segmentDuration.Seconds())
+	low := max(1, int(math.Ceil(15/seconds)))
+	targetSeconds := min(60.0, max(30.0, targetReserve.Seconds()))
+	target := max(low, int(math.Ceil(targetSeconds/seconds)))
+	high := max(target, int(math.Ceil(60/seconds)))
+	ahead := advertised - max(0, demand)
+	if ahead >= target {
+		return progressivePlan{}
+	}
+	background := ahead >= low
+	desired := demand + target
+	if !background {
+		desired = demand + low
+	}
+	end := min(advertised+max(1, maximum), desired)
+	end = min(end, demand+high)
+	if total > 0 {
+		end = min(end, total)
+	}
+	return progressivePlan{end: end, background: background, ok: end > advertised}
 }
 
 func directPrefetchIndexLocked(s *streamInfo, owner int, assetName string) int {
@@ -697,17 +734,6 @@ func directPrefetchIndexLocked(s *streamInfo, owner int, assetName string) int {
 		return max(owner, s.progressiveAdvertised-1)
 	}
 	return owner
-}
-
-func progressivePrefetchEnd(begin, total, window int, startup bool) int {
-	if startup {
-		window = 1
-	}
-	end := begin + max(1, window)
-	if total > 0 {
-		end = min(end, total)
-	}
-	return end
 }
 
 func (m *manager) retryProgressivePrefetch(s *streamInfo) {
@@ -756,10 +782,6 @@ func (m *manager) prefetchProgressiveSubtitles(s *streamInfo, begin, end int) {
 }
 
 func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJob) {
-	prefetchBegin := 0
-	prefetchEnd := 0
-	prefetchTarget := 0.0
-	keepDirectOrigin := false
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			job.err = fmt.Errorf("video generation panic: %v", recovered)
@@ -772,8 +794,13 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 		close(job.done)
 		s.finishJob(videoSegmentJob, job)
 		m.enforceCacheLimit()
-		if job.err == nil && prefetchBegin < prefetchEnd {
-			m.prefetchVideoRange(s, prefetchBegin, prefetchEnd, prefetchTarget, keepDirectOrigin)
+		if job.err == nil {
+			s.recordJobDelivery(job, m.settings.HlsSegmentDuration(), time.Now())
+			s.mtx.Lock()
+			demand := s.progressiveDemand
+			s.mtx.Unlock()
+			m.prefetchProgressiveWindow(s, demand)
+			m.maybeRefineStreamDuration(s)
 		}
 	}()
 	ctx, cancel := context.WithTimeout(ctx, windowGenerationTimeout)
@@ -812,9 +839,11 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 	}()
 	s.markJobStarted(job)
 
-	generateTranscoded := func() error {
+	transcodedFragments := make([]ffmpeg.HLSFragment, 0, segmentCount)
+	generateTranscoded := func(runCtx context.Context) error {
+		transcodedFragments = transcodedFragments[:0]
 		job.result, job.err = ffmpeg.GenerateVideoWindow(
-			ctx,
+			runCtx,
 			s.source.URLForJob(job.id),
 			s.paths.outDir,
 			info,
@@ -822,8 +851,22 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 			job.begin,
 			job.end-job.begin,
 			m.settings.HlsSegmentDuration(),
-			func(index int) error {
+			func(index int, duration float64) error {
+				fragment := ffmpeg.HLSFragment{
+					Start:    m.timeline(0).segmentStart(index),
+					Duration: duration,
+					Name:     videoSegmentName(index),
+				}
+				transcodedFragments = append(transcodedFragments, fragment)
+				s.markJobStage(job, domain.HlsStagePublishing)
+				if err := m.publishMaterializedWindow(s, job, transcodedFragments, false, false, index+1, false); err != nil {
+					return err
+				}
+				if stat, err := os.Stat(filepath.Join(s.paths.outDir, fragment.Name)); err == nil {
+					s.markPublished(job, fragment.Name, stat.Size())
+				}
 				s.markSegmentProgress(job, index)
+				s.markJobStage(job, domain.HlsStagePackaging)
 				if err := m.checkHlsCacheLimit(); err != nil {
 					stopResourceGuard(err)
 					return err
@@ -849,18 +892,23 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 			}
 			fragmentEnd := fragment.Start + fragment.Duration - 0.001
 			advertisedEnd := m.timeline(info.Duration).locate(fragmentEnd).segment + 1
+			s.markJobStage(job, domain.HlsStagePublishing)
 			if err := m.publishMaterializedWindow(s, job, pending, ffmpeg.UsesFMP4(info, selection), true, advertisedEnd, false); err != nil {
 				return err
+			}
+			if stat, err := os.Stat(filepath.Join(s.paths.outDir, fragment.Name)); err == nil {
+				s.markPublished(job, fragment.Name, stat.Size())
 			}
 			pending = pending[:0]
 			published = true
 			s.markSegmentProgress(job, advertisedEnd-1)
+			s.markJobStage(job, domain.HlsStagePackaging)
 			return m.checkHlsCacheLimit()
 		}
-		generateDirect := func() error {
+		generateDirect := func(runCtx context.Context) error {
 			var err error
 			direct, err = ffmpeg.GenerateDirectWindow(
-				ctx,
+				runCtx,
 				s.source.URLForJob(job.id),
 				s.paths.outDir,
 				info,
@@ -875,9 +923,9 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 		}
 		var directErr error
 		if ffmpeg.CopiesAudio(info, selection) {
-			directErr = generateDirect()
+			directErr = m.runBoundedPackager(ctx, s, job, false, generateDirect)
 		} else {
-			directErr = m.withTranscodeSlot(ctx, generateDirect)
+			directErr = m.runBoundedPackager(ctx, s, job, true, generateDirect)
 		}
 		if directErr == nil {
 			if err := m.checkHlsCacheLimit(); err != nil {
@@ -902,13 +950,13 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 				job.err = m.switchToTranscode(s, job)
 			}
 			if job.err == nil {
-				job.err = m.withTranscodeSlot(ctx, generateTranscoded)
+				job.err = m.runBoundedPackager(ctx, s, job, true, generateTranscoded)
 			}
 		} else {
 			job.err = directErr
 		}
 	} else {
-		job.err = m.withTranscodeSlot(ctx, generateTranscoded)
+		job.err = m.runBoundedPackager(ctx, s, job, true, generateTranscoded)
 	}
 	if job.err == nil {
 		s.mtx.Lock()
@@ -925,51 +973,47 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 	}
 	if job.err == nil {
 		m.prefetchProgressiveSubtitles(s, job.begin, job.end)
-		prefetchBegin = job.end
-		prefetchEnd = job.followEnd
-		prefetchTarget = job.targetSeconds
-		s.mtx.Lock()
-		stillDirect := s.directPlay
-		s.mtx.Unlock()
-		if stillDirect && !job.background && job.followEnd > job.end {
-			prefetchBegin = job.begin
-			keepDirectOrigin = true
-		}
 	}
 	if job.err != nil && !errors.Is(job.err, context.Canceled) {
 		log.Printf("Generate HLS video window failed: dir=%s segments=[%d,%d): %v", filepath.Base(s.paths.outDir), job.begin, job.end, job.err)
 	}
 }
 
-func (m *manager) prefetchVideoRange(s *streamInfo, begin, end int, targetSeconds float64, keepDirectOrigin bool) {
-	if begin >= end {
-		return
-	}
+func (m *manager) maybeRefineStreamDuration(s *streamInfo) {
+	targetAhead := max(1, int(math.Ceil(30/max(1.0, m.settings.HlsSegmentDuration().Seconds()))))
 	s.mtx.Lock()
-	if s.closing || s.fatalErr != nil || findSegmentJob(s.videoJobs, begin) != nil {
+	if s.closing || s.durationRefinementStarted || s.progressiveAdvertised-s.progressiveDemand < targetAhead {
 		s.mtx.Unlock()
 		return
 	}
-	timeline := m.timeline(s.mediaInfo.Duration)
-	if !keepDirectOrigin {
-		begin = nextUncoveredDirectSegment(s.directWindows, timeline, begin, end)
-	}
-	if begin >= end {
-		s.mtx.Unlock()
-		return
-	}
-	job, jobCtx, created, err := s.acquireJobLocked(videoSegmentJob, begin, begin, end, true, m.scheduler, m.settings.MaxJobsPerStream())
-	if err != nil {
-		s.mtx.Unlock()
-		return
-	}
-	if !created {
-		s.mtx.Unlock()
-		return
-	}
-	job.targetSeconds = targetSeconds
+	s.durationRefinementStarted = true
+	info := s.mediaInfo
+	key := s.mediaKey
 	s.mtx.Unlock()
-	go m.runVideoJob(s, jobCtx, job)
+
+	go func() {
+		refined, err := s.source.refineDurationFromTail(s.ctx, info)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("background duration refinement failed: hash=%s file=%d: %v", key.InfoHash, key.Index, err)
+			}
+			return
+		}
+		if math.Abs(refined.Duration-info.Duration) <= 0.25 {
+			return
+		}
+		s.mtx.Lock()
+		if s.closing {
+			s.mtx.Unlock()
+			return
+		}
+		s.mediaInfo.Duration = refined.Duration
+		s.mediaInfo.Seekable = refined.Seekable
+		s.status.Duration = refined.Duration
+		s.status.Seekable = refined.Seekable
+		s.mtx.Unlock()
+		m.storeMediaDescriptor(s.ctx, key, refined)
+	}()
 }
 
 func (m *manager) directPrerollBudget(bitrate int64) time.Duration {
@@ -1496,12 +1540,24 @@ func directFragmentsCoverTime(windows map[int][]ffmpeg.HLSFragment, target float
 func classifyHlsStatus(status domain.HlsStatus, now time.Time) domain.HlsStatus {
 	if status.Phase == domain.HlsPhaseProbing || status.Phase == domain.HlsPhasePreparing {
 		idle := now.Sub(status.LastProgress)
-		if status.ActivePeers == 0 && idle >= 5*time.Second {
-			status.Phase = domain.HlsPhaseNoPeers
-			status.Message = "No active peers; discovery is still running"
-		} else if idle >= 15*time.Second {
-			status.Phase = domain.HlsPhaseStalled
-			status.Message = "Connected peers or the media worker have not produced data recently"
+		switch status.Stage {
+		case domain.HlsStageWaitingSource, domain.HlsStageSourceBlocked:
+			if status.ActivePeers == 0 && idle >= 5*time.Second {
+				status.Phase = domain.HlsPhaseNoPeers
+				status.Message = "No active peers have the required torrent pieces; discovery is still running"
+			} else if idle >= 15*time.Second {
+				status.Phase = domain.HlsPhaseStalled
+				status.Message = "The required torrent pieces have not advanced recently"
+			}
+		case domain.HlsStageWaitingCPU:
+			status.Message = "Waiting for foreground media-worker capacity"
+		case domain.HlsStagePackaging:
+			if idle >= 15*time.Second {
+				status.Phase = domain.HlsPhaseStalled
+				status.Message = "The media packager has not produced a complete fragment recently"
+			}
+		case domain.HlsStagePublishing:
+			status.Message = "Publishing a complete fragment to the HLS presentation"
 		}
 	}
 	return status
@@ -1613,7 +1669,7 @@ func (m *manager) runSubtitleJob(s *streamInfo, ctx context.Context, job *segmen
 			job.err = resourceErr
 		}
 	}()
-	job.err = m.withTranscodeSlot(ctx, func() error {
+	job.err = m.runBoundedPackager(ctx, s, job, true, func(runCtx context.Context) error {
 		s.markJobStarted(job)
 		for index := job.begin; index < job.end; index++ {
 			path := filepath.Join(s.paths.outDir, subtitleSegmentName(index))
@@ -1621,7 +1677,7 @@ func (m *manager) runSubtitleJob(s *streamInfo, ctx context.Context, job *segmen
 				continue
 			}
 			if err := ffmpeg.GenerateSubtitleSegment(
-				ctx,
+				runCtx,
 				s.source.URLForJob(job.id),
 				path,
 				s.selection.SubtitleTrackIndex,
@@ -1692,8 +1748,86 @@ func (s *streamInfo) markJobStarted(job *segmentJob) {
 	s.mtx.Unlock()
 }
 
-func (m *manager) withTranscodeSlot(ctx context.Context, run func() error) error {
-	return m.scheduler.transcode(ctx, run)
+func (m *manager) runBoundedPackager(ctx context.Context, s *streamInfo, job *segmentJob, needsCPU bool, run func(context.Context) error) error {
+	sourceBlockedDeadline := max(10*time.Second, 3*m.settings.HlsSegmentDuration())
+	packagerDeadline := sourceBlockedDeadline
+	if needsCPU {
+		// Compatibility transcoding can legitimately need longer than real time
+		// for its first frame on a small VPS. Source underflow still yields at the
+		// shorter deadline above.
+		packagerDeadline = max(packagerDeadline, time.Minute)
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attempt := func() error {
+			s.markJobStage(job, domain.HlsStagePackaging)
+			attemptCtx, stop := context.WithCancelCause(ctx)
+			monitorDone := make(chan struct{})
+			go func() {
+				defer close(monitorDone)
+				ticker := time.NewTicker(250 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-attemptCtx.Done():
+						return
+					case now := <-ticker.C:
+						sourceProgress, outputProgress, diagnosticProgress, rangeStart, rangeEnd := s.packagerProgress(job)
+						missing, _ := s.source.rangePieceCounts(rangeStart, rangeEnd-rangeStart)
+						if rangeEnd > rangeStart && missing > 0 && now.Sub(sourceProgress) >= 500*time.Millisecond {
+							s.markJobStage(job, domain.HlsStageSourceBlocked)
+						}
+						lastProgress := outputProgress
+						if sourceProgress.After(lastProgress) {
+							lastProgress = sourceProgress
+						}
+						if diagnosticProgress.After(lastProgress) {
+							lastProgress = diagnosticProgress
+						}
+						if rangeEnd > rangeStart && missing > 0 &&
+							now.Sub(sourceProgress) >= sourceBlockedDeadline && now.Sub(outputProgress) >= sourceBlockedDeadline {
+							stop(errSourceBlocked)
+							return
+						}
+						if now.Sub(lastProgress) >= packagerDeadline {
+							stop(errPackagerNoOutput)
+							return
+						}
+					}
+				}
+			}()
+			err := run(attemptCtx)
+			stop(context.Canceled)
+			<-monitorDone
+			if cause := context.Cause(attemptCtx); errors.Is(cause, errSourceBlocked) || errors.Is(cause, errPackagerNoOutput) {
+				return cause
+			}
+			return err
+		}
+
+		var err error
+		if needsCPU {
+			s.markJobStage(job, domain.HlsStageWaitingCPU)
+			err = m.scheduler.transcode(ctx, job.background, job.cancel, attempt)
+		} else {
+			err = attempt()
+		}
+		if !errors.Is(err, errSourceBlocked) {
+			return err
+		}
+
+		_, _, _, rangeStart, rangeEnd := s.packagerProgress(job)
+		if rangeEnd <= rangeStart {
+			return err
+		}
+		s.markJobStage(job, domain.HlsStageWaitingSource)
+		log.Printf("HLS packager yielded CPU while waiting for torrent range: dir=%s job=%s range=[%d,%d)", filepath.Base(s.paths.outDir), job.id, rangeStart, rangeEnd)
+		if waitErr := s.source.WaitRange(ctx, rangeStart, rangeEnd-rangeStart); waitErr != nil {
+			return waitErr
+		}
+	}
 }
 
 func waitForGeneratedAsset(ctx context.Context, cache *mediaCache, path string, job *segmentJob) error {

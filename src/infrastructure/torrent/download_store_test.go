@@ -77,6 +77,33 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 	}
 }
 
+func TestDownloadStorePersistsMediaDescriptor(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("d", 40)
+	want := domain.MediaInfo{
+		VideoCodec:      "h264",
+		VideoTrackIndex: 2,
+		NeedFilter:      true,
+		Duration:        7200,
+		Seekable:        true,
+		AudioTracks:     []domain.AudioTrack{{Index: 0, Codec: "eac3", Channels: 6}},
+	}
+	if err := store.writeMediaInfo(context.Background(), id, 3, want); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := store.readMediaInfo(context.Background(), id, 3)
+	if err != nil || !ok {
+		t.Fatalf("readMediaInfo() = %+v, %t, %v", got, ok, err)
+	}
+	if got.VideoCodec != want.VideoCodec || got.VideoTrackIndex != want.VideoTrackIndex ||
+		got.NeedFilter != want.NeedFilter || got.Duration != want.Duration || len(got.AudioTracks) != 1 {
+		t.Fatalf("descriptor = %+v, want %+v", got, want)
+	}
+}
+
 func TestCleanInfoHashRejectsBadIDs(t *testing.T) {
 	for _, id := range []string{"", "abc", strings.Repeat("x", 40), strings.Repeat("a", 39)} {
 		if _, err := cleanInfoHash(id); !errors.Is(err, domain.ErrBadDownloadID) {

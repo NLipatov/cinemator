@@ -15,6 +15,10 @@ describe normative requirements.
 
 The target model MUST:
 
+- present the first useful decoded frame as soon as safely possible after Play
+  or an uncached seek;
+- minimize the number and total duration of involuntary playback interruptions
+  after playback begins;
 - play media much larger than the available local disk without storing the
   complete source file;
 - preserve the source encoded video samples, resolution, frame rate, bit depth,
@@ -30,6 +34,10 @@ The target model MUST:
 - use valid HLS playlist transitions and advertise only complete media assets
   instead of relying on client-specific recovery from unavailable segments;
 - surface preparation progress and terminal failures to the player.
+
+The metric definitions, workload profiles, SLOs, scheduling requirements, and
+buffer-control acceptance criteria in [`playback-qoe.md`](playback-qoe.md) are
+a normative part of this target model.
 
 ## Non-goals and fundamental constraints
 
@@ -267,10 +275,11 @@ playlist. It omits `EXT-X-PLAYLIST-TYPE` so that legal head removal is possible.
 - new entries are appended and retained entries are never replaced or
   reordered;
 - old entries are removed only from the head;
-- generation is demand-paced: fetching an init file or an early media segment
-  MUST NOT advance the tail; the next bounded window is admitted only after the
-  client requests the current advertised tail, so publication cannot outrun
-  the client's forward buffer;
+- generation is demand-paced and bounded: fetching an init file alone MUST NOT
+  advance the tail; after a managed client requests media, the server MAY admit
+  canonical intervals needed to restore the low and target watermarks, but
+  sequential prefetch MUST NOT exceed the high watermark defined by
+  [`playback-qoe.md`](playback-qoe.md);
 - the managed client continues already buffered media when the LIVE window
   advances and MUST NOT chase the HLS live edge;
 - the initial version MAY contain one complete fragment for a client that can
@@ -966,6 +975,9 @@ shows:
 
 Automated and real-media validation covers:
 
+- the startup, seek-resume, sustained-playback, hybrid-audio, scheduling, and
+  playback-continuity scenarios defined in
+  [`playback-qoe.md`](playback-qoe.md);
 - a controlled seeded-peer fixture with measured delivery capacity of at least
   1.5 times the source or resolved profile's required peak bitrate and bounded
   network latency; prepare reaches `ready` within the configured preparation
@@ -1047,6 +1059,7 @@ and resource invariants have tests.
 ## References
 
 - [Cache asset lifecycle and disk admission](cache-asset-lifecycle.md)
+- [Playback QoE target](playback-qoe.md)
 - [RFC 8216: HTTP Live Streaming](https://www.rfc-editor.org/rfc/rfc8216.html)
 - [RFC 6381: MIME codecs and profiles](https://www.rfc-editor.org/rfc/rfc6381.html)
 - [W3C Media Capabilities](https://www.w3.org/TR/media-capabilities/)

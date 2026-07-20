@@ -45,6 +45,7 @@ type manager struct {
 	closeOnce    sync.Once
 	closeErr     error
 	scheduler    *segmentScheduler
+	demand       *pieceDemand
 	settings     settings.Settings
 }
 
@@ -167,6 +168,7 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 		watcherDone: make(chan struct{}),
 		events:      newDownloadEventBroadcaster(),
 		scheduler:   newSegmentScheduler(settings.MaxQueuedJobs(), settings.MaxTranscodes()),
+		demand:      newPieceDemand(),
 		settings:    settings,
 	}
 	pieceCache.provider.onEvict = m.syncEvictedPieces
@@ -281,9 +283,7 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	}
 	defer m.releaseTorrentUse(hash, false)
 	key := mediaKey{InfoHash: hash, Index: fileIndex}
-	m.mu.Lock()
-	cached, ok := m.mediaInfo[key]
-	m.mu.Unlock()
+	cached, ok := m.cachedMediaDescriptor(ctx, key)
 	if ok {
 		if err := ctx.Err(); err != nil {
 			return domain.MediaInfo{}, err
@@ -306,7 +306,7 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	}
 	m.touchDownload(ctx, t.InfoHash().HexString())
 	file := files[fileIndex]
-	source, err := newTorrentSource(file, m.sources, m.settings.TorrentReadaheadBytes(), nil, nil)
+	source, err := newTorrentSource(file, m.sources, m.demand, m.settings.TorrentReadaheadBytes(), nil, nil, nil, nil)
 	if err != nil {
 		return domain.MediaInfo{}, err
 	}
@@ -316,9 +316,7 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 		return domain.MediaInfo{}, errors.New("selected file has no video stream")
 	}
 	if err == nil {
-		m.mu.Lock()
-		m.mediaInfo[key] = info
-		m.mu.Unlock()
+		m.storeMediaDescriptor(ctx, key, info)
 	}
 	return info, err
 }
@@ -355,9 +353,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	file := files[fileIndex]
 	m.touchDownload(ctx, hash)
 	probeKey := mediaKey{InfoHash: hash, Index: fileIndex}
-	m.mu.Lock()
-	cachedInfo, hasCachedInfo := m.mediaInfo[probeKey]
-	m.mu.Unlock()
+	cachedInfo, hasCachedInfo := m.cachedMediaDescriptor(ctx, probeKey)
 	duration := 0.0
 	if hasCachedInfo {
 		duration = cachedInfo.Duration
@@ -384,9 +380,18 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		}
 
 		var candidate *streamInfo
-		source, sourceErr := newTorrentSource(file, m.sources, m.settings.TorrentReadaheadBytes(), func(jobID string, n int64) {
+		source, sourceErr := newTorrentSource(file, m.sources, m.demand, m.settings.TorrentReadaheadBytes(), func(jobID string) int64 {
+			if candidate == nil {
+				return 16 << 20
+			}
+			return candidate.sourceReadahead(jobID, m.settings.TorrentReadaheadBytes())
+		}, func(jobID string, offset, length int64) {
 			if candidate != nil {
-				candidate.recordSourceBytes(jobID, n)
+				candidate.recordSourceRange(jobID, offset, length)
+			}
+		}, func(jobID string, offset, n int64) {
+			if candidate != nil {
+				candidate.recordSourceBytes(jobID, offset, n)
 			}
 		}, nil)
 		if sourceErr != nil {
@@ -407,16 +412,20 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			selection:          ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack, ForceTranscode: forceTranscode},
 			mediaInfo:          cachedInfo,
 			mediaInfoReady:     hasCachedInfo,
+			mediaKey:           probeKey,
 			presentationTarget: startSeconds,
 			ready:              make(chan struct{}),
 			status: domain.HlsStatus{
 				Phase:         domain.HlsPhaseProbing,
+				Stage:         domain.HlsStageWaitingSource,
 				TargetSeconds: startSeconds,
 				StartedAt:     now,
 				LastProgress:  now,
 			},
 			statusSegment:         -1,
 			progressiveAdvertised: startIndex,
+			progressiveDemand:     startIndex,
+			progressiveTarget:     30 * time.Second,
 			progressiveSubtitles:  startIndex,
 			playbackWindow:        startIndex,
 			segmentErrors:         make(map[int]segmentFailure),
@@ -477,6 +486,37 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		m.notifyDownloadsChanged()
 		log.Printf("Stream registered: key=%v, playlist=%s", key, paths.masterPlaylist)
 		return paths.masterPlaylist, nil
+	}
+}
+
+func (m *manager) cachedMediaDescriptor(ctx context.Context, key mediaKey) (domain.MediaInfo, bool) {
+	m.mu.Lock()
+	info, ok := m.mediaInfo[key]
+	m.mu.Unlock()
+	if ok {
+		return info, true
+	}
+	info, ok, err := m.downloads.readMediaInfo(ctx, key.InfoHash, key.Index)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			log.Printf("failed to read cached media descriptor: hash=%s file=%d: %v", key.InfoHash, key.Index, err)
+		}
+		return domain.MediaInfo{}, false
+	}
+	if ok {
+		m.mu.Lock()
+		m.mediaInfo[key] = info
+		m.mu.Unlock()
+	}
+	return info, ok
+}
+
+func (m *manager) storeMediaDescriptor(ctx context.Context, key mediaKey, info domain.MediaInfo) {
+	m.mu.Lock()
+	m.mediaInfo[key] = info
+	m.mu.Unlock()
+	if err := m.downloads.writeMediaInfo(ctx, key.InfoHash, key.Index, info); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("failed to persist media descriptor: hash=%s file=%d: %v", key.InfoHash, key.Index, err)
 	}
 }
 

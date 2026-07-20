@@ -25,6 +25,20 @@ const (
 	HlsPhaseError     HlsPhase = "error"
 )
 
+type HlsStage string
+
+const (
+	HlsStageQueued        HlsStage = "queued"
+	HlsStageWaitingSource HlsStage = "waiting_source"
+	HlsStageWaitingCPU    HlsStage = "waiting_cpu"
+	HlsStagePackaging     HlsStage = "packaging"
+	HlsStageSourceBlocked HlsStage = "source_blocked"
+	HlsStagePublishing    HlsStage = "publishing"
+	HlsStageReady         HlsStage = "ready"
+	HlsStageCancelled     HlsStage = "cancelled"
+	HlsStageError         HlsStage = "error"
+)
+
 type AudioTrack struct {
 	Index      int    `json:"index"`
 	Codec      string `json:"codec"`
@@ -72,6 +86,8 @@ type MediaInfo struct {
 
 type HlsStatus struct {
 	Phase                     HlsPhase  `json:"phase"`
+	Stage                     HlsStage  `json:"stage,omitempty"`
+	WorkClass                 string    `json:"workClass,omitempty"`
 	Generation                string    `json:"generation"`
 	Mode                      string    `json:"mode,omitempty"`
 	TargetSeconds             float64   `json:"targetSeconds"`
@@ -79,6 +95,14 @@ type HlsStatus struct {
 	StartedAt                 time.Time `json:"startedAt"`
 	LastProgress              time.Time `json:"lastProgress"`
 	BytesRead                 int64     `json:"bytesRead"`
+	PeerBytes                 int64     `json:"peerBytes,omitempty"`
+	SourceRateBitsPerSecond   int64     `json:"sourceRateBitsPerSecond,omitempty"`
+	CacheBytes                int64     `json:"cacheBytes,omitempty"`
+	PublishedBytes            int64     `json:"publishedBytes,omitempty"`
+	RequestedRangeStart       int64     `json:"requestedRangeStart,omitempty"`
+	RequestedRangeEnd         int64     `json:"requestedRangeEnd,omitempty"`
+	MissingPieces             int       `json:"missingPieces,omitempty"`
+	RangePieces               int       `json:"rangePieces,omitempty"`
 	ActivePeers               int       `json:"activePeers"`
 	TotalPeers                int       `json:"totalPeers"`
 	Seekable                  bool      `json:"seekable"`

@@ -377,44 +377,39 @@ func GenerateDirectWindow(
 	)
 	wasCovered := false
 	published := directPublishOutcome{firstPTS: math.NaN()}
-	var runErr error
-	if info.Duration <= 0 {
-		_, runErr = cli.RunWithStdin(ctx, nil, "ffmpeg", args...)
-	} else {
-		monitorCtx, stopMonitor := context.WithCancel(ctx)
-		stdin, stopFFmpeg, pipeErr := os.Pipe()
-		if pipeErr != nil {
-			stopMonitor()
-			return DirectWindowResult{}, fmt.Errorf("create FFmpeg control pipe: %w", pipeErr)
-		}
-		publishResult := make(chan directPublishOutcome, 1)
-		go func() {
-			outcome := publishDirectCoverage(
-				monitorCtx,
-				workDir,
-				outDir,
-				firstSegment,
-				start.Seconds(),
-				wantedEnd.Seconds(),
-				prerollBudget,
-				fmp4,
-				onPublished,
-			)
-			publishResult <- outcome
-			if outcome.covered || outcome.err != nil {
-				_, _ = io.WriteString(stopFFmpeg, "q\n")
-				_ = stopFFmpeg.Close()
-			}
-		}()
-		_, runErr = cli.RunWithStdin(ctx, stdin, "ffmpeg", args...)
-		_ = stdin.Close()
-		_ = stopFFmpeg.Close()
+	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	stdin, stopFFmpeg, pipeErr := os.Pipe()
+	if pipeErr != nil {
 		stopMonitor()
-		published = <-publishResult
-		wasCovered = published.covered
-		if published.err != nil {
-			return DirectWindowResult{}, published.err
+		return DirectWindowResult{}, fmt.Errorf("create FFmpeg control pipe: %w", pipeErr)
+	}
+	publishResult := make(chan directPublishOutcome, 1)
+	go func() {
+		outcome := publishDirectCoverage(
+			monitorCtx,
+			workDir,
+			outDir,
+			firstSegment,
+			start.Seconds(),
+			wantedEnd.Seconds(),
+			prerollBudget,
+			fmp4,
+			onPublished,
+		)
+		publishResult <- outcome
+		if outcome.covered || outcome.err != nil {
+			_, _ = io.WriteString(stopFFmpeg, "q\n")
+			_ = stopFFmpeg.Close()
 		}
+	}()
+	_, runErr := cli.RunWithStdin(ctx, stdin, "ffmpeg", args...)
+	_ = stdin.Close()
+	_ = stopFFmpeg.Close()
+	stopMonitor()
+	published = <-publishResult
+	wasCovered = published.covered
+	if published.err != nil {
+		return DirectWindowResult{}, published.err
 	}
 	if runErr != nil && !wasCovered {
 		if ctx.Err() != nil {
@@ -607,7 +602,7 @@ func GenerateVideoWindow(
 	selection StreamSelection,
 	firstSegment, segmentCount int,
 	segmentDuration time.Duration,
-	onPublished func(int) error,
+	onPublished func(int, float64) error,
 ) (VideoWindowResult, error) {
 	if firstSegment < 0 || segmentCount <= 0 {
 		return VideoWindowResult{}, fmt.Errorf("invalid HLS window")
@@ -694,7 +689,7 @@ func GenerateVideoWindow(
 	return result, nil
 }
 
-func publishVideoSegments(ctx context.Context, workDir, outDir string, begin, end int, generationDone <-chan struct{}, onPublished func(int) error) (int, error) {
+func publishVideoSegments(ctx context.Context, workDir, outDir string, begin, end int, generationDone <-chan struct{}, onPublished func(int, float64) error) (int, error) {
 	ticker := time.NewTicker(generationPollInterval)
 	defer ticker.Stop()
 	next := begin
@@ -724,7 +719,7 @@ func publishVideoSegments(ctx context.Context, workDir, outDir string, begin, en
 			}
 			next++
 			if onPublished != nil {
-				if err := onPublished(next - 1); err != nil {
+				if err := onPublished(next-1, duration); err != nil {
 					return false, err
 				}
 			}

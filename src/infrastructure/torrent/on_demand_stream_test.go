@@ -23,7 +23,7 @@ func TestStreamStatusTracksRequestedSegmentProgress(t *testing.T) {
 	stream.markPreparing(7, 42)
 	job := &segmentJob{begin: 5, end: 10, id: "requested"}
 	stream.videoJobs[job] = struct{}{}
-	stream.recordSourceBytes(job.id, 8192)
+	stream.recordSourceBytes(job.id, 0, 8192)
 
 	stream.mtx.Lock()
 	status := stream.status
@@ -161,7 +161,7 @@ func TestVideoPlaylistRequestRestartsStartupGeneration(t *testing.T) {
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
 	scheduler := newSegmentScheduler(1, 1)
-	scheduler.jobs <- struct{}{}
+	_, _ = scheduler.reserveJob(false, func() {})
 	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, scheduler: scheduler, settings: settings.NewSettings()}
 
 	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), "index.m3u8", "current"); err != nil {
@@ -337,11 +337,11 @@ func TestSourceProgressIsAttributedToMatchingJob(t *testing.T) {
 		videoJobs:    map[*segmentJob]struct{}{video: {}},
 		subtitleJobs: map[*segmentJob]struct{}{subtitle: {}},
 	}
-	stream.recordSourceBytes("video", 4096)
+	stream.recordSourceBytes("video", 0, 4096)
 	if video.bytesRead != 4096 || subtitle.bytesRead != 0 {
 		t.Fatalf("job bytes: video=%d subtitle=%d", video.bytesRead, subtitle.bytesRead)
 	}
-	stream.recordSourceBytes("subtitle", 1024)
+	stream.recordSourceBytes("subtitle", 0, 1024)
 	if video.bytesRead != 4096 || subtitle.bytesRead != 1024 {
 		t.Fatalf("job bytes after subtitle read: video=%d subtitle=%d", video.bytesRead, subtitle.bytesRead)
 	}
@@ -361,32 +361,98 @@ func TestSegmentWindowCreatesCanonicalNonOverlappingRanges(t *testing.T) {
 	}
 }
 
-func TestProgressivePrefetchPublishesOneStartupSegment(t *testing.T) {
-	if end := progressivePrefetchEnd(100, 200, 5, true); end != 101 {
-		t.Fatalf("startup end = %d, want 101", end)
-	}
-	if end := progressivePrefetchEnd(101, 200, 5, false); end != 106 {
-		t.Fatalf("forward end = %d, want 106", end)
-	}
-	if end := progressivePrefetchEnd(199, 200, 5, false); end != 200 {
-		t.Fatalf("tail end = %d, want 200", end)
+func TestProgressivePrefetchPlan(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		demand     int
+		advertised int
+		total      int
+		maximum    int
+		startup    bool
+		want       progressivePlan
+	}{
+		{
+			name:       "startup publishes one segment",
+			demand:     100,
+			advertised: 100,
+			total:      200,
+			maximum:    15,
+			startup:    true,
+			want:       progressivePlan{end: 101, ok: true},
+		},
+		{
+			name:       "foreground fills low watermark",
+			demand:     0,
+			advertised: 1,
+			total:      200,
+			maximum:    15,
+			want:       progressivePlan{end: 8, ok: true},
+		},
+		{
+			name:       "background fills target watermark",
+			demand:     0,
+			advertised: 8,
+			total:      200,
+			maximum:    15,
+			want:       progressivePlan{end: 15, background: true, ok: true},
+		},
+		{
+			name:       "target watermark stops prefetch",
+			demand:     0,
+			advertised: 15,
+			total:      200,
+			maximum:    15,
+			want:       progressivePlan{},
+		},
+		{
+			name:       "tail is capped by duration",
+			demand:     95,
+			advertised: 99,
+			total:      100,
+			maximum:    15,
+			want:       progressivePlan{end: 100, ok: true},
+		},
+		{
+			name:       "forward seek refills from requested position",
+			demand:     660,
+			advertised: 661,
+			total:      1000,
+			maximum:    15,
+			want:       progressivePlan{end: 668, ok: true},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := progressivePrefetchPlan(test.demand, test.advertised, test.total, test.maximum, 2*time.Second, 30*time.Second, test.startup)
+			if got != test.want {
+				t.Fatalf("progressivePrefetchPlan() = %+v, want %+v", got, test.want)
+			}
+		})
 	}
 }
 
-func TestProgressivePrefetchWaitsForAdvertisedTail(t *testing.T) {
-	for _, test := range []struct {
-		requested  int
-		advertised int
-		want       bool
-	}{
-		{requested: -1, advertised: 16, want: true},
-		{requested: 0, advertised: 1, want: true},
-		{requested: 14, advertised: 16, want: false},
-		{requested: 15, advertised: 16, want: true},
-	} {
-		if got := shouldPrefetchProgressiveWindow(test.requested, test.advertised); got != test.want {
-			t.Fatalf("shouldPrefetchProgressiveWindow(%d, %d) = %t, want %t", test.requested, test.advertised, got, test.want)
-		}
+func TestStreamDeliveryRiskRaisesAndRecoversTheForwardReserve(t *testing.T) {
+	now := time.Now()
+	stream := &streamInfo{progressiveTarget: 30 * time.Second}
+	stream.recordJobDelivery(&segmentJob{begin: 0, end: 5, startedAt: now.Add(-9 * time.Second)}, 2*time.Second, now)
+	if stream.progressiveTarget != 60*time.Second {
+		t.Fatalf("target after marginal delivery = %v, want 60s", stream.progressiveTarget)
+	}
+
+	for range 12 {
+		stream.recordJobDelivery(&segmentJob{begin: 0, end: 5, startedAt: now.Add(-time.Second)}, 2*time.Second, now)
+	}
+	if stream.progressiveTarget != 30*time.Second {
+		t.Fatalf("target after sustained fast delivery = %v, want 30s", stream.progressiveTarget)
+	}
+}
+
+func TestProgressivePrefetchPlanUsesAdaptiveTargetWithoutExceedingHighWatermark(t *testing.T) {
+	got := progressivePrefetchPlan(0, 15, 100, 15, 2*time.Second, 60*time.Second, false)
+	if want := (progressivePlan{end: 30, background: true, ok: true}); got != want {
+		t.Fatalf("adaptive progressive plan = %+v, want %+v", got, want)
+	}
+	if got := progressivePrefetchPlan(0, 30, 100, 15, 2*time.Second, 60*time.Second, false); got.ok {
+		t.Fatalf("plan beyond high watermark = %+v, want no work", got)
 	}
 }
 
@@ -498,18 +564,18 @@ func TestParseDirectSegmentOwner(t *testing.T) {
 func TestReserveJobSlotEnforcesGlobalAndPerStreamLimits(t *testing.T) {
 	scheduler := newSegmentScheduler(1, 1)
 	stream := &streamInfo{videoJobs: make(map[*segmentJob]struct{}), subtitleJobs: make(map[*segmentJob]struct{})}
-	release, err := stream.reserveJobLocked(scheduler, 3)
+	release, err := stream.reserveJobLocked(scheduler, 3, false, func() {})
 	if err != nil {
 		t.Fatalf("first reservation: %v", err)
 	}
-	if _, err := stream.reserveJobLocked(scheduler, 3); !errors.Is(err, errStreamJobQueueFull) {
+	if _, err := stream.reserveJobLocked(scheduler, 3, false, func() {}); !errors.Is(err, errStreamJobQueueFull) {
 		t.Fatalf("second reservation = %v, want queue full", err)
 	}
 	release()
 	for index := 0; index < 3; index++ {
 		stream.videoJobs[&segmentJob{}] = struct{}{}
 	}
-	if _, err := stream.reserveJobLocked(scheduler, 3); !errors.Is(err, errStreamJobLimit) {
+	if _, err := stream.reserveJobLocked(scheduler, 3, false, func() {}); !errors.Is(err, errStreamJobLimit) {
 		t.Fatalf("per-stream reservation = %v, want stream limit", err)
 	}
 }
@@ -540,7 +606,7 @@ func TestImmediateQueueFailureBecomesVisible(t *testing.T) {
 
 func TestClassifyHlsStatusDistinguishesNoPeersAndStalledWork(t *testing.T) {
 	now := time.Now()
-	base := domain.HlsStatus{Phase: "preparing", LastProgress: now.Add(-20 * time.Second)}
+	base := domain.HlsStatus{Phase: "preparing", Stage: domain.HlsStageWaitingSource, LastProgress: now.Add(-20 * time.Second)}
 	noPeers := classifyHlsStatus(base, now)
 	if noPeers.Phase != "no_peers" {
 		t.Fatalf("no-peer phase = %q", noPeers.Phase)
@@ -553,6 +619,12 @@ func TestClassifyHlsStatusDistinguishesNoPeersAndStalledWork(t *testing.T) {
 	base.LastProgress = now
 	if active := classifyHlsStatus(base, now); active.Phase != "preparing" {
 		t.Fatalf("active phase = %q", active.Phase)
+	}
+	base.LastProgress = now.Add(-20 * time.Second)
+	base.ActivePeers = 0
+	base.Stage = domain.HlsStageWaitingCPU
+	if waitingCPU := classifyHlsStatus(base, now); waitingCPU.Phase != "preparing" {
+		t.Fatalf("waiting CPU phase = %q, want preparing", waitingCPU.Phase)
 	}
 }
 

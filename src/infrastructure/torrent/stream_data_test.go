@@ -62,17 +62,39 @@ func TestRecordSourceBytesUpdatesOnlyRequestedVideoPreparation(t *testing.T) {
 		subtitleJobs: map[*segmentJob]struct{}{subtitle: {}},
 	}
 
-	stream.recordSourceBytes(background.id, 10)
-	stream.recordSourceBytes(subtitle.id, 20)
+	stream.recordSourceBytes(background.id, 0, 10)
+	stream.recordSourceBytes(subtitle.id, 0, 20)
 	if stream.status.BytesRead != 0 || !stream.status.LastProgress.Equal(started) {
 		t.Fatalf("unrelated work changed preparation status: %+v", stream.status)
 	}
-	stream.recordSourceBytes(requested.id, 30)
+	stream.recordSourceBytes(requested.id, 0, 30)
 	if stream.status.BytesRead != 30 || !stream.status.LastProgress.After(started) {
 		t.Fatalf("requested video work did not advance preparation status: %+v", stream.status)
 	}
 	if background.bytesRead != 10 || subtitle.bytesRead != 20 || requested.bytesRead != 30 {
 		t.Fatalf("per-job byte accounting was lost: background=%d subtitle=%d requested=%d", background.bytesRead, subtitle.bytesRead, requested.bytesRead)
+	}
+}
+
+func TestAddSourceRangeCountsOnlyUniqueBytes(t *testing.T) {
+	ranges, unique := addSourceRange(nil, 100, 200)
+	if unique != 100 {
+		t.Fatalf("first unique bytes = %d, want 100", unique)
+	}
+	ranges, unique = addSourceRange(ranges, 125, 175)
+	if unique != 0 {
+		t.Fatalf("repeated unique bytes = %d, want 0", unique)
+	}
+	ranges, unique = addSourceRange(ranges, 150, 250)
+	if unique != 50 {
+		t.Fatalf("overlap unique bytes = %d, want 50", unique)
+	}
+	ranges, unique = addSourceRange(ranges, 50, 110)
+	if unique != 50 {
+		t.Fatalf("prefix unique bytes = %d, want 50", unique)
+	}
+	if len(ranges) != 1 || ranges[0] != (sourceByteRange{start: 50, end: 250}) {
+		t.Fatalf("merged ranges = %+v, want [{50 250}]", ranges)
 	}
 }
 
