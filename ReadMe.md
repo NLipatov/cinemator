@@ -119,11 +119,10 @@ describes the currently deployed behavior and configuration.
 
 Cinemator does not need enough local disk space for the complete selected file. Torrent data is stored as a bounded LRU cache of verified pieces, and HLS segments are generated on demand from the current playhead. Seeking to an uncached position starts a short FFmpeg window around that position. While it is being prepared, the player reports elapsed time, source bytes read, active/known peers, and whether the window is being remuxed or transcoded instead of appearing frozen.
 
-The defaults reserve 12 GiB for torrent pieces and 2 GiB for generated HLS assets. They are suitable starting values for a 30 GB VPS while leaving space for the operating system, container layers, and logs. Configure the budgets in `.env` using byte values:
+By default, generated HLS assets and verified torrent pieces share one 12 GiB budget. HLS history has eviction priority because it is immediately playable; torrent pieces use all remaining space and are redownloaded when needed. This is a suitable starting point for a 30 GB VPS while leaving space for the operating system, container layers, and logs. Configure the limit in `.env` using byte values:
 
 ```dotenv
-CINEMATOR_MAX_TORRENT_CACHE_BYTES=12884901888
-CINEMATOR_MAX_CACHE_BYTES=2147483648
+CINEMATOR_TOTAL_CACHE_BYTES=12884901888
 CINEMATOR_MIN_FREE_BYTES=2147483648
 CINEMATOR_MIN_FREE_INODES=4096
 CINEMATOR_TORRENT_READAHEAD_BYTES=67108864
@@ -135,20 +134,25 @@ spend that emergency reserve. Cache eviction never unlinks an HLS asset or
 torrent piece while Cinemator is reading it, so slow clients can temporarily
 cause admission to fail but cannot create disk blocks hidden from `du`.
 
+For migration, the deprecated `CINEMATOR_MAX_CACHE_BYTES` and
+`CINEMATOR_MAX_TORRENT_CACHE_BYTES` values are added together only when
+`CINEMATOR_TOTAL_CACHE_BYTES` is absent. Remove the old variables after setting
+the shared limit.
+
 The generated HLS window is controlled separately:
 
 ```dotenv
-CINEMATOR_HLS_SEGMENT_SECONDS=6
-CINEMATOR_HLS_WINDOW_SEGMENTS=5
+CINEMATOR_HLS_SEGMENT_SECONDS=2
+CINEMATOR_HLS_WINDOW_SEGMENTS=15
 CINEMATOR_MAX_TRANSCODES=1
 CINEMATOR_MAX_QUEUED_JOBS=4
 CINEMATOR_MAX_JOBS_PER_STREAM=3
 CINEMATOR_MAX_ACTIVE_STREAMS=16
 ```
 
-Larger windows reduce regeneration after short seeks but use more temporary disk space. Direct-play output uses the source GOP boundaries inside this nominal window. Cinemator reserves cache headroom before starting each window and limits concurrent FFmpeg jobs; keep `CINEMATOR_MAX_TRANSCODES=1` on a small VPS. Evicted torrent pieces are downloaded again from currently available peers; piece hashes verify their contents but cannot guarantee that a peer will still be available later.
+Larger windows reduce regeneration after short seeks but use more temporary disk space. The defaults keep a roughly 30-second window while publishing a two-second target segment first. Direct-play output still follows source GOP boundaries, so copied segments may be longer than the target. Cinemator reserves cache headroom before starting each window and limits concurrent FFmpeg jobs; keep `CINEMATOR_MAX_TRANSCODES=1` on a small VPS. Evicted torrent pieces are downloaded again from currently available peers; piece hashes verify their contents but cannot guarantee that a peer will still be available later.
 
-The 64 MiB readahead keeps enough torrent work queued for sequential FFmpeg reads without fetching hundreds of unused megabytes after a seek; it is also capped at one quarter of the torrent cache budget. Compatible H.264, HEVC, and AV1 video is remuxed at its source resolution and bitrate; AAC is copied too, while other audio is converted to AAC independently. Audio conversion shares the same concurrency limit as video transcoding. Each playlist contains only complete materialized fragments and keeps a bounded sliding tail. The application-owned source timeline creates a new presentation for a nonlocal seek, keeps the requested playhead exact, and hides decode-only keyframe preroll. Video is converted to H.264 at its source dimensions only when the selected client path cannot accept the original codec/profile or when deinterlacing, rotation, HDR tone mapping, or a bitmap subtitle overlay requires new pixels. Compatibility output keeps CRF quality mode and source dimensions, with a peak rate scaled from the source resolution, frame rate, and bitrate so its disk reservation remains enforceable; this bound never applies to copied source video.
+The 64 MiB readahead keeps enough torrent work queued for sequential FFmpeg reads without fetching hundreds of unused megabytes after a seek; it is also capped at one quarter of the shared cache budget. The torrent piece cache is access-based rather than split into fixed forward/backward halves: unused capacity keeps playback history, while newly requested pieces gradually displace the least recently used data. Compatible H.264, HEVC, and AV1 video is remuxed at its source resolution and bitrate; AAC is copied too, while other audio is converted to AAC independently. Audio conversion shares the same concurrency limit as video transcoding. Each playlist contains only complete materialized fragments and retains its generated history until shared-cache pressure evicts least-recently-used windows; the current window and its immediate neighbors remain protected. The managed player projects that presentation onto the full source duration. Video is converted to H.264 at its source dimensions only when the selected client path cannot accept the original codec/profile or when deinterlacing, rotation, HDR tone mapping, or a bitmap subtitle overlay requires new pixels. Compatibility output keeps CRF quality mode and source dimensions, with a peak rate scaled from the source resolution, frame rate, and bitrate so its disk reservation remains enforceable; this bound never applies to copied source video.
 
 When a container exposes a reliable duration, the web player exposes that full source duration independently of the bounded HLS presentation and supports arbitrary seeks by preparing a presentation at the selected source time. If duration cannot be determined without reading to the end, Cinemator starts with a sequential sliding LIVE presentation and still remuxes compatible video instead of transcoding solely because duration is unknown. The verified duration replaces the unknown value when FFmpeg reaches the end; Cinemator never guesses it from bitrate.
 

@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -56,6 +57,7 @@ func (s *HttpServer) Run(ctx context.Context) (result error) {
 	server := &http.Server{
 		Addr:              listenPort,
 		Handler:           s.handler(),
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    1 << 20,
@@ -70,7 +72,7 @@ func (s *HttpServer) Run(ctx context.Context) (result error) {
 		return err
 	case <-ctx.Done():
 	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		result = errors.Join(err, server.Close())

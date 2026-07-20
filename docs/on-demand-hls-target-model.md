@@ -77,8 +77,9 @@ sparse reads.
 - The application exposes the full source duration independently of HLS.
 - Initial play and every nonlocal seek create a new presentation generation
   with a new playlist URL.
-- Its initial bounded window is fully materialized before the playlist is
-  published.
+- Its first playable fragment is fully materialized before it is advertised;
+  the configured forward window is staged immediately after the first media
+  request.
 - The presentation then advances as a standards-compliant sliding LIVE
   playlist containing only complete segments.
 - Segment identities and durations come from validated source access points.
@@ -266,8 +267,15 @@ playlist. It omits `EXT-X-PLAYLIST-TYPE` so that legal head removal is possible.
 - new entries are appended and retained entries are never replaced or
   reordered;
 - old entries are removed only from the head;
-- every version without `EXT-X-ENDLIST`, including the initial version, contains
-  at least three target durations; head removal preserves this floor;
+- generation is demand-paced: fetching an init file or an early media segment
+  MUST NOT advance the tail; the next bounded window is admitted only after the
+  client requests the current advertised tail, so publication cannot outrun
+  the client's forward buffer;
+- the managed client continues already buffered media when the LIVE window
+  advances and MUST NOT chase the HLS live edge;
+- the initial version MAY contain one complete fragment for a client that can
+  start from it; the playlist grows toward three target durations immediately,
+  and head removal never reduces an established tail below that floor;
 - `EXT-X-MEDIA-SEQUENCE` is present from the first version;
 - `EXT-X-DISCONTINUITY-SEQUENCE` is present from the first version, using zero
   before any discontinuity, so later head removal can advance it legally;
@@ -285,12 +293,25 @@ playlist. It omits `EXT-X-PLAYLIST-TYPE` so that legal head removal is possible.
   presentation generation, whether because of source EOF or bounded
   finalization;
 - presentation duration is the sum of its finalized segment durations; full
-  source duration remains out-of-band application state.
+  source duration remains out-of-band session state and is projected onto the
+  managed player's media timeline.
 
 A random seek outside the current prepared presentation does not rewrite that
 playlist or move its sequence backwards. It prepares a new presentation
-generation under a new playlist URL. The application maps its local HLS media
-time to the requested source timeline and owns the full-duration seek UI.
+generation under a new playlist URL. The managed client offsets each bounded
+presentation to its absolute source time and overrides the MediaSource duration
+with the known source duration. Native player controls therefore expose one
+full-duration timeline; a seek outside the current buffered or advertised range
+is translated into a new bounded presentation at that source position.
+If the user returns to the retained presentation while that replacement is
+still preparing, the client cancels the pending switch and resumes the retained
+presentation. A completed presentation covering the requested source time is
+reusable even when it was originally prepared from a different start position.
+
+Unknown-duration sources keep the bounded presentation timeline until duration
+becomes known. A native-HLS-only fallback that cannot apply the managed timeline
+projection may likewise expose only its current bounded presentation; it MUST
+NOT advertise missing media assets merely to synthesize a duration.
 
 While a LIVE playlist has no `EXT-X-ENDLIST`, the server publishes a new version
 within the HLS cadence, between 0.5 and 1.5 target durations after the previous
@@ -714,8 +735,11 @@ Before generation:
 - compatibility reservation MUST use the resolved output profile and bounded
   peak bitrate;
 - torrent pieces needed for the admitted operation, temporary output, and final
-  assets are reserved atomically against their respective budgets;
+  assets are reserved atomically against the shared cache budget and physical
+  disk floor;
 - current, next, and a small back window are pinned;
+- other complete materialized windows remain addressable and consume the
+  available generated-asset budget until byte pressure evicts them by recency;
 - work MUST be rejected with a clear resource error if one required GOP or
   output window cannot fit.
 
@@ -877,8 +901,9 @@ shows:
 - Sliding updates append at the tail, remove only from the head, advance media
   and discontinuity sequences correctly, and retain removed assets for the
   exact persisted deadline defined by the LIVE retention formula.
-- Every nonfinal sliding version retains at least three target durations and
-  carries media and discontinuity sequence tags from its first version.
+- After startup growth, every nonfinal sliding version retains at least three
+  target durations and carries media and discontinuity sequence tags from its
+  first version.
 - A no-ENDLIST LIVE presentation publishes a compliant next version or
   finalizes by its update deadline, including when torrent peers stall.
 - No segment exceeds the immutable target duration of its presentation;
@@ -924,8 +949,10 @@ shows:
 - Direct mode performs no video decoding or encoding.
 - A seek reads only the metadata, torrent pieces, and bounded preroll needed for
   its validated source access point and prepared horizon.
-- Generated and temporary bytes remain within admitted disk budgets and the
-  global free-space floor.
+- Generated HLS assets and verified torrent pieces share one configured cache
+  budget. Reproducible pieces are evicted before retained HLS history, and all
+  temporary bytes remain within admission reservations and the global
+  free-space floor.
 - Client forward and back buffers remain bounded during long playback and
   repeated seeks.
 - Concurrent viewers requesting the same representation share generated assets

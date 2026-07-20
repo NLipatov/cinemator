@@ -57,7 +57,7 @@ func TestManagerRetainsCacheFenceWhenAssetCloseIsOutstanding(t *testing.T) {
 	if err := os.WriteFile(assetPath, []byte("data"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	asset, err := manager.assets.Open(assetPath)
+	asset, err := manager.media.assets.Open(assetPath)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,8 +10,7 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	t.Setenv("CINEMATOR_DOWNLOAD_PATH", "/tmp/cinemator-test-download")
 	t.Setenv("CINEMATOR_HTTP_PORT", "18080")
 	t.Setenv("CINEMATOR_TORRENT_PORT", "0")
-	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "12345")
-	t.Setenv("CINEMATOR_MAX_TORRENT_CACHE_BYTES", "23456")
+	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "23456")
 	t.Setenv("CINEMATOR_MIN_FREE_BYTES", "45678")
 	t.Setenv("CINEMATOR_MIN_FREE_INODES", "567")
 	t.Setenv("CINEMATOR_TORRENT_READAHEAD_BYTES", "34567")
@@ -37,11 +36,8 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	if settings.TorrentPort() != 0 {
 		t.Fatalf("TorrentPort() = %d", settings.TorrentPort())
 	}
-	if settings.MaxCacheBytes() != 12345 {
+	if settings.MaxCacheBytes() != 23456 {
 		t.Fatalf("MaxCacheBytes() = %d", settings.MaxCacheBytes())
-	}
-	if settings.MaxTorrentCacheBytes() != 23456 {
-		t.Fatalf("MaxTorrentCacheBytes() = %d", settings.MaxTorrentCacheBytes())
 	}
 	if settings.MinFreeBytes() != 45678 || settings.MinFreeInodes() != 567 {
 		t.Fatalf("disk floors = %d bytes, %d inodes", settings.MinFreeBytes(), settings.MinFreeInodes())
@@ -70,7 +66,7 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 }
 
 func TestNewSettingsLeavesReadaheadBelowCacheQuarterUnchanged(t *testing.T) {
-	t.Setenv("CINEMATOR_MAX_TORRENT_CACHE_BYTES", "1000000")
+	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "1000000")
 	t.Setenv("CINEMATOR_TORRENT_READAHEAD_BYTES", "200000")
 
 	if got := NewSettings().TorrentReadaheadBytes(); got != 200000 {
@@ -89,8 +85,7 @@ func TestNewSettingsFallsBackForNonPositiveReadahead(t *testing.T) {
 func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	t.Setenv("CINEMATOR_HTTP_PORT", "bad")
 	t.Setenv("CINEMATOR_TORRENT_PORT", "bad")
-	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "bad")
-	t.Setenv("CINEMATOR_MAX_TORRENT_CACHE_BYTES", "bad")
+	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "bad")
 	t.Setenv("CINEMATOR_MIN_FREE_BYTES", "bad")
 	t.Setenv("CINEMATOR_MIN_FREE_INODES", "bad")
 	t.Setenv("CINEMATOR_TORRENT_READAHEAD_BYTES", "bad")
@@ -111,9 +106,6 @@ func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	if settings.MaxCacheBytes() != defaultMaxCacheBytes {
 		t.Fatalf("MaxCacheBytes() = %d, want %d", settings.MaxCacheBytes(), defaultMaxCacheBytes)
 	}
-	if settings.MaxTorrentCacheBytes() != defaultMaxTorrentCacheBytes {
-		t.Fatalf("MaxTorrentCacheBytes() = %d, want %d", settings.MaxTorrentCacheBytes(), defaultMaxTorrentCacheBytes)
-	}
 	if settings.MinFreeBytes() != defaultMinFreeBytes || settings.MinFreeInodes() != defaultMinFreeInodes {
 		t.Fatalf("bad numeric disk floors did not fall back")
 	}
@@ -131,5 +123,24 @@ func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	}
 	if settings.MaxQueuedJobs() != defaultMaxQueuedJobs || settings.MaxJobsPerStream() != defaultMaxJobsPerStream || settings.MaxActiveStreams() != defaultMaxActiveStreams {
 		t.Fatalf("bad numeric job limits did not fall back")
+	}
+}
+
+func TestNewSettingsCombinesLegacyCacheLimits(t *testing.T) {
+	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "12345")
+	t.Setenv("CINEMATOR_MAX_TORRENT_CACHE_BYTES", "23456")
+
+	if got := NewSettings().MaxCacheBytes(); got != 35801 {
+		t.Fatalf("MaxCacheBytes() = %d, want legacy sum", got)
+	}
+}
+
+func TestNewSettingsTotalCacheOverridesLegacyLimits(t *testing.T) {
+	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "45678")
+	t.Setenv("CINEMATOR_MAX_CACHE_BYTES", "12345")
+	t.Setenv("CINEMATOR_MAX_TORRENT_CACHE_BYTES", "23456")
+
+	if got := NewSettings().MaxCacheBytes(); got != 45678 {
+		t.Fatalf("MaxCacheBytes() = %d, want canonical total", got)
 	}
 }

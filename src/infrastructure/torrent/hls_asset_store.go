@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"cinemator/application"
 )
@@ -99,6 +100,27 @@ func (s *hlsAssetStore) Open(path string) (application.HlsAsset, error) {
 		ReadSeekCloser: &leasedHlsFile{File: file, store: s, path: path, name: name, state: state},
 		ModTime:        info.ModTime(),
 	}, nil
+}
+
+func (s *hlsAssetStore) Touch(path string, minimumAge time.Duration) bool {
+	path, name, err := s.managedPath(path)
+	if err != nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pathRetired(path) {
+		return false
+	}
+	info, err := s.root.Lstat(name)
+	if err != nil || validateHlsAsset(path, info) != nil {
+		return false
+	}
+	if time.Since(info.ModTime()) >= minimumAge {
+		now := time.Now()
+		_ = s.root.Chtimes(name, now, now)
+	}
+	return true
 }
 
 // TryEvict removes a file only when it has no active readers. A busy file stays

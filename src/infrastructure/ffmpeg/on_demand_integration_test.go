@@ -121,7 +121,8 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 	hybridSource := filepath.Join(dir, "source-ac3.mkv")
 	runMediaCommand(t, "ffmpeg",
 		"-hide_banner", "-loglevel", "error", "-y", "-i", source,
-		"-c:v", "copy", "-c:a", "ac3", hybridSource,
+		"-f", "lavfi", "-i", "anullsrc=r=48000:cl=5.1(side):d=14",
+		"-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "ac3", "-shortest", hybridSource,
 	)
 	hybridDir := filepath.Join(dir, "hybrid")
 	if err := os.MkdirAll(hybridDir, 0755); err != nil {
@@ -134,21 +135,26 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 			VideoCodec:  "h264",
 			Width:       160,
 			Height:      90,
-			AudioTracks: []domain.AudioTrack{{Codec: "ac3"}},
+			AudioTracks: []domain.AudioTrack{{Codec: "ac3", Channels: 6}},
 		},
 		StreamSelection{AudioTrackIndex: 0},
-		0, 1, 6*time.Second, 30*time.Second,
+		0, 2, 6*time.Second, 30*time.Second,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(hybrid.Fragments) < 2 {
+		t.Fatalf("hybrid fragments = %+v, want at least two", hybrid.Fragments)
+	}
 	hybridAudio := runMediaCommand(t, "ffprobe",
 		"-v", "error", "-select_streams", "a:0",
-		"-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1",
-		filepath.Join(hybridDir, hybrid.Fragments[0].Name),
+		"-show_entries", "stream=codec_name,sample_rate,channels", "-of", "default=nw=1:nk=1",
+		filepath.Join(hybridDir, hybrid.Fragments[1].Name),
 	)
-	if !strings.Contains(string(hybridAudio), "aac") {
-		t.Fatalf("hybrid audio codec = %q, want AAC", hybridAudio)
+	for _, want := range []string{"aac", "48000", "6"} {
+		if !strings.Contains(string(hybridAudio), want) {
+			t.Fatalf("second hybrid segment audio = %q, want %s", hybridAudio, want)
+		}
 	}
 	progressiveDir := filepath.Join(dir, "progressive")
 	if err := os.MkdirAll(progressiveDir, 0755); err != nil {

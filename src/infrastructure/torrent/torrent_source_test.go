@@ -1,6 +1,11 @@
 package torrent
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+
+	anacrolix "github.com/anacrolix/torrent"
+)
 
 func TestClampRange(t *testing.T) {
 	tests := []struct {
@@ -26,5 +31,41 @@ func TestClampRange(t *testing.T) {
 				t.Fatalf("clampRange() = %d, %d; want %d, %d", gotOffset, gotLength, tt.wantOffset, tt.wantLength)
 			}
 		})
+	}
+}
+
+func TestSupportedTrackerTiers(t *testing.T) {
+	tiers := [][]string{
+		{"http://tracker.example/announce", "unsupported://tracker.example/announce"},
+		{"udp://tracker.example:80", "udp4://tracker.example:80", "udp6://tracker.example:80"},
+		{"ws://tracker.example", "wss://tracker.example"},
+		{"not a tracker", "://invalid"},
+	}
+	want := [][]string{
+		{"http://tracker.example/announce"},
+		{"udp://tracker.example:80", "udp4://tracker.example:80", "udp6://tracker.example:80"},
+		{"ws://tracker.example", "wss://tracker.example"},
+	}
+
+	if got := supportedTrackerTiers(tiers); !reflect.DeepEqual(got, want) {
+		t.Fatalf("supportedTrackerTiers() = %#v; want %#v", got, want)
+	}
+}
+
+func TestAddMagnetIgnoresUnsupportedTrackerSchemes(t *testing.T) {
+	config := anacrolix.TestingConfig(t)
+	config.DisableTrackers = false
+	client, err := anacrolix.NewClient(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	torrent, err := addMagnet(client, "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=unsupported%3A%2F%2Ftracker.example%2Fannounce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if torrent == nil {
+		t.Fatal("torrent was not created")
 	}
 }

@@ -243,7 +243,7 @@ func buildStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 	// Preserve the selected layout: silently folding surround tracks to stereo is
 	// a quality change, not a compatibility default.
 	if hasAudio {
-		args = append(args, "-c:a", "aac", "-b:a", strconv.FormatInt(compatibilityAudioBitrate, 10))
+		args = appendAACEncodingArgs(args, info.AudioTracks[audioIdx])
 	}
 
 	return args
@@ -264,7 +264,20 @@ func buildRemuxStreamArgs(info domain.MediaInfo, sel StreamSelection) []string {
 	if CopiesAudio(info, sel) {
 		return append(args, "-c:a", "copy")
 	}
-	return append(args, "-c:a", "aac", "-b:a", strconv.FormatInt(compatibilityAudioBitrate, 10))
+	return appendAACEncodingArgs(args, info.AudioTracks[audioIdx])
+}
+
+func appendAACEncodingArgs(args []string, track domain.AudioTrack) []string {
+	args = append(args, "-c:a", "aac", "-b:a", strconv.FormatInt(compatibilityAudioBitrate, 10))
+	if track.Channels > 0 {
+		// FFmpeg otherwise preserves layouts such as 5.1(side), which require an
+		// AAC Program Config Element. MPEG-TS writes that element only at the
+		// beginning of the encoded stream, leaving later HLS segments without a
+		// decodable channel configuration. Selecting the same channel count makes
+		// FFmpeg use the standard AAC layout without downmixing.
+		args = append(args, "-ac:a", strconv.Itoa(track.Channels))
+	}
+	return args
 }
 
 func selectedAudioIndex(info domain.MediaInfo, sel StreamSelection) int {

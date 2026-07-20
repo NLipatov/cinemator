@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"cinemator/domain"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -34,14 +35,15 @@ func TestTranscodedStreamKeyHasDistinctStableIdentity(t *testing.T) {
 	}
 }
 
-func TestPresentationStartHasDistinctStableIdentity(t *testing.T) {
-	key := streamKey{InfoHash: "abc123", Index: 7, Audio: 1, Subtitle: -1, Start: 12_345}
-	if got := key.dirName(); got != "abc123_7_a1_s-1_t0_p12345" {
-		t.Fatalf("dirName() = %q", got)
+func TestPlaybackStatusPublishesCurrentAssetGeneration(t *testing.T) {
+	stream := &streamInfo{
+		assetVersion: "generation-2",
+		status:       domain.HlsStatus{Phase: domain.HlsPhaseWaiting},
 	}
-	parsed, err := parseStreamDir(key.dirName())
-	if err != nil || parsed != key {
-		t.Fatalf("parseStreamDir() = %#v, %v; want %#v", parsed, err, key)
+
+	status := stream.playbackStatus(-1, playbackTimeline{}, time.Now(), 0, 0, 0)
+	if status.Generation != "generation-2" {
+		t.Fatalf("generation = %q, want generation-2", status.Generation)
 	}
 }
 
@@ -74,6 +76,62 @@ func TestRecordSourceBytesUpdatesOnlyRequestedVideoPreparation(t *testing.T) {
 	}
 }
 
+func TestSessionAdmissionDeduplicatesOneTarget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &streamInfo{
+		ctx:          ctx,
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	scheduler := newSegmentScheduler(2, 1)
+
+	stream.mtx.Lock()
+	first, _, created, err := stream.acquireJobLocked(videoSegmentJob, 12, 10, 15, false, scheduler, 2)
+	if err != nil || !created {
+		t.Fatalf("first admission = %v, created=%t", err, created)
+	}
+	second, _, created, err := stream.acquireJobLocked(videoSegmentJob, 12, 10, 15, false, scheduler, 2)
+	stream.mtx.Unlock()
+	if err != nil || created || second != first {
+		t.Fatalf("second admission = %p, %v, created=%t; want existing %p", second, err, created, first)
+	}
+	if len(stream.videoJobs) != 1 || len(scheduler.jobs) != 1 {
+		t.Fatalf("jobs = session:%d scheduler:%d, want 1/1", len(stream.videoJobs), len(scheduler.jobs))
+	}
+	first.releaseAdmission()
+}
+
+func TestSessionAdmissionCancelsSupersededUnobservedTarget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &streamInfo{
+		ctx:          ctx,
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	scheduler := newSegmentScheduler(2, 1)
+
+	stream.mtx.Lock()
+	first, firstCtx, _, err := stream.acquireJobLocked(videoSegmentJob, 0, 0, 5, false, scheduler, 2)
+	if err != nil {
+		stream.mtx.Unlock()
+		t.Fatal(err)
+	}
+	second, _, _, err := stream.acquireJobLocked(videoSegmentJob, 10, 10, 15, false, scheduler, 2)
+	stream.mtx.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-firstCtx.Done():
+	default:
+		t.Fatal("superseded unobserved target was not canceled")
+	}
+	first.releaseAdmission()
+	second.releaseAdmission()
+}
+
 func TestStreamKeyPaths(t *testing.T) {
 	root := t.TempDir()
 	paths := (streamKey{InfoHash: "hash", Index: 2, Audio: 0, Subtitle: 3}).paths(root)
@@ -87,7 +145,7 @@ func TestStreamKeyPaths(t *testing.T) {
 }
 
 func TestParseStreamDirRejectsMalformedNames(t *testing.T) {
-	for _, name := range []string{"", "hash_1_a0", "hash_x_a0_s0_t0", "hash_1_x0_s0_t0", "hash_1_a0_x0_t0", "hash_1_a0_sx_t0", "hash_1_a0_s0_tx"} {
+	for _, name := range []string{"", "hash_1_a0", "hash_x_a0_s0_t0", "hash_1_x0_s0_t0", "hash_1_a0_x0_t0", "hash_1_a0_sx_t0", "hash_1_a0_s0_tx", "hash_1_a0_s0_t0_p12000", "hash_1_a0_s0_t0_g1"} {
 		if _, err := parseStreamDir(name); err == nil {
 			t.Fatalf("parseStreamDir(%q) succeeded", name)
 		}
@@ -107,7 +165,7 @@ func TestResetStreamOutputRemovesStaleHLSFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := manager{assets: assets}
+	m := manager{media: &mediaCache{assets: assets}}
 	if err := m.resetStreamOutput(paths); err != nil {
 		t.Fatalf("resetStreamOutput() error = %v", err)
 	}

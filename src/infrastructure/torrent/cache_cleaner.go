@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"cinemator/infrastructure/ffmpeg"
 )
 
 type hlsCacheItem struct {
@@ -20,63 +22,153 @@ type hlsCacheItem struct {
 	last time.Time
 }
 
+type cacheBudget struct {
+	mu          sync.Mutex
+	limit       int64
+	hlsBytes    int64
+	hlsReserved int64
+}
+
+func newCacheBudget(limit int64) *cacheBudget {
+	return &cacheBudget{limit: limit}
+}
+
 func (m *manager) enforceCacheLimit() {
-	limit := m.settings.MaxCacheBytes()
-	if limit <= 0 {
+	if m.media == nil {
 		return
 	}
-	m.cacheMu.Lock()
-	defer m.cacheMu.Unlock()
-	if _, err := m.trimHlsCache(max(0, limit-m.hlsReserved)); err != nil {
+	if err := m.media.enforce(
+		m.settings.HlsPath(),
+		m.hlsCacheProtection,
+		m.unpublishActiveHlsAssets,
+	); err != nil {
 		log.Printf("enforceCacheLimit: %v", err)
 	}
 }
 
 func (m *manager) reserveHlsGeneration(duration time.Duration, bitrate int64) (func(), error) {
-	limit := m.settings.MaxCacheBytes()
+	return m.media.reserveHlsGeneration(
+		duration,
+		bitrate,
+		m.settings.HlsSegmentDuration(),
+		m.settings.HlsPath(),
+		m.hlsCacheProtection,
+		m.unpublishActiveHlsAssets,
+	)
+}
+
+type hlsCacheProtection func() (map[string]*streamInfo, map[string]struct{})
+type hlsUnpublisher func(*streamInfo, []hlsCacheItem) error
+
+func (c *mediaCache) enforce(root string, protection hlsCacheProtection, unpublish hlsUnpublisher) error {
+	if c.budget == nil || c.budget.limit <= 0 {
+		return nil
+	}
+	c.budget.mu.Lock()
+	_, evicted, err := c.trimSharedCacheLocked(max(0, c.budget.limit-c.budget.hlsReserved), root, protection, unpublish)
+	c.budget.mu.Unlock()
+	c.notifyPieceEvictions(evicted)
+	return err
+}
+
+func (c *mediaCache) reserveHlsGeneration(
+	duration time.Duration,
+	bitrate int64,
+	segmentDuration time.Duration,
+	root string,
+	protection hlsCacheProtection,
+	unpublish hlsUnpublisher,
+) (func(), error) {
+	limit := c.budget.limit
 	required := estimatedHlsWindowBytes(duration, bitrate)
 	if limit > 0 && required > limit {
-		return nil, fmt.Errorf("HLS window requires about %d bytes but the cache limit is %d", required, limit)
+		return nil, fmt.Errorf("HLS window requires about %d bytes but the shared cache limit is %d", required, limit)
 	}
 
-	m.cacheMu.Lock()
+	c.budget.mu.Lock()
+	var evicted []string
 	if limit > 0 {
-		target := limit - m.hlsReserved - required
+		target := limit - c.budget.hlsReserved - required
 		if target < 0 {
-			reserved := m.hlsReserved
-			m.cacheMu.Unlock()
-			return nil, fmt.Errorf("cannot reserve %d bytes in HLS cache: %d bytes are already reserved", required, reserved)
+			reserved := c.budget.hlsReserved
+			c.budget.mu.Unlock()
+			return nil, fmt.Errorf("cannot reserve %d HLS bytes: %d shared cache bytes are already reserved", required, reserved)
 		}
-		total, err := m.trimHlsCache(target)
+		total, removed, err := c.trimSharedCacheLocked(target, root, protection, unpublish)
+		evicted = append(evicted, removed...)
 		if err == nil && total > target {
-			err = fmt.Errorf("cannot reserve %d bytes in HLS cache: %d protected bytes remain", required, total)
+			err = fmt.Errorf("cannot reserve %d HLS bytes: %d protected shared cache bytes remain", required, total)
 		}
 		if err != nil {
-			m.cacheMu.Unlock()
+			c.budget.mu.Unlock()
+			c.notifyPieceEvictions(evicted)
 			return nil, err
 		}
 	}
 	var physical *diskReservation
-	if m.hlsDisk != nil {
-		reservation, err := m.hlsDisk.Reserve(uint64(required), estimatedHlsWindowInodes(duration, m.settings.HlsSegmentDuration()))
+	if c.hlsDisk != nil {
+		reservation, err := c.hlsDisk.Reserve(uint64(required), estimatedHlsWindowInodes(duration, segmentDuration))
 		if err != nil {
-			m.cacheMu.Unlock()
+			c.budget.mu.Unlock()
+			c.notifyPieceEvictions(evicted)
 			return nil, err
 		}
 		physical = reservation
 	}
-	m.hlsReserved += required
-	m.cacheMu.Unlock()
+	c.budget.hlsReserved += required
+	c.budget.mu.Unlock()
+	c.notifyPieceEvictions(evicted)
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			m.cacheMu.Lock()
-			m.hlsReserved = max(0, m.hlsReserved-required)
-			m.cacheMu.Unlock()
+			c.budget.mu.Lock()
+			c.budget.hlsReserved = max(0, c.budget.hlsReserved-required)
+			if total, err := c.trimHlsCache(math.MaxInt64, root, protection, unpublish); err == nil {
+				c.budget.hlsBytes = total
+			} else {
+				c.budget.hlsBytes += required
+			}
+			c.budget.mu.Unlock()
 			physical.Release()
 		})
 	}, nil
+}
+
+// trimSharedCacheLocked gives generated HLS priority over reproducible source
+// pieces. Pieces can still consume the entire budget while HLS is absent.
+func (c *mediaCache) trimSharedCacheLocked(target int64, root string, protection hlsCacheProtection, unpublish hlsUnpublisher) (int64, []string, error) {
+	hlsBytes, err := c.trimHlsCache(math.MaxInt64, root, protection, unpublish)
+	if err != nil {
+		return 0, nil, err
+	}
+	c.budget.hlsBytes = hlsBytes
+	pieceBytes := int64(0)
+	var evicted []string
+	if c.pieces != nil {
+		pieceBytes = c.pieces.usedBytes()
+		if hlsBytes+pieceBytes > target {
+			pieceBytes, evicted, _ = c.pieces.trimTo(max(0, target-hlsBytes))
+		}
+	}
+	if hlsBytes+pieceBytes > target {
+		hlsBytes, err = c.trimHlsCache(max(0, target-pieceBytes), root, protection, unpublish)
+		c.budget.hlsBytes = hlsBytes
+		if err != nil {
+			return hlsBytes + pieceBytes, evicted, err
+		}
+	}
+	total := hlsBytes + pieceBytes
+	if total > target {
+		return total, evicted, fmt.Errorf("shared cache is %d bytes above target because remaining data is active", total-target)
+	}
+	return total, evicted, nil
+}
+
+func (c *mediaCache) notifyPieceEvictions(locations []string) {
+	if c != nil && c.pieces != nil {
+		c.pieces.notifyEvicted(locations)
+	}
 }
 
 func estimatedHlsWindowBytes(duration time.Duration, bitrate int64) int64 {
@@ -115,9 +207,8 @@ func estimatedHlsWindowInodes(duration, segmentDuration time.Duration) uint64 {
 	return segments*2 + 16
 }
 
-func (m *manager) trimHlsCache(target int64) (int64, error) {
-	active, pinned := m.hlsCacheProtection()
-	root := m.settings.HlsPath()
+func (c *mediaCache) trimHlsCache(target int64, root string, protection hlsCacheProtection, unpublish hlsUnpublisher) (int64, error) {
+	active, pinned := protection()
 	var total int64
 	var candidates []hlsCacheItem
 	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
@@ -188,10 +279,17 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 	planned := total
 	flushBatches := func() {
 		for _, batch := range batches {
-			removed, err := m.evictActiveHlsAssets(batch.stream, batch.items)
-			for _, item := range batch.items {
-				if _, ok := removed[item.path]; ok {
-					recordRemoved(item)
+			err := unpublish(batch.stream, batch.items)
+			if err == nil {
+				for _, item := range batch.items {
+					removed, removeErr := c.assets.TryEvict(item.path)
+					if removeErr != nil {
+						err = removeErr
+						break
+					}
+					if removed {
+						recordRemoved(item)
+					}
 				}
 			}
 			batch.stream.generationMtx.Unlock()
@@ -222,7 +320,7 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 					activeBatches[parts[0]] = batch
 					batches = append(batches, batch)
 				}
-				ok, canEvictErr := m.assets.CanEvict(item.path)
+				ok, canEvictErr := c.assets.CanEvict(item.path)
 				if canEvictErr != nil {
 					log.Printf("enforceCacheLimit: failed to inspect %s: %v", item.path, canEvictErr)
 					continue
@@ -235,7 +333,7 @@ func (m *manager) trimHlsCache(target int64) (int64, error) {
 				continue
 			}
 		}
-		removed, err := m.assets.TryEvict(item.path)
+		removed, err := c.assets.TryEvict(item.path)
 		if err != nil {
 			log.Printf("enforceCacheLimit: failed to remove %s: %v", item.path, err)
 			continue
@@ -278,23 +376,27 @@ func (m *manager) monitorHlsResources(ctx context.Context, cancel context.Cancel
 }
 
 func (m *manager) checkHlsResources() error {
-	return m.hlsDisk.CheckFloor()
+	return m.media.generationDiskHealthy()
 }
 
 func (m *manager) checkHlsCacheLimit() error {
-	limit := m.settings.MaxCacheBytes()
+	return m.media.checkHlsLimit(m.settings.HlsPath())
+}
+
+func (c *mediaCache) checkHlsLimit(root string) error {
+	limit := c.budget.limit
 	if limit <= 0 {
 		return nil
 	}
 	var total int64
-	err := filepath.WalkDir(m.settings.HlsPath(), func(path string, entry fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				return nil
 			}
 			return err
 		}
-		if entry.IsDir() || path == filepath.Join(m.settings.HlsPath(), cacheOwnerLockName) {
+		if entry.IsDir() || path == filepath.Join(root, cacheOwnerLockName) {
 			return nil
 		}
 		info, err := entry.Info()
@@ -328,47 +430,57 @@ func (m *manager) hlsCacheProtection() (active map[string]*streamInfo, pinned ma
 	defer m.mu.Unlock()
 	for key, stream := range m.active {
 		active[key.dirName()] = stream
-		stream.mtx.Lock()
-		publishing := false
-		if stream.ready != nil {
-			select {
-			case <-stream.ready:
-			default:
-				publishing = true
-			}
-		}
-		for job := range stream.videoJobs {
-			pinSegmentJob(pinned, stream.paths.outDir, job, videoSegmentName)
+		snapshot := stream.cacheSnapshot()
+		for _, job := range snapshot.videoJobs {
+			pinSegmentJob(pinned, snapshot.paths.outDir, job, videoSegmentName)
 			if !jobFinished(job) {
-				publishing = true
-				window := filepath.Join(stream.paths.outDir, "window_"+formatSegmentIndex(job.begin)+".m3u8")
+				window := filepath.Join(snapshot.paths.outDir, "window_"+formatSegmentIndex(job.begin)+".m3u8")
 				pinned[window] = struct{}{}
 				pinned[window+".tmp"] = struct{}{}
 			}
 		}
-		for job := range stream.subtitleJobs {
-			pinSegmentJob(pinned, stream.paths.outDir, job, subtitleSegmentName)
-			publishing = publishing || !jobFinished(job)
+		for _, job := range snapshot.subtitleJobs {
+			pinSegmentJob(pinned, snapshot.paths.outDir, job, subtitleSegmentName)
 		}
-		for _, fragments := range stream.directWindows {
+		for owner := range protectedMaterializedOwners(snapshot.directWindows, snapshot.playbackWindow) {
+			fragments := snapshot.directWindows[owner]
 			for _, fragment := range fragments {
-				pinned[filepath.Join(stream.paths.outDir, fragment.Name)] = struct{}{}
+				pinned[filepath.Join(snapshot.paths.outDir, fragment.Name)] = struct{}{}
 				if fragment.Init != "" {
-					pinned[filepath.Join(stream.paths.outDir, fragment.Init)] = struct{}{}
+					pinned[filepath.Join(snapshot.paths.outDir, fragment.Init)] = struct{}{}
 				}
 			}
 		}
 		window := max(3, m.settings.HlsWindowSegments())
-		first := max(0, stream.progressiveSubtitles-window)
-		for index := first; index < stream.progressiveSubtitles; index++ {
-			pinned[filepath.Join(stream.paths.outDir, subtitleSegmentName(index))] = struct{}{}
+		first := max(0, snapshot.progressiveSubtitles-window)
+		for index := first; index < snapshot.progressiveSubtitles; index++ {
+			pinned[filepath.Join(snapshot.paths.outDir, subtitleSegmentName(index))] = struct{}{}
 		}
-		if publishing {
-			pinned[stream.paths.outDir] = struct{}{}
+		if snapshot.publishing {
+			pinned[snapshot.paths.outDir] = struct{}{}
 		}
-		stream.mtx.Unlock()
 	}
 	return active, pinned
+}
+
+func protectedMaterializedOwners(windows map[int][]ffmpeg.HLSFragment, playbackOwner int) map[int]struct{} {
+	protected := make(map[int]struct{}, min(3, len(windows)))
+	owners := make([]int, 0, len(windows))
+	for owner := range windows {
+		owners = append(owners, owner)
+	}
+	if len(owners) == 0 {
+		return protected
+	}
+	sort.Ints(owners)
+	current := sort.SearchInts(owners, playbackOwner)
+	if current == len(owners) || owners[current] != playbackOwner {
+		current = len(owners) - 1
+	}
+	for index := max(0, current-1); index <= min(len(owners)-1, current+1); index++ {
+		protected[owners[index]] = struct{}{}
+	}
+	return protected
 }
 
 func pinSegmentJob(pinned map[string]struct{}, outDir string, job *segmentJob, name func(int) string) {

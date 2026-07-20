@@ -125,6 +125,15 @@ body {
   color: var(--color-fg);
 }
 
+.brand-version {
+  margin-left: 0.45rem;
+  color: var(--color-muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
 .top-actions {
   display: flex;
   align-items: center;
@@ -728,20 +737,6 @@ button:focus-visible {
   align-items: center;
   gap: 0.8rem;
   justify-content: flex-end;
-}
-
-.source-timeline {
-  display: grid;
-  grid-template-columns: auto minmax(8rem, 28rem);
-  align-items: center;
-  gap: 0.65rem;
-  margin-right: auto;
-  font-variant-numeric: tabular-nums;
-  font-size: 0.82rem;
-}
-
-.source-timeline input {
-  width: min(44vw, 28rem);
 }
 
 .media-info-button {

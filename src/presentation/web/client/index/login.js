@@ -24,6 +24,14 @@ const form = document.getElementById('loginForm');
 const password = document.getElementById('password');
 const button = document.getElementById('loginButton');
 const message = document.getElementById('loginMessage');
+const appVersion = document.getElementById('appVersion');
+
+fetch('/api/auth/status', { cache: 'no-store' })
+  .then(response => response.ok ? response.json() : null)
+  .then(status => {
+    if (status?.version) appVersion.textContent = status.version;
+  })
+  .catch(() => {});
 
 form.addEventListener('submit', async event => {
   event.preventDefault();

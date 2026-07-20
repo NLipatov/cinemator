@@ -24,7 +24,7 @@ func TestPieceCacheTrimDoesNotUnlinkOpenPiece(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := newPieceCacheProvider(cache, root, 4, nil)
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(4), nil)
 	first, _ := provider.NewInstance("completed/first")
 	if err := first.(*pieceCacheInstance).PutSized(bytes.NewReader([]byte("aaaa")), 4); err != nil {
 		t.Fatal(err)
@@ -55,13 +55,72 @@ func TestPieceCacheTrimDoesNotUnlinkOpenPiece(t *testing.T) {
 	}
 }
 
+func TestPieceCacheUsesSharedBudgetRemainderAndReportsEviction(t *testing.T) {
+	root := t.TempDir()
+	cache, err := filecache.NewCache(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := newCacheBudget(8)
+	budget.hlsBytes = 4
+	provider := newPieceCacheProvider(cache, root, budget, nil)
+	var evicted []string
+	provider.onEvict = func(locations []string) { evicted = append(evicted, locations...) }
+	first, _ := provider.NewInstance("completed/first")
+	second, _ := provider.NewInstance("completed/second")
+	if err := first.(*pieceCacheInstance).PutSized(bytes.NewReader([]byte("aaaa")), 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.(*pieceCacheInstance).PutSized(bytes.NewReader([]byte("bbbb")), 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.Stat(); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old piece remains after HLS consumed shared capacity: %v", err)
+	}
+	if len(evicted) != 1 || evicted[0] != "completed/first" {
+		t.Fatalf("eviction notifications = %q", evicted)
+	}
+}
+
+func TestPieceCacheReportsPartialEvictionWhenLeasedDataPreventsTarget(t *testing.T) {
+	root := t.TempDir()
+	cache, err := filecache.NewCache(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budget := newCacheBudget(8)
+	provider := newPieceCacheProvider(cache, root, budget, nil)
+	first, _ := provider.NewInstance("completed/first")
+	second, _ := provider.NewInstance("completed/second")
+	for _, instance := range []*pieceCacheInstance{first.(*pieceCacheInstance), second.(*pieceCacheInstance)} {
+		if err := instance.PutSized(bytes.NewReader([]byte("data")), 4); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lease, err := first.Get()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	var evicted []string
+	provider.onEvict = func(locations []string) { evicted = append(evicted, locations...) }
+	budget.hlsBytes = 8
+
+	if err := provider.trimToCapacity(); err == nil {
+		t.Fatal("trim succeeded while a leased piece kept the cache above target")
+	}
+	if len(evicted) != 1 || evicted[0] != "completed/second" {
+		t.Fatalf("partial eviction notifications = %q", evicted)
+	}
+}
+
 func TestPieceChunkReaderPinsEveryChunk(t *testing.T) {
 	root := t.TempDir()
 	cache, err := filecache.NewCache(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := newPieceCacheProvider(cache, root, 4, nil)
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(4), nil)
 	for name, data := range map[string]string{"incompleted/hash/0": "aa", "incompleted/hash/2": "bb"} {
 		instance, _ := provider.NewInstance(name)
 		if err := instance.(*pieceCacheInstance).PutSized(bytes.NewReader([]byte(data)), int64(len(data))); err != nil {
@@ -94,7 +153,7 @@ func TestPieceDeleteWaitsForLastReader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := newPieceCacheProvider(cache, root, 16, nil)
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(16), nil)
 	instance, _ := provider.NewInstance("completed/piece")
 	if err := instance.(*pieceCacheInstance).PutSized(bytes.NewReader([]byte("data")), 4); err != nil {
 		t.Fatal(err)
@@ -127,7 +186,7 @@ func TestPieceBeingPublishedIsNotReadable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := newPieceCacheProvider(cache, root, 16, nil)
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(16), nil)
 	instance, _ := provider.NewInstance("completed/piece")
 	input := &blockingPieceReader{started: make(chan struct{}), release: make(chan struct{})}
 	written := make(chan error, 1)
@@ -165,7 +224,7 @@ func TestPieceCacheRejectsSymlinkAndHardLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := newPieceCacheProvider(cache, root, 16, nil)
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(16), nil)
 	instance, _ := provider.NewInstance("completed/piece")
 	if err := instance.(*pieceCacheInstance).PutSized(bytes.NewReader([]byte("data")), 4); err != nil {
 		t.Fatal(err)
@@ -201,7 +260,7 @@ func TestPieceDeleteDuringPublicationFinishesAfterWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := newPieceCacheProvider(cache, root, 16, nil)
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(16), nil)
 	instance, _ := provider.NewInstance("completed/piece")
 	input := &blockingPieceReader{started: make(chan struct{}), release: make(chan struct{})}
 	written := make(chan error, 1)
@@ -239,7 +298,7 @@ func TestResourcePiecePromotionRemovesIncompleteChunksAfterReadersClose(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	provider := newPieceCacheProvider(cache, root, 8, nil)
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(8), nil)
 	client := storage.NewResourcePieces(provider)
 	data := []byte("data")
 	pieceHash := sha1.Sum(data)
@@ -262,5 +321,46 @@ func TestResourcePiecePromotionRemovesIncompleteChunksAfterReadersClose(t *testi
 	cache.WalkItems(func(info filecache.ItemInfo) { paths = append(paths, string(info.Path)) })
 	if len(paths) != 1 || !strings.HasPrefix(paths[0], "completed/") {
 		t.Fatalf("piece cache paths after promotion = %q", paths)
+	}
+}
+
+func TestFailedCompletePieceReadInvalidatesCompletion(t *testing.T) {
+	root := t.TempDir()
+	cache, err := filecache.NewCache(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(8), nil)
+	client := storage.NewResourcePieces(provider)
+	data := []byte("data")
+	pieceHash := sha1.Sum(data)
+	info := &metainfo.Info{PieceLength: 4, Length: 4, Pieces: pieceHash[:]}
+	torrentStorage, err := client.OpenTorrent(context.Background(), info, metainfo.Hash{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	piece := torrentStorage.PieceWithHash(info.Piece(0), g.Some(pieceHash[:]))
+	if _, err := piece.WriteAt(data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := piece.MarkComplete(); err != nil {
+		t.Fatal(err)
+	}
+
+	var completed string
+	cache.WalkItems(func(info filecache.ItemInfo) {
+		if strings.HasPrefix(string(info.Path), "completed/") {
+			completed = string(info.Path)
+		}
+	})
+	instance, err := provider.NewInstance(completed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := instance.ReadAt(make([]byte, 1), int64(len(data))); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("failed read = %d, %v", n, err)
+	}
+	if completion := piece.Completion(); !completion.Ok || completion.Complete {
+		t.Fatalf("piece completion after failed read = %+v", completion)
 	}
 }

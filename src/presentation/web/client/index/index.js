@@ -64,11 +64,13 @@
     }
 
     const logoutBtn = $('logoutBtn');
+    const appVersion = $('appVersion');
     if (logoutBtn) {
       window.fetch('/api/auth/status', { cache: 'no-store' })
         .then(response => response.ok ? response.json() : null)
         .then(status => {
           logoutBtn.hidden = !status?.enabled;
+          if (status?.version) appVersion.textContent = status.version;
         })
         .catch(() => {});
       logoutBtn.addEventListener('click', async () => {
@@ -83,15 +85,9 @@
       });
     }
 
-    let hls = null;
     let subtitleDelay = parseFloat(localStorage.getItem('subtitle-delay') || '0');
     let msgTimeout = null;
     let subtitleWaitTimer = null;
-    let playbackRecoveryTimer = null;
-    let playbackRecoveryInFlight = false;
-    let lastPlaybackRecoveryAt = 0;
-    let lastStreamActivityAt = 0;
-    let forcedRecoveryAttempts = 0;
     let downloadCatalog = [];
     let downloadsLoading = false;
     let downloadsRefreshQueued = false;
@@ -99,24 +95,119 @@
     let downloadFallbackPolling = false;
     let downloadPollingTimer = null;
     let openExtendDownloadID = null;
-    let requestSeq = 0;
-    let flowRequestController = null;
-    let activeStreamDir = null;
-    let currentMediaSeekable = true;
-    let currentMediaInfo = null;
-    let currentPlaybackMode = '';
-    let currentPlaybackDecision = '';
-    let presentationSourceStart = 0;
-    let presentationMediaAnchor = null;
-    let sourceSeekDragging = false;
-    let playbackUsesPassthrough = false;
-    let forceTranscodePlayback = false;
-    let nativePassthroughRetries = 0;
-    let playbackNotice = '';
-    let hlsStatusTimer = null;
-    let hlsStatusController = null;
-    let hlsStatusSeq = 0;
-    let hlsStatusTarget = null;
+    function mediaBufferedRanges(video) {
+      const ranges = [];
+      for (let index = 0; index < (video?.buffered?.length || 0); index++) {
+        ranges.push({ start: video.buffered.start(index), end: video.buffered.end(index) });
+      }
+      return ranges;
+    }
+    class PlaybackTimeline {
+      constructor() { this.reset(); }
+      reset() {
+        this.sourceStart = 0;
+        this.mediaAnchor = null;
+        this.absolute = false;
+      }
+      configure({ sourceStart, duration, presentationOrigin, seekable }) {
+        this.sourceStart = Math.max(0, Number(sourceStart) || 0);
+        this.mediaAnchor = null;
+        this.absolute = Boolean(seekable && Number.isFinite(duration) && duration > 0);
+        return this.absolute ? Number(presentationOrigin) : undefined;
+      }
+      sourceTime(currentTime) {
+        if (currentTime === undefined) return this.sourceStart;
+        const local = Number.isFinite(currentTime) ? currentTime : this.mediaAnchor;
+        if (this.absolute && Number.isFinite(local)) {
+          return Math.max(0, local);
+        }
+        if (!Number.isFinite(this.mediaAnchor)) return this.sourceStart;
+        return Math.max(0, this.sourceStart + local - this.mediaAnchor);
+      }
+      anchor(currentTime) {
+        if (!Number.isFinite(this.mediaAnchor) && Number.isFinite(currentTime)) {
+          this.mediaAnchor = currentTime;
+        }
+      }
+      buffered(ranges, time) {
+        for (const range of ranges) {
+          if (time >= range.start - 0.05 && time < range.end + 0.05) return true;
+        }
+        return false;
+      }
+      contains(time, ranges, fragments) {
+        if (!this.absolute) return true;
+        if (this.buffered(ranges, time)) return true;
+        if (!fragments?.length) return false;
+        const first = fragments[0];
+        const last = fragments[fragments.length - 1];
+        return time >= first.start - 0.25 && time < last.start + last.duration + 0.25;
+      }
+    }
+    class PlaybackSession {
+      constructor() {
+        this.timeline = new PlaybackTimeline();
+        this.hls = null;
+        this.events = null;
+        this.requestSeq = 0;
+        this.requestController = null;
+        this.requestTarget = null;
+        this.streamDir = null;
+        this.generation = '';
+        this.attaching = false;
+        this.mediaSeekable = true;
+        this.mediaInfo = null;
+        this.mode = '';
+        this.decision = '';
+        this.usesPassthrough = false;
+        this.forceTranscode = false;
+        this.nativeRetries = 0;
+        this.notice = '';
+        this.recoveryTimer = null;
+        this.recoveryInFlight = false;
+        this.lastRecoveryAt = 0;
+        this.lastActivityAt = 0;
+        this.forcedRecoveryAttempts = 0;
+        this.statusTimer = null;
+        this.statusController = null;
+        this.statusSeq = 0;
+        this.statusTarget = null;
+      }
+      isStale(id) { return id !== this.requestSeq; }
+      cancelRequest() {
+        this.requestSeq++;
+        if (this.requestController) this.requestController.abort();
+        this.requestController = null;
+        this.requestTarget = null;
+      }
+      beginRequest(target = null) {
+        this.cancelRequest();
+        const request = { id: this.requestSeq, controller: new AbortController() };
+        request.signal = request.controller.signal;
+        this.requestController = request.controller;
+        this.requestTarget = Number.isFinite(target) ? target : null;
+        return request;
+      }
+      isRequesting(target) {
+        return this.requestController && Number.isFinite(this.requestTarget) &&
+          Math.abs(this.requestTarget - target) < 0.25;
+      }
+      finishRequest(request) {
+        if (this.requestController === request.controller) {
+          this.requestController = null;
+          this.requestTarget = null;
+        }
+      }
+      stopStatusPolling() {
+        this.statusSeq++;
+        this.statusTarget = null;
+        if (this.statusTimer) clearTimeout(this.statusTimer);
+        this.statusTimer = null;
+        if (this.statusController) this.statusController.abort();
+        this.statusController = null;
+      }
+    }
+    const playback = new PlaybackSession();
     const idleRecoveryMs = 12 * 60 * 1000;
     const recoveryThrottleMs = 5000;
     const stallRecoveryDelayMs = 3500;
@@ -128,45 +219,25 @@
       { days: 7, label: '7 days' },
       { days: 30, label: '30 days' },
     ];
-    const isStale = id => id !== requestSeq;
-    function cancelFlowRequest() {
-      requestSeq++;
-      if (flowRequestController) {
-        flowRequestController.abort();
-        flowRequestController = null;
-      }
-    }
-    function beginFlowRequest() {
-      cancelFlowRequest();
-      const request = {
-        id: requestSeq,
-        controller: new AbortController(),
-      };
-      request.signal = request.controller.signal;
-      flowRequestController = request.controller;
-      return request;
-    }
-    function finishFlowRequest(request) {
-      if (flowRequestController === request.controller) {
-        flowRequestController = null;
-      }
-    }
     function destroyVideoAndHls({ resetLayout = true } = {}) {
-      if (hls) { hls.destroy(); hls = null; }
-      stopHlsStatusPolling();
-      activeStreamDir = null;
-      presentationMediaAnchor = null;
+      if (playback.events) { playback.events.abort(); playback.events = null; }
+      if (playback.hls) { playback.hls.destroy(); playback.hls = null; }
+      playback.stopStatusPolling();
+      playback.streamDir = null;
+      playback.generation = '';
+      playback.attaching = false;
+      playback.timeline.reset();
       const mediaDialog = $('mediaInfoDialog');
       if (mediaDialog?.open) mediaDialog.close();
-      if (playbackRecoveryTimer) {
-        clearTimeout(playbackRecoveryTimer);
-        playbackRecoveryTimer = null;
+      if (playback.recoveryTimer) {
+        clearTimeout(playback.recoveryTimer);
+        playback.recoveryTimer = null;
       }
       if (resetLayout) document.body.classList.remove('has-player');
-      const oldVideo = $('video');
-      const newVideo = oldVideo.cloneNode(false);
-      oldVideo.parentNode.replaceChild(newVideo, oldVideo);
-      newVideo.id = 'video';
+      const video = $('video');
+      video.pause();
+      video.removeAttribute('src');
+      video.load();
     }
     function setOptions(select, options) {
       select.replaceChildren(...options.map(({ value, label }) => new Option(label, String(value))));
@@ -214,22 +285,9 @@
       setWarningExtra('');
     }
     function removeWarning() {
-      stopHlsStatusPolling();
+      playback.stopStatusPolling();
       clearSubtitleWait();
       $('warnMsg').hidden = true;
-    }
-
-    function stopHlsStatusPolling() {
-      hlsStatusSeq++;
-      hlsStatusTarget = null;
-      if (hlsStatusTimer) {
-        clearTimeout(hlsStatusTimer);
-        hlsStatusTimer = null;
-      }
-      if (hlsStatusController) {
-        hlsStatusController.abort();
-        hlsStatusController = null;
-      }
     }
 
     function formatElapsed(startedAt) {
@@ -251,47 +309,17 @@
         : `${minutes}:${String(rest).padStart(2, '0')}`;
     }
 
-    function currentSourceTime(video = $('video')) {
-      if (!video || !Number.isFinite(presentationMediaAnchor)) return presentationSourceStart;
-      const local = Number.isFinite(video.currentTime) ? video.currentTime : presentationMediaAnchor;
-      return Math.max(0, presentationSourceStart + local - presentationMediaAnchor);
-    }
-
-    function updateSourceTimeline(value = currentSourceTime()) {
-      const duration = Number(currentMediaInfo?.duration);
-      const timeline = $('sourceTimeline');
-      const seek = $('sourceSeek');
-      if (!timeline || !seek || !Number.isFinite(duration) || duration <= 0) {
-        if (timeline) timeline.hidden = true;
-        return;
-      }
-      timeline.hidden = false;
-      seek.max = String(duration);
-      const position = Math.min(duration, Math.max(0, Number(value) || 0));
-      if (!sourceSeekDragging) seek.value = String(position);
-      const shown = sourceSeekDragging ? Number(seek.value) : position;
-      $('sourceTime').textContent = `${formatPlaybackTime(shown)} / ${formatPlaybackTime(duration)}`;
-    }
-
-    function anchorPresentation(video) {
-      if (!Number.isFinite(presentationMediaAnchor) && Number.isFinite(video?.currentTime)) {
-        presentationMediaAnchor = video.currentTime;
-      }
-      updateSourceTimeline();
-    }
-
     function renderHlsStatus(status, fallbackTarget) {
-      if (Number(status.duration) > 0 && currentMediaInfo && !(Number(currentMediaInfo.duration) > 0)) {
-        currentMediaInfo.duration = Number(status.duration);
-        currentMediaSeekable = true;
-        updateSourceTimeline();
+      if (Number(status.duration) > 0 && playback.mediaInfo && !(Number(playback.mediaInfo.duration) > 0)) {
+        playback.mediaInfo.duration = Number(status.duration);
+        playback.mediaSeekable = true;
       }
-      if (status.mode && status.mode !== currentPlaybackMode) {
-        if (status.mode === 'transcode' && playbackUsesPassthrough) {
-          playbackUsesPassthrough = false;
-          currentPlaybackDecision = 'The source could not be remuxed safely; the server switched to the compatibility fallback.';
+      if (status.mode && status.mode !== playback.mode) {
+        if (status.mode === 'transcode' && playback.usesPassthrough) {
+          playback.usesPassthrough = false;
+          playback.decision = 'The source could not be remuxed safely; the server switched to the compatibility fallback.';
         }
-        currentPlaybackMode = status.mode;
+        playback.mode = status.mode;
         renderMediaInfo();
       }
       const reportedTarget = Number.isFinite(status.targetSeconds) ? status.targetSeconds : fallbackTarget;
@@ -340,15 +368,15 @@
       if (status.phase === 'ready') {
         showWarning(
           `Position ${formatPlaybackTime(target)} is ready`,
-          'The prepared segment is being sent to the player.',
-          `${formatBytes(status.bytesRead || 0)} read · ${peerText}${suffix}`,
+          'The requested segment is prepared. Connecting it to the player.',
+          `${formatBytes(status.bytesRead || 0)} read · ${peerText}`,
         );
         return;
       }
       if (status.phase === 'waiting') {
         showWarning(
           `Starting ${formatPlaybackTime(target)}`,
-          'Media information is ready. Waiting for the player to request its first HLS segment.',
+          'Media information is ready. Waiting for the server to publish the first HLS segment.',
           `${peerText}${suffix}`,
         );
         return;
@@ -361,12 +389,12 @@
     }
 
     function beginHlsStatusPolling(targetSeconds, replace = false) {
-      if (!activeStreamDir) return;
+      if (!playback.streamDir) return;
       targetSeconds = Number.isFinite(targetSeconds) ? Math.max(0, targetSeconds) : 0;
-      if (hlsStatusTarget !== null && (!replace || Math.abs(hlsStatusTarget - targetSeconds) < 1)) return;
-      stopHlsStatusPolling();
-      hlsStatusTarget = targetSeconds;
-      const seq = hlsStatusSeq;
+      if (playback.statusTarget !== null && (!replace || Math.abs(playback.statusTarget - targetSeconds) < 1)) return;
+      playback.stopStatusPolling();
+      playback.statusTarget = targetSeconds;
+      const seq = playback.statusSeq;
       showWarning(
         `Preparing ${formatPlaybackTime(targetSeconds)}`,
         'Checking the cache and requesting the required torrent pieces.',
@@ -374,16 +402,16 @@
       );
       let consecutiveFailures = 0;
       const poll = async () => {
-        if (seq !== hlsStatusSeq || !activeStreamDir) return;
+        if (seq !== playback.statusSeq || !playback.streamDir) return;
         const controller = new AbortController();
-        hlsStatusController = controller;
+        playback.statusController = controller;
         try {
-          const statusURL = `/api/hls/status/${encodeURIComponent(activeStreamDir)}?target=${encodeURIComponent(targetSeconds)}`;
+          const statusURL = `/api/hls/status/${encodeURIComponent(playback.streamDir)}?target=${encodeURIComponent(targetSeconds)}`;
           const response = await apiFetch(statusURL, {
             cache: 'no-store',
             signal: controller.signal,
           }, 10000);
-          if (seq !== hlsStatusSeq) return;
+          if (seq !== playback.statusSeq) return;
           if (!response.ok) {
             const error = new Error((await response.text()).trim() || `Status request failed (${response.status})`);
             error.status = response.status;
@@ -391,10 +419,10 @@
           }
           consecutiveFailures = 0;
           const status = await response.json();
-          if (seq !== hlsStatusSeq) return;
+          if (seq !== playback.statusSeq) return;
           renderHlsStatus(status, targetSeconds);
         } catch (error) {
-          if (error.name !== 'AbortError' && seq === hlsStatusSeq) {
+          if (error.name !== 'AbortError' && seq === playback.statusSeq) {
             consecutiveFailures++;
             if (consecutiveFailures >= 3) {
               if (error.status === 404 && requestPlaybackRecovery('stream-worker-lost', true)) {
@@ -410,18 +438,39 @@
             }
           }
         } finally {
-          if (hlsStatusController === controller) hlsStatusController = null;
-          if (seq === hlsStatusSeq) {
-            hlsStatusTimer = setTimeout(poll, 1000);
+          if (playback.statusController === controller) playback.statusController = null;
+          if (seq === playback.statusSeq) {
+            playback.statusTimer = setTimeout(poll, 1000);
           }
         }
       };
       poll();
     }
 
+    async function waitForHlsReady(streamDir, targetSeconds, signal) {
+      for (;;) {
+        const statusURL = `/api/hls/status/${encodeURIComponent(streamDir)}?target=${encodeURIComponent(targetSeconds)}`;
+        const response = await apiFetch(statusURL, {
+          cache: 'no-store',
+          signal,
+        }, 10000);
+        if (!response.ok) {
+          throw new Error((await response.text()).trim() || `Status request failed (${response.status})`);
+        }
+        const status = await response.json();
+        renderHlsStatus(status, targetSeconds);
+        if (status.phase === 'ready') return status;
+        if (status.phase === 'error') {
+          throw new Error(status.message || 'The server could not prepare the requested position');
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      }
+    }
+
     function showPlaybackNotice() {
-      showMsg('playerMsg', playbackNotice);
-      if (playbackNotice) {
+      showMsg('playerMsg', playback.notice);
+      if (playback.notice) {
         clearTimeout(msgTimeout);
       }
     }
@@ -470,7 +519,7 @@
     }
 
     function selectedAudioTrack() {
-      const tracks = currentMediaInfo?.audioTracks || [];
+      const tracks = playback.mediaInfo?.audioTracks || [];
       const selected = Number.parseInt($('audioSelect').value || '0', 10);
       return tracks.find(track => track.index === selected) || tracks[0] || null;
     }
@@ -484,7 +533,7 @@
     }
 
     function renderMediaInfo() {
-      const info = currentMediaInfo;
+      const info = playback.mediaInfo;
       const button = $('mediaInfoBtn');
       if (!button) return;
       button.hidden = !info;
@@ -505,29 +554,27 @@
       setMediaInfoRow('mediaColorRow', 'mediaColor', color);
       setMediaInfoRow('mediaBitrateRow', 'mediaBitrate', formatBitrate(Number(info.bitrate)));
       setMediaInfoRow('mediaAudioRow', 'mediaAudio', audioText);
-      $('mediaPlaybackMode').textContent = modes[currentPlaybackMode] || 'Preparing';
-      setMediaInfoRow('mediaDecisionRow', 'mediaDecision', currentPlaybackDecision);
+      $('mediaPlaybackMode').textContent = modes[playback.mode] || 'Preparing';
+      setMediaInfoRow('mediaDecisionRow', 'mediaDecision', playback.decision);
     }
 
     function setMediaInfo(info = null) {
-      currentMediaInfo = info;
-      currentMediaSeekable = info?.seekable === true;
-      presentationSourceStart = 0;
-      presentationMediaAnchor = null;
-      currentPlaybackMode = '';
-      currentPlaybackDecision = '';
-      playbackUsesPassthrough = false;
-      forceTranscodePlayback = false;
-      nativePassthroughRetries = 0;
-      playbackNotice = '';
+      playback.mediaInfo = info;
+      playback.mediaSeekable = info?.seekable === true;
+      playback.timeline.reset();
+      playback.mode = '';
+      playback.decision = '';
+      playback.usesPassthrough = false;
+      playback.forceTranscode = false;
+      playback.nativeRetries = 0;
+      playback.notice = '';
       renderMediaInfo();
-      updateSourceTimeline(presentationSourceStart);
     }
 
     function useCompatibilityFallback(reason) {
-      if (!playbackUsesPassthrough) return;
-      forceTranscodePlayback = true;
-      currentPlaybackDecision = reason || 'The original stream failed to decode; using the compatibility fallback.';
+      if (!playback.usesPassthrough) return;
+      playback.forceTranscode = true;
+      playback.decision = reason || 'The original stream failed to decode; using the compatibility fallback.';
       renderMediaInfo();
     }
 
@@ -805,7 +852,7 @@
         showMsg('downloadsMsg', 'Download metadata is incomplete', true);
         return;
       }
-      cancelFlowRequest();
+      playback.cancelRequest();
       destroyVideoAndHls();
       setMediaInfo();
       $('magnet').value = download.magnet;
@@ -844,7 +891,7 @@
         const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('Could not delete download');
         if ($('magnet').value.trim() === download.magnet) {
-          cancelFlowRequest();
+          playback.cancelRequest();
           destroyVideoAndHls();
           setMediaInfo();
           $('magnet').value = '';
@@ -942,7 +989,7 @@
         showMsg('magnetMsg', 'Magnet link required', true);
         return;
       }
-      const request = beginFlowRequest();
+      const request = playback.beginRequest();
       const requestId = request.id;
       destroyVideoAndHls();
       setMediaInfo();
@@ -956,18 +1003,18 @@
         const res = await apiFetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: request.signal }, 60000);
         if (!res.ok) throw new Error((await res.text()).trim() || 'Server error');
         const files = await res.json();
-        if (isStale(requestId)) return;
+        if (playback.isStale(requestId)) return;
         if (!files.length) throw new Error('No playable files found in torrent');
         setFileList(files);
         $('step-files').style.display = '';
         showMsg('magnetMsg', '');
       } catch (e) {
         if (e.name === 'AbortError') return;
-        if (isStale(requestId)) return;
+        if (playback.isStale(requestId)) return;
         showMsg('magnetMsg', e.message || 'Error loading files', true);
         return;
       } finally {
-        finishFlowRequest(request);
+        playback.finishRequest(request);
       }
     };
 
@@ -986,7 +1033,7 @@
         showMsg('fileMsg', 'Select a file first', true);
         return;
       }
-      const request = beginFlowRequest();
+      const request = playback.beginRequest();
       const requestId = request.id;
       showMsg('fileMsg', 'Loading track info…', false, true);
       $('step-tracks').style.display = 'none';
@@ -994,13 +1041,13 @@
         const res = await apiFetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal }, 60000);
         if (!res.ok) throw new Error((await res.text()).trim() || 'Could not load media info');
         const info = await res.json();
-        if (isStale(requestId)) return;
+        if (playback.isStale(requestId)) return;
         setMediaInfo(info);
         const notices = Array.isArray(info.warnings) ? [...info.warnings] : [];
-        if (!currentMediaSeekable) {
+        if (!playback.mediaSeekable) {
           notices.unshift('Duration is unavailable for this format. Playback is progressive; seeking is limited to the discovered part.');
         }
-        playbackNotice = notices.join(' ');
+        playback.notice = notices.join(' ');
 
         const audioCount = info.audioTracks ? info.audioTracks.length : 0;
         const subCount = info.subtitles ? info.subtitles.length : 0;
@@ -1053,10 +1100,10 @@
         showMsg('fileMsg', '');
       } catch (e) {
         if (e.name === 'AbortError') return;
-        if (isStale(requestId)) return;
+        if (playback.isStale(requestId)) return;
         showMsg('fileMsg', e.message || 'Error loading tracks', true);
       } finally {
-        finishFlowRequest(request);
+        playback.finishRequest(request);
       }
     };
 
@@ -1070,18 +1117,24 @@
         showMsg('trackMsg', 'Select a file first', true);
         return;
       }
-      const request = beginFlowRequest();
+      const start = playback.mediaSeekable && Number.isFinite(resumeTime) && resumeTime > 0 ? resumeTime : 0;
+      const request = playback.beginRequest(start);
       const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
-      destroyVideoAndHls({ resetLayout: !wasPlaying });
+      const retainedHls = keepPlayerVisible ? playback.hls : null;
+      if (retainedHls?.stopLoad) {
+        retainedHls.stopLoad();
+      } else {
+        destroyVideoAndHls({ resetLayout: !wasPlaying });
+      }
       $('player-block').style.display = keepPlayerVisible ? '' : 'none';
       removeWarning();
       showWarning();
       showMsg('trackMsg', '');
       showMsg('playerMsg', keepPlayerVisible ? 'Restoring stream...' : '', false, keepPlayerVisible);
-      lastStreamActivityAt = Date.now();
+      playback.lastActivityAt = Date.now();
       if (!keepPlayerVisible) {
-        forcedRecoveryAttempts = 0;
+        playback.forcedRecoveryAttempts = 0;
       }
 
       if (subtitleSelected) {
@@ -1091,16 +1144,12 @@
         }, 8000);
       }
       try {
-        const start = currentMediaSeekable && Number.isFinite(resumeTime) && resumeTime > 0 ? resumeTime : 0;
-        presentationSourceStart = start;
-        presentationMediaAnchor = null;
-        updateSourceTimeline(start);
-        const capability = await sourcePlaybackCapability(currentMediaInfo);
-        if (isStale(requestId)) return;
-        const forceTranscode = forceTranscodePlayback || !capability.supported;
-        playbackUsesPassthrough = !forceTranscode;
-        currentPlaybackMode = '';
-        currentPlaybackDecision = forceTranscodePlayback
+        const capability = await sourcePlaybackCapability(playback.mediaInfo);
+        if (playback.isStale(requestId)) return;
+        const forceTranscode = playback.forceTranscode || !capability.supported;
+        playback.usesPassthrough = !forceTranscode;
+        playback.mode = '';
+        playback.decision = playback.forceTranscode
           ? 'The original stream failed to decode; using the compatibility fallback.'
           : capability.reason;
         renderMediaInfo();
@@ -1109,22 +1158,47 @@
           signal: request.signal,
         }, 60000);
         if (!resp.ok) throw new Error((await resp.text()).trim() || 'Stream error');
-        if (isStale(requestId)) return;
+        if (playback.isStale(requestId)) return;
         const prepared = await resp.json();
         if (!prepared.playlist || !prepared.stream) throw new Error('Server returned an invalid stream descriptor');
-        const playlistURL = new URL(prepared.playlist, window.location.href);
-        activeStreamDir = prepared.stream;
-        const m3u8 = playlistURL.pathname + '?t=' + Date.now();
         $('player-block').style.display = '';
         document.body.classList.add('has-player');
+        const readyStatus = await waitForHlsReady(prepared.stream, start, request.signal);
+        if (playback.isStale(requestId)) return;
+        const duration = Number(playback.mediaInfo?.duration);
+        const presentationOrigin = Number(readyStatus.presentationOriginSeconds);
+        if (playback.mediaSeekable && Number.isFinite(duration) && duration > 0 &&
+          (!Number.isFinite(presentationOrigin) || presentationOrigin < 0)) {
+          throw new Error('Server returned an invalid presentation origin');
+        }
+        const playlistURL = new URL(prepared.playlist, window.location.href);
+        const reusesPresentation = retainedHls && playback.hls === retainedHls &&
+          prepared.stream === playback.streamDir &&
+          readyStatus.generation && readyStatus.generation === playback.generation;
+        if (retainedHls && playback.hls === retainedHls && !reusesPresentation) {
+          destroyVideoAndHls({ resetLayout: false });
+        }
+        playback.streamDir = prepared.stream;
+        playback.generation = readyStatus.generation || '';
         showPlaybackNotice();
         beginHlsStatusPolling(start);
-        const segmentSeconds = Number(prepared.segmentDurationSeconds) || 6;
-        const windowSegments = Number(prepared.windowSegments) || 5;
-        playHls(m3u8, subtitleSelected, { segmentSeconds, windowSegments });
+        if (reusesPresentation) {
+          retainedHls.startLoad?.(start);
+          return;
+        }
+        const m3u8 = playlistURL.pathname + '?t=' + Date.now();
+        const segmentSeconds = Number(prepared.segmentDurationSeconds) || 2;
+        const windowSegments = Number(prepared.windowSegments) || 15;
+        playHls(m3u8, subtitleSelected, {
+          segmentSeconds,
+          windowSegments,
+          duration,
+          sourceStart: start,
+          presentationOrigin,
+        });
       } catch (e) {
         if (e.name === 'AbortError') return;
-        if (isStale(requestId)) return;
+        if (playback.isStale(requestId)) return;
         removeWarning();
         const msg = e.message || 'Could not start stream';
         if (keepPlayerVisible) {
@@ -1134,24 +1208,24 @@
         }
         return;
       } finally {
-        finishFlowRequest(request);
+        playback.finishRequest(request);
       }
     }
 
     $('play').onclick = () => {
-      forceTranscodePlayback = false;
-      nativePassthroughRetries = 0;
+      playback.forceTranscode = false;
+      playback.nativeRetries = 0;
       startPlayback(0);
     };
     ['audioSelect', 'subtitleSelect'].forEach(id => {
       const el = $(id);
       if (!el) return;
       el.addEventListener('change', () => {
-        forceTranscodePlayback = false;
-        nativePassthroughRetries = 0;
+        playback.forceTranscode = false;
+        playback.nativeRetries = 0;
         renderMediaInfo();
         if ($('player-block').style.display !== 'none') {
-          const t = currentSourceTime();
+          const t = playback.timeline.sourceTime($('video')?.currentTime);
           startPlayback(t);
         }
       });
@@ -1184,12 +1258,12 @@
       });
     }
 
-    function watchSubtitleUpdates(video, onUpdate) {
+    function watchSubtitleUpdates(video, onUpdate, signal) {
       if (!video || !video.textTracks) return;
       const tracks = video.textTracks;
       const attachTrack = track => {
         if (!track || !track.addEventListener) return;
-        track.addEventListener('cuechange', onUpdate);
+        track.addEventListener('cuechange', onUpdate, { signal });
       };
       Array.from(tracks).forEach(attachTrack);
       if (tracks.addEventListener) {
@@ -1197,42 +1271,43 @@
           attachTrack(e.track);
           showSubtitleTextTracks(video);
           setTimeout(onUpdate, 0);
-        });
+        }, { signal });
       }
     }
 
     function requestPlaybackRecovery(reason, force = false) {
       const video = $('video');
       if (!video || $('player-block').style.display === 'none') return false;
+      if (playback.requestController) return false;
 
       const now = Date.now();
-      if (playbackRecoveryInFlight || now - lastPlaybackRecoveryAt < recoveryThrottleMs) {
+      if (playback.recoveryInFlight || now - playback.lastRecoveryAt < recoveryThrottleMs) {
         return false;
       }
-      if (!force && now - lastStreamActivityAt < idleRecoveryMs) {
+      if (!force && now - playback.lastActivityAt < idleRecoveryMs) {
         return false;
       }
 
-      playbackRecoveryInFlight = true;
-      lastPlaybackRecoveryAt = now;
+      playback.recoveryInFlight = true;
+      playback.lastRecoveryAt = now;
       if (force) {
-        if (forcedRecoveryAttempts >= maxForcedRecoveryAttempts) {
-          playbackRecoveryInFlight = false;
+        if (playback.forcedRecoveryAttempts >= maxForcedRecoveryAttempts) {
+          playback.recoveryInFlight = false;
           return false;
         }
-        forcedRecoveryAttempts++;
+        playback.forcedRecoveryAttempts++;
       }
-      const resumeTime = currentSourceTime(video);
+      const resumeTime = playback.timeline.sourceTime(video?.currentTime);
       startPlayback(resumeTime, { keepPlayerVisible: true }).finally(() => {
-        playbackRecoveryInFlight = false;
+        playback.recoveryInFlight = false;
       });
       return true;
     }
 
     function schedulePlaybackRecovery(reason, force = false) {
-      if (playbackRecoveryTimer) clearTimeout(playbackRecoveryTimer);
-      playbackRecoveryTimer = setTimeout(() => {
-        playbackRecoveryTimer = null;
+      if (playback.recoveryTimer) clearTimeout(playback.recoveryTimer);
+      playback.recoveryTimer = setTimeout(() => {
+        playback.recoveryTimer = null;
         const video = $('video');
         if (!video || video.paused) return;
         if (force || video.readyState < 3) {
@@ -1246,37 +1321,74 @@
       showMsg('playerMsg', 'Playback error: ' + (details || 'Fatal error'), true);
     }
 
-    function attachPlaybackRecovery(video) {
-      video.addEventListener('play', () => requestPlaybackRecovery('play'));
-      video.addEventListener('playing', () => anchorPresentation(video));
-      video.addEventListener('timeupdate', () => {
-        if (Number.isFinite(presentationMediaAnchor)) updateSourceTimeline();
-      });
-      video.addEventListener('seeking', () => beginHlsStatusPolling(currentSourceTime(video), true));
+    function attachPlaybackRecovery(video, signal) {
+      const options = { signal };
+      video.addEventListener('play', () => requestPlaybackRecovery('play'), options);
+      video.addEventListener('playing', () => {
+        playback.timeline.anchor(video.currentTime);
+        showPlaybackNotice();
+        removeWarning();
+      }, options);
+      video.addEventListener('seeking', () => {
+        if (playback.attaching) return;
+        const target = playback.timeline.sourceTime(video.currentTime);
+        const retained = playback.timeline.contains(
+          target,
+          mediaBufferedRanges(video),
+          playback.hls?.latestLevelDetails?.fragments,
+        );
+        if (playback.requestController) {
+          if (playback.isRequesting(target)) return;
+          playback.cancelRequest();
+          if (retained) {
+            if (playback.hls?.startLoad) playback.hls.startLoad(target);
+            playback.lastActivityAt = Date.now();
+            removeWarning();
+            showPlaybackNotice();
+            beginHlsStatusPolling(target);
+          } else {
+            const duration = Number(playback.mediaInfo?.duration);
+            startPlayback(duration > 0 ? Math.min(target, Math.max(0, duration - 0.001)) : target, { keepPlayerVisible: true });
+          }
+          return;
+        }
+        beginHlsStatusPolling(target, true);
+        if (retained) {
+          return;
+        }
+        const duration = Number(playback.mediaInfo?.duration);
+        if (duration > 0) {
+          startPlayback(Math.min(target, Math.max(0, duration - 0.001)), { keepPlayerVisible: true });
+        }
+      }, options);
       video.addEventListener('seeked', () => {
+        if (playback.requestController) return;
         if (video.readyState >= 3) {
           removeWarning();
         } else {
-          beginHlsStatusPolling(currentSourceTime(video));
+          beginHlsStatusPolling(playback.timeline.sourceTime(video.currentTime));
         }
-      });
+      }, options);
       video.addEventListener('waiting', () => {
-        beginHlsStatusPolling(currentSourceTime(video));
+        if (playback.requestController) return;
+        beginHlsStatusPolling(playback.timeline.sourceTime(video.currentTime));
         schedulePlaybackRecovery('waiting');
-      });
+      }, options);
       video.addEventListener('stalled', () => {
-        beginHlsStatusPolling(currentSourceTime(video));
+        if (playback.requestController) return;
+        beginHlsStatusPolling(playback.timeline.sourceTime(video.currentTime));
         schedulePlaybackRecovery('stalled');
-      });
+      }, options);
       video.addEventListener('error', () => {
-        if (playbackUsesPassthrough && nativePassthroughRetries === 0) {
-          nativePassthroughRetries++;
+        playback.attaching = false;
+        if (playback.usesPassthrough && playback.nativeRetries === 0) {
+          playback.nativeRetries++;
           if (requestPlaybackRecovery('native-direct-reload', true)) return;
         }
         useCompatibilityFallback('The browser rejected the original stream; using the compatibility fallback.');
         if (requestPlaybackRecovery('native-error', true)) return;
         showPlaybackError('Native media error');
-      });
+      }, options);
     }
 
     function longHlsLoadPolicy() {
@@ -1300,62 +1412,70 @@
 
     function playHls(src, enableSubtitles, streamConfig = {}) {
       const video = $('video');
-      video.style.opacity = 0;
-      setTimeout(() => { video.style.opacity = 1; }, 120);
-      lastStreamActivityAt = Date.now();
-      attachPlaybackRecovery(video);
+      if (playback.events) playback.events.abort();
+      playback.events = new AbortController();
+      playback.attaching = true;
+      const eventOptions = { signal: playback.events.signal };
+      playback.lastActivityAt = Date.now();
+      attachPlaybackRecovery(video, playback.events.signal);
 
       const reapplySubtitleDelay = () => applySubtitleDelay(video, subtitleDelay);
       if (enableSubtitles) {
-        watchSubtitleUpdates(video, reapplySubtitleDelay);
+        watchSubtitleUpdates(video, reapplySubtitleDelay, playback.events.signal);
       }
 
       let mainFragBuffered = false;
-      let subtitleFragLoaded = !enableSubtitles;
+      let playbackStartRequested = false;
       function currentPositionBuffered() {
-        const position = video.currentTime;
-        for (let index = 0; index < video.buffered.length; index++) {
-          if (position >= video.buffered.start(index) - 0.05 && position < video.buffered.end(index) + 0.05) {
-            return true;
-          }
-        }
-        return false;
-      }
-      function fragmentCoversPosition(fragment, position) {
-        const start = Number(fragment?.start);
-        const duration = Number(fragment?.duration);
-        if (!Number.isFinite(start) || !Number.isFinite(duration)) return false;
-        return position >= start - 0.25 && position < start + duration + 0.25;
-      }
-      function hideWarningOnce() {
-        if (mainFragBuffered && subtitleFragLoaded) {
-          removeWarning();
-        }
+        return playback.timeline.buffered(mediaBufferedRanges(video), video.currentTime);
       }
       function markStreamActive() {
         mainFragBuffered = currentPositionBuffered();
         if (!mainFragBuffered) return;
-        nativePassthroughRetries = 0;
-        lastStreamActivityAt = Date.now();
-        forcedRecoveryAttempts = 0;
+        playback.timeline.anchor(video.currentTime);
+        playback.nativeRetries = 0;
+        playback.lastActivityAt = Date.now();
+        playback.forcedRecoveryAttempts = 0;
         showPlaybackNotice();
-        hideWarningOnce();
+        removeWarning();
       }
       function markPlaybackProgress() {
-        lastStreamActivityAt = Date.now();
-        forcedRecoveryAttempts = 0;
+        playback.lastActivityAt = Date.now();
+        playback.forcedRecoveryAttempts = 0;
+      }
+      function requestPlaybackStart() {
+        if (playbackStartRequested || !video.paused) return;
+        playbackStartRequested = true;
+        video.play().catch(error => {
+          if (error?.name === 'NotAllowedError') {
+            removeWarning();
+            showMsg('playerMsg', 'Video is ready. Press Play to begin.', false, true);
+          } else {
+            playbackStartRequested = false;
+          }
+        });
       }
       video.addEventListener('seeking', () => {
         mainFragBuffered = currentPositionBuffered();
-        if (!mainFragBuffered && enableSubtitles) subtitleFragLoaded = false;
-      });
+      }, eventOptions);
 
       if (window.Hls && Hls.isSupported()) {
-        const segmentSeconds = Math.max(1, Number(streamConfig.segmentSeconds) || 6);
-        const windowSegments = Math.max(1, Number(streamConfig.windowSegments) || 5);
-        const forwardBuffer = segmentSeconds * Math.min(windowSegments, 2);
-        hls = new Hls({
-          startPosition: -1,
+        const segmentSeconds = Math.max(1, Number(streamConfig.segmentSeconds) || 2);
+        const windowSegments = Math.max(1, Number(streamConfig.windowSegments) || 15);
+        const forwardBuffer = Math.min(segmentSeconds * windowSegments, 12);
+        const duration = Number(streamConfig.duration);
+        const sourceStart = Math.max(0, Number(streamConfig.sourceStart) || 0);
+        const presentationStart = playback.timeline.configure({
+          sourceStart,
+          duration,
+          presentationOrigin: streamConfig.presentationOrigin,
+          seekable: playback.mediaSeekable,
+        });
+        playback.hls = new Hls({
+          startPosition: playback.timeline.absolute ? Math.max(sourceStart, presentationStart) : -1,
+          timelineOffset: playback.timeline.absolute ? presentationStart : undefined,
+          initialLiveManifestSize: 1,
+          liveSyncMode: 'buffered',
           maxBufferLength: forwardBuffer,
           maxMaxBufferLength: forwardBuffer,
           backBufferLength: segmentSeconds * 2,
@@ -1378,48 +1498,47 @@
           manifestLoadPolicy: longHlsLoadPolicy(),
           playlistLoadPolicy: longHlsLoadPolicy(),
         });
-        hls.loadSource(src);
-        hls.attachMedia(video);
-
-        hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          lastStreamActivityAt = Date.now();
-          if (enableSubtitles && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
-            hls.subtitleTrack = 0;
-            hls.subtitleDisplay = true;
+        playback.hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          playback.attaching = false;
+          playback.lastActivityAt = Date.now();
+          if (enableSubtitles && playback.hls.subtitleTracks && playback.hls.subtitleTracks.length > 0) {
+            playback.hls.subtitleTrack = 0;
+            playback.hls.subtitleDisplay = true;
             showSubtitleTextTracks(video);
             reapplySubtitleDelay();
           }
         });
+        playback.hls.on(Hls.Events.MEDIA_ATTACHED, (evt, data) => {
+          const mediaSource = data?.mediaSource;
+          if (!playback.timeline.absolute || mediaSource?.readyState !== 'open') return;
+          try {
+            mediaSource.duration = duration;
+          } catch (_) {
+            // hls.js reapplies the override when level details arrive.
+          }
+        });
         if (enableSubtitles) {
-          hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, () => {
+          playback.hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, () => {
             showSubtitleTextTracks(video);
             reapplySubtitleDelay();
           });
-          hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, () => {
+          playback.hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, () => {
             showSubtitleTextTracks(video);
             reapplySubtitleDelay();
           });
         }
-        hls.on(Hls.Events.FRAG_LOADED, (evt, data) => {
-          if (!data?.frag || data.frag.type === 'main') {
-            markPlaybackProgress();
-          } else {
-            if (data.frag.type === 'subtitle' && fragmentCoversPosition(data.frag, video.currentTime)) {
-              subtitleFragLoaded = true;
-              hideWarningOnce();
-            }
-            markPlaybackProgress();
-          }
-        });
-        hls.on(Hls.Events.FRAG_BUFFERED, (evt, data) => {
+        playback.hls.on(Hls.Events.FRAG_LOADED, markPlaybackProgress);
+        playback.hls.on(Hls.Events.FRAG_BUFFERED, (evt, data) => {
           if (!data?.frag || data.frag.type === 'main') {
             markStreamActive();
+            requestPlaybackStart();
           }
         });
-        hls.on(Hls.Events.ERROR, (evt, data) => {
+        playback.hls.on(Hls.Events.ERROR, (evt, data) => {
+          playback.attaching = false;
           if (enableSubtitles && data?.frag?.type === 'subtitle') {
             showMsg('playerMsg', `Subtitle error: ${data.details || 'could not load subtitles'}`, true);
-            beginHlsStatusPolling(currentSourceTime(video));
+            beginHlsStatusPolling(playback.timeline.sourceTime(video.currentTime));
             return;
           }
           const responseCode = Number(data?.response?.code || data?.response?.status || 0);
@@ -1430,7 +1549,7 @@
           }
           const levelEmpty = data.details === 'levelEmptyError' ||
             (Hls.ErrorDetails && data.details === Hls.ErrorDetails.LEVEL_EMPTY_ERROR);
-          if (levelEmpty && (mainFragBuffered || Date.now() - lastStreamActivityAt < 8000)) {
+          if (levelEmpty && (mainFragBuffered || Date.now() - playback.lastActivityAt < 8000)) {
             return;
           }
           if (data.fatal) {
@@ -1442,17 +1561,25 @@
             showPlaybackError(data.details || 'Fatal error');
           }
         });
+        playback.hls.loadSource(src);
+        playback.hls.attachMedia(playback.timeline.absolute
+          ? { media: video, overrides: { duration } }
+          : video);
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
-        video.addEventListener('canplay', markStreamActive, { once: true });
-        video.addEventListener('playing', markStreamActive);
-        video.addEventListener('progress', markPlaybackProgress);
-        video.addEventListener('timeupdate', markPlaybackProgress);
+        video.addEventListener('loadedmetadata', () => { playback.attaching = false; }, { once: true, signal: playback.events.signal });
+        video.addEventListener('canplay', () => {
+          markStreamActive();
+          requestPlaybackStart();
+        }, { once: true, signal: playback.events.signal });
+        video.addEventListener('playing', markStreamActive, eventOptions);
+        video.addEventListener('progress', markPlaybackProgress, eventOptions);
+        video.addEventListener('timeupdate', markPlaybackProgress, eventOptions);
         video.addEventListener('loadeddata', () => {
           markStreamActive();
           if (enableSubtitles) showSubtitleTextTracks(video);
           reapplySubtitleDelay();
-        }, { once: true });
+        }, { once: true, signal: playback.events.signal });
       } else {
         removeWarning();
         const message = window.Hls
@@ -1471,8 +1598,8 @@
       localStorage.setItem('subtitle-delay', subtitleDelay.toString());
       updateDelayDisplay();
       applySubtitleDelay($('video'), subtitleDelay);
-      if (hls && hls.subtitleTracks && hls.subtitleTracks.length > 0) {
-        hls.subtitleDisplay = true;
+      if (playback.hls && playback.hls.subtitleTracks && playback.hls.subtitleTracks.length > 0) {
+        playback.hls.subtitleDisplay = true;
       }
     }
     updateDelayDisplay();
@@ -1495,22 +1622,4 @@
     }
     if (mediaInfoClose && mediaInfoDialog) {
       mediaInfoClose.onclick = () => mediaInfoDialog.close();
-    }
-
-    const sourceSeek = $('sourceSeek');
-    if (sourceSeek) {
-      sourceSeek.addEventListener('input', () => {
-        sourceSeekDragging = true;
-        updateSourceTimeline(Number(sourceSeek.value));
-      });
-      sourceSeek.addEventListener('change', () => {
-        const target = Number(sourceSeek.value);
-        sourceSeekDragging = false;
-        updateSourceTimeline(target);
-        if (Number.isFinite(target)) startPlayback(target, { keepPlayerVisible: true });
-      });
-      sourceSeek.addEventListener('blur', () => {
-        sourceSeekDragging = false;
-        updateSourceTimeline();
-      });
     }

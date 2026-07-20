@@ -11,7 +11,11 @@ on:
       - '.github/workflows/**'
       - '.release-please-manifest.json'
       - 'release-please-config.json'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'playwright.config.mjs'
       - 'src/**'
+      - 'tests/e2e/**'
       - 'version.txt'
 
 permissions:
@@ -37,6 +41,21 @@ jobs:
       - name: Test
         working-directory: src
         run: go test ./...
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install browser test dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Test browser flows
+        run: npm run test:e2e
 
   release-please:
     runs-on: ubuntu-latest
@@ -95,6 +114,8 @@ jobs:
         with:
           context: ./src
           push: true
+          build-args: |
+            VERSION=${{ needs.release-please.outputs.tag_name }}
           tags: |
             nlipatov/cinemator:${{ needs.release-please.outputs.tag_name }}
             nlipatov/cinemator:latest

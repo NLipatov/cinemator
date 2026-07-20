@@ -100,7 +100,7 @@ func TestBuildStreamArgsPreservesResolutionAndBoundsPeakRate(t *testing.T) {
 	}
 }
 
-func TestCompatibilityAudioPreservesSourceChannelLayout(t *testing.T) {
+func TestCompatibilityAudioPreservesChannelCountWithSegmentSafeLayout(t *testing.T) {
 	info := domain.MediaInfo{
 		VideoCodec:  "vp9",
 		AudioTracks: []domain.AudioTrack{{Codec: "ac3", Channels: 6}},
@@ -109,8 +109,9 @@ func TestCompatibilityAudioPreservesSourceChannelLayout(t *testing.T) {
 		"full transcode": buildStreamArgs(info, StreamSelection{}),
 		"hybrid":         buildRemuxStreamArgs(info, StreamSelection{}),
 	} {
-		if slices.Contains(args, "-ac") {
-			t.Fatalf("%s args silently change the source channel count: %v", name, args)
+		joined := strings.Join(args, " ")
+		if !strings.Contains(joined, "-ac:a 6") {
+			t.Fatalf("%s args do not preserve six channels with a segment-safe AAC layout: %v", name, args)
 		}
 	}
 }

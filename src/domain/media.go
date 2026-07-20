@@ -13,6 +13,18 @@ var (
 	ErrHlsPlaylistChanged        = errors.New("HLS playlist changed")
 )
 
+type HlsPhase string
+
+const (
+	HlsPhaseProbing   HlsPhase = "probing"
+	HlsPhaseWaiting   HlsPhase = "waiting"
+	HlsPhasePreparing HlsPhase = "preparing"
+	HlsPhaseReady     HlsPhase = "ready"
+	HlsPhaseNoPeers   HlsPhase = "no_peers"
+	HlsPhaseStalled   HlsPhase = "stalled"
+	HlsPhaseError     HlsPhase = "error"
+)
+
 type AudioTrack struct {
 	Index      int    `json:"index"`
 	Codec      string `json:"codec"`
@@ -59,15 +71,17 @@ type MediaInfo struct {
 }
 
 type HlsStatus struct {
-	Phase         string    `json:"phase"`
-	Mode          string    `json:"mode,omitempty"`
-	TargetSeconds float64   `json:"targetSeconds"`
-	StartedAt     time.Time `json:"startedAt"`
-	LastProgress  time.Time `json:"lastProgress"`
-	BytesRead     int64     `json:"bytesRead"`
-	ActivePeers   int       `json:"activePeers"`
-	TotalPeers    int       `json:"totalPeers"`
-	Seekable      bool      `json:"seekable"`
-	Duration      float64   `json:"duration"`
-	Message       string    `json:"message,omitempty"`
+	Phase                     HlsPhase  `json:"phase"`
+	Generation                string    `json:"generation"`
+	Mode                      string    `json:"mode,omitempty"`
+	TargetSeconds             float64   `json:"targetSeconds"`
+	PresentationOriginSeconds float64   `json:"presentationOriginSeconds"`
+	StartedAt                 time.Time `json:"startedAt"`
+	LastProgress              time.Time `json:"lastProgress"`
+	BytesRead                 int64     `json:"bytesRead"`
+	ActivePeers               int       `json:"activePeers"`
+	TotalPeers                int       `json:"totalPeers"`
+	Seekable                  bool      `json:"seekable"`
+	Duration                  float64   `json:"duration"`
+	Message                   string    `json:"message,omitempty"`
 }

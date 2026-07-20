@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -304,7 +306,7 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 			if got := rec.Header().Get("Allow"); got != tt.wantAllow {
 				t.Fatalf("Allow = %q, want %q", got, tt.wantAllow)
 			}
-			if tt.accept == "application/json" && (!strings.Contains(rec.Body.String(), `"playlist":"/api/hls/stream/master.m3u8"`) || !strings.Contains(rec.Body.String(), `"stream":"stream"`) || !strings.Contains(rec.Body.String(), `"segmentDurationSeconds":6`) || !strings.Contains(rec.Body.String(), `"windowSegments":5`)) {
+			if tt.accept == "application/json" && (!strings.Contains(rec.Body.String(), `"playlist":"/api/hls/stream/master.m3u8"`) || !strings.Contains(rec.Body.String(), `"stream":"stream"`) || !strings.Contains(rec.Body.String(), `"segmentDurationSeconds":2`) || !strings.Contains(rec.Body.String(), `"windowSegments":15`)) {
 				t.Fatalf("body = %q", rec.Body.String())
 			}
 		})
@@ -386,7 +388,7 @@ func TestHandleGetMediaInfoExposesPlaybackCapabilities(t *testing.T) {
 }
 
 func TestHandleGetHlsStatus(t *testing.T) {
-	want := domain.HlsStatus{Phase: "preparing", TargetSeconds: 72, BytesRead: 4096, ActivePeers: 2, TotalPeers: 4}
+	want := domain.HlsStatus{Phase: "preparing", Generation: "generation-2", TargetSeconds: 72, BytesRead: 4096, ActivePeers: 2, TotalPeers: 4}
 	call := statusHlsCall{}
 	stream := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_0_a0_s-1"
 	server := HttpServer{mgr: fakeTorrentManager{status: want, statusCall: &call}, settings: settings.NewSettings()}
@@ -398,7 +400,9 @@ func TestHandleGetHlsStatus(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"phase":"preparing"`) || !strings.Contains(rec.Body.String(), `"bytesRead":4096`) {
+	if !strings.Contains(rec.Body.String(), `"phase":"preparing"`) ||
+		!strings.Contains(rec.Body.String(), `"generation":"generation-2"`) ||
+		!strings.Contains(rec.Body.String(), `"bytesRead":4096`) {
 		t.Fatalf("body = %q", rec.Body.String())
 	}
 	if got := rec.Header().Get("Cache-Control"); got != "no-store" {
@@ -585,6 +589,63 @@ func TestHandleDownloadEventsStreamsChangedEvents(t *testing.T) {
 	events <- struct{}{}
 	if block := readSSEBlock(t, reader); !strings.Contains(block, "event: changed\n") {
 		t.Fatalf("changed SSE block = %q, want changed event", block)
+	}
+}
+
+func TestRunCancelsDownloadEventsBeforeGracefulShutdown(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on ephemeral port: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close ephemeral listener: %v", err)
+	}
+	t.Setenv("CINEMATOR_HTTP_PORT", strconv.Itoa(port))
+
+	server := HttpServer{
+		mgr:      fakeTorrentManager{events: make(chan struct{})},
+		settings: settings.NewSettings(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runResult := make(chan error, 1)
+	go func() { runResult <- server.Run(ctx) }()
+
+	transport := &http.Transport{ResponseHeaderTimeout: time.Second}
+	t.Cleanup(transport.CloseIdleConnections)
+	client := &http.Client{Transport: transport}
+	url := "http://127.0.0.1:" + strconv.Itoa(port) + "/api/downloads/events"
+	deadline := time.Now().Add(2 * time.Second)
+	var response *http.Response
+	for response == nil {
+		response, err = client.Get(url)
+		if err == nil {
+			break
+		}
+		select {
+		case runErr := <-runResult:
+			t.Fatalf("server exited before accepting requests: %v", runErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connect to server: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusOK)
+	}
+
+	cancel()
+	select {
+	case err := <-runResult:
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop while an SSE connection was open")
 	}
 }
 

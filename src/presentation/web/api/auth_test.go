@@ -309,7 +309,7 @@ func TestMissingPasswordHashLeavesApplicationPublic(t *testing.T) {
 	}
 
 	status := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/api/auth/status", nil), nil)
-	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"enabled":false`) {
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"enabled":false`) || !strings.Contains(status.Body.String(), `"version":"dev-build"`) {
 		t.Fatalf("auth status = %d %q", status.Code, status.Body.String())
 	}
 }

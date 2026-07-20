@@ -3,9 +3,11 @@ module cinemator
 go 1.25.0
 
 require (
+	github.com/anacrolix/generics v0.2.0
 	github.com/anacrolix/missinggo/v2 v2.10.0
 	github.com/anacrolix/torrent v1.61.0
 	golang.org/x/crypto v0.54.0
+	golang.org/x/sys v0.47.0
 	golang.org/x/time v0.15.0
 )
 
@@ -16,7 +18,6 @@ require (
 	github.com/anacrolix/chansync v0.8.0 // indirect
 	github.com/anacrolix/dht/v2 v2.24.0 // indirect
 	github.com/anacrolix/envpprof v1.5.0 // indirect
-	github.com/anacrolix/generics v0.2.0 // indirect
 	github.com/anacrolix/go-libutp v1.4.0 // indirect
 	github.com/anacrolix/log v0.17.1-0.20251118025802-918f1157b7bb // indirect
 	github.com/anacrolix/missinggo v1.3.0 // indirect
@@ -87,7 +88,6 @@ require (
 	golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597 // indirect
 	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 	modernc.org/libc v1.74.1 // indirect
@@ -96,3 +96,5 @@ require (
 	modernc.org/sqlite v1.54.0 // indirect
 	zombiezen.com/go/sqlite v1.4.2 // indirect
 )
+
+replace github.com/anacrolix/torrent => github.com/NLipatov/torrent v1.61.1-0.20260719140349-6ece66cdf7a0

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestHlsAssetStoreDoesNotUnlinkLeasedFile(t *testing.T) {
@@ -40,6 +41,39 @@ func TestHlsAssetStoreDoesNotUnlinkLeasedFile(t *testing.T) {
 	}
 	if removed, err := store.TryEvict(path); err != nil || !removed {
 		t.Fatalf("TryEvict() after close = %t, %v", removed, err)
+	}
+}
+
+func TestHlsAssetStoreTouchesOnlyManagedRegularFiles(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "stream", "chunk.ts")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("segment"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Unix(1, 0)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	store, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if !store.Touch(path, time.Second) {
+		t.Fatal("managed asset was not found")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.ModTime().After(old) {
+		t.Fatalf("modification time = %v, want after %v", info.ModTime(), old)
+	}
+	if store.Touch(filepath.Join(t.TempDir(), "outside.ts"), 0) {
+		t.Fatal("asset outside the cache was accepted")
 	}
 }
 

@@ -31,3 +31,8 @@ go.work.sum
 *.db
 *.db-shm
 *.db-wal
+
+# Browser test artifacts
+/node_modules/
+/playwright-report/
+/test-results/

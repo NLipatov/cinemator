@@ -13,6 +13,7 @@
     <div class="topbar-inner">
       <div class="brand">
         <span class="brand-name">cinemator</span>
+        <span class="brand-version" id="appVersion">dev-build</span>
       </div>
       <div class="top-actions">
         <button class="auth-logout" id="logoutBtn" type="button" hidden>Sign out</button>
@@ -93,10 +94,6 @@
       <div id="player-block" class="player-stage step" style="display:none">
         <video id="video" controls autoplay playsinline></video>
         <div class="player-toolbar">
-          <label id="sourceTimeline" class="source-timeline" hidden>
-            <span id="sourceTime">0:00 / 0:00</span>
-            <input id="sourceSeek" type="range" min="0" max="0" step="0.1" value="0" aria-label="Seek in source video">
-          </label>
           <button id="mediaInfoBtn" class="media-info-button" type="button" hidden>Media info</button>
         </div>
         <div class="msg" id="playerMsg"></div>

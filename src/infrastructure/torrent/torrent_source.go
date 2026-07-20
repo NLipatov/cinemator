@@ -288,6 +288,7 @@ func addMagnet(client *torrent.Client, magnet string) (*torrent.Torrent, error) 
 	if err != nil {
 		return nil, err
 	}
+	spec.Trackers = supportedTrackerTiers(spec.Trackers)
 	spec.IgnoreUnverifiedPieceCompletion = true
 	t, _, err := client.AddTorrentSpec(spec)
 	if err != nil {
@@ -297,4 +298,25 @@ func addMagnet(client *torrent.Client, magnet string) (*torrent.Torrent, error) 
 		return nil, fmt.Errorf("torrent not created")
 	}
 	return t, nil
+}
+
+func supportedTrackerTiers(tiers [][]string) [][]string {
+	filtered := make([][]string, 0, len(tiers))
+	for _, tier := range tiers {
+		trackers := make([]string, 0, len(tier))
+		for _, tracker := range tier {
+			u, err := url.Parse(tracker)
+			if err != nil {
+				continue
+			}
+			switch u.Scheme {
+			case "http", "https", "udp", "udp4", "udp6", "ws", "wss":
+				trackers = append(trackers, tracker)
+			}
+		}
+		if len(trackers) != 0 {
+			filtered = append(filtered, trackers)
+		}
+	}
+	return filtered
 }

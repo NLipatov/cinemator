@@ -21,11 +21,12 @@ import (
 // pieceCacheProvider disables filecache's independent capacity eviction and
 // serializes every open, writer reservation and unlink under one lock.
 type pieceCacheProvider struct {
-	cache    *filecache.Cache
-	base     resource.Provider
-	root     string
-	capacity int64
-	disk     *diskBudget
+	cache   *filecache.Cache
+	base    resource.Provider
+	root    string
+	budget  *cacheBudget
+	disk    *diskBudget
+	onEvict func([]string)
 
 	mu       sync.Mutex
 	leases   map[string]int
@@ -34,14 +35,14 @@ type pieceCacheProvider struct {
 	reserved int64
 }
 
-func newPieceCacheProvider(cache *filecache.Cache, root string, capacity int64, disk *diskBudget) *pieceCacheProvider {
+func newPieceCacheProvider(cache *filecache.Cache, root string, budget *cacheBudget, disk *diskBudget) *pieceCacheProvider {
 	// A negative capacity prevents filecache from unlinking behind our leases.
 	cache.SetCapacity(-1)
 	return &pieceCacheProvider{
 		cache:    cache,
 		base:     cache.AsResourceProvider(),
 		root:     root,
-		capacity: capacity,
+		budget:   budget,
 		disk:     disk,
 		leases:   make(map[string]int),
 		writers:  make(map[string]bool),
@@ -249,12 +250,16 @@ type pieceWriteReservation struct {
 }
 
 func (p *pieceCacheProvider) beginWrite(location string, finalSize int64) (pieceWriteReservation, error) {
+	p.budget.mu.Lock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.leases[location] != 0 {
+		p.mu.Unlock()
+		p.budget.mu.Unlock()
 		return pieceWriteReservation{}, fmt.Errorf("torrent piece is in use: %s", location)
 	}
 	if p.retiring[location] {
+		p.mu.Unlock()
+		p.budget.mu.Unlock()
 		return pieceWriteReservation{}, fmt.Errorf("torrent piece is being removed: %s", location)
 	}
 	current := int64(0)
@@ -262,18 +267,27 @@ func (p *pieceCacheProvider) beginWrite(location string, finalSize int64) (piece
 	if info, err := p.statFileLocked(location); err == nil {
 		current = info.Size()
 	} else if !errors.Is(err, os.ErrNotExist) {
+		p.mu.Unlock()
+		p.budget.mu.Unlock()
 		return pieceWriteReservation{}, err
 	} else {
 		inodes = 1
 	}
 	growth := max(int64(0), finalSize-current)
-	if err := p.makeRoomLocked(growth, location); err != nil {
+	removed, err := p.makeRoomLocked(growth, location)
+	if err != nil {
+		p.mu.Unlock()
+		p.budget.mu.Unlock()
+		p.notifyEvicted(removed)
 		return pieceWriteReservation{}, err
 	}
 	var diskReservation *diskReservation
 	if p.disk != nil {
 		reservation, err := p.disk.Reserve(uint64(growth), inodes)
 		if err != nil {
+			p.mu.Unlock()
+			p.budget.mu.Unlock()
+			p.notifyEvicted(removed)
 			return pieceWriteReservation{}, err
 		}
 		diskReservation = reservation
@@ -281,6 +295,9 @@ func (p *pieceCacheProvider) beginWrite(location string, finalSize int64) (piece
 	p.reserved += growth
 	p.leases[location]++
 	p.writers[location] = true
+	p.mu.Unlock()
+	p.budget.mu.Unlock()
+	p.notifyEvicted(removed)
 	return pieceWriteReservation{location: location, bytes: growth, disk: diskReservation}, nil
 }
 
@@ -310,8 +327,8 @@ func (p *pieceCacheProvider) finishWrite(reservation pieceWriteReservation, writ
 func (p *pieceCacheProvider) remove(location string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.retiring[location] = true
 	if p.leases[location] != 0 {
-		p.retiring[location] = true
 		return nil
 	}
 	return p.removeLocked(location)
@@ -362,9 +379,13 @@ func (p *pieceCacheProvider) filePath(location string) string {
 }
 
 func (p *pieceCacheProvider) trimToCapacity() error {
+	p.budget.mu.Lock()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.makeRoomLocked(0, "")
+	removed, err := p.makeRoomLocked(0, "")
+	p.mu.Unlock()
+	p.budget.mu.Unlock()
+	p.notifyEvicted(removed)
+	return err
 }
 
 func (p *pieceCacheProvider) hasLeases() bool {
@@ -373,22 +394,28 @@ func (p *pieceCacheProvider) hasLeases() bool {
 	return len(p.leases) != 0
 }
 
-func (p *pieceCacheProvider) makeRoomLocked(growth int64, protected string) error {
-	if p.capacity <= 0 {
-		return nil
+func (p *pieceCacheProvider) makeRoomLocked(growth int64, protected string) ([]string, error) {
+	if p.budget.limit <= 0 {
+		return nil, nil
 	}
-	info := p.cache.Info()
-	target := p.capacity - p.reserved - growth
+	target := p.budget.limit - p.budget.hlsBytes - p.budget.hlsReserved - p.reserved - growth
 	if target < 0 {
-		return fmt.Errorf("torrent piece cache cannot reserve %d bytes", growth)
+		return nil, fmt.Errorf("shared cache cannot reserve %d torrent bytes", growth)
 	}
+	_, removed, err := p.trimLocked(target, protected)
+	return removed, err
+}
+
+func (p *pieceCacheProvider) trimLocked(target int64, protected string) (int64, []string, error) {
+	info := p.cache.Info()
 	if info.Filled <= target {
-		return nil
+		return info.Filled, nil, nil
 	}
 	var candidates []filecache.ItemInfo
 	p.cache.WalkItems(func(item filecache.ItemInfo) { candidates = append(candidates, item) })
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Accessed.Before(candidates[j].Accessed) })
 	filled := info.Filled
+	var removed []string
 	for _, candidate := range candidates {
 		if filled <= target {
 			break
@@ -401,11 +428,33 @@ func (p *pieceCacheProvider) makeRoomLocked(growth int64, protected string) erro
 			continue
 		}
 		filled -= candidate.Size
+		removed = append(removed, location)
 	}
 	if filled > target {
-		return fmt.Errorf("torrent piece cache needs %d more bytes; existing pieces are in use", filled-target)
+		return filled, removed, fmt.Errorf("shared cache needs %d more bytes; existing torrent pieces are in use", filled-target)
 	}
-	return nil
+	return filled, removed, nil
+}
+
+// trimTo is called with budget.mu held so new HLS and piece reservations cannot
+// race the shared target calculation.
+func (p *pieceCacheProvider) trimTo(target int64) (int64, []string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	filled, removed, err := p.trimLocked(max(0, target-p.reserved), "")
+	return filled + p.reserved, removed, err
+}
+
+func (p *pieceCacheProvider) usedBytes() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.cache.Info().Filled + p.reserved
+}
+
+func (p *pieceCacheProvider) notifyEvicted(locations []string) {
+	if len(locations) != 0 && p.onEvict != nil {
+		p.onEvict(locations)
+	}
 }
 
 type pieceCacheInstance struct {
@@ -441,7 +490,7 @@ func (i *pieceCacheInstance) Stat() (os.FileInfo, error) {
 func (i *pieceCacheInstance) ReadAt(data []byte, offset int64) (int, error) {
 	reader, err := i.Get()
 	if err != nil {
-		return 0, err
+		return 0, i.retireFailedCompleteRead(err)
 	}
 	readAt, ok := reader.(io.ReaderAt)
 	if !ok {
@@ -449,11 +498,24 @@ func (i *pieceCacheInstance) ReadAt(data []byte, offset int64) (int, error) {
 		return 0, errors.New("piece cache reader does not support ReaderAt")
 	}
 	n, readErr := readAt.ReadAt(data, offset)
+	if n == 0 && readErr != nil {
+		readErr = i.retireFailedCompleteRead(readErr)
+	}
 	closeErr := reader.Close()
 	if readErr == nil {
 		readErr = closeErr
 	}
 	return n, readErr
+}
+
+func (i *pieceCacheInstance) retireFailedCompleteRead(readErr error) error {
+	if !strings.HasPrefix(i.location, "completed/") {
+		return readErr
+	}
+	if err := i.provider.remove(i.location); err != nil {
+		return errors.Join(readErr, fmt.Errorf("retire unreadable torrent piece: %w", err))
+	}
+	return readErr
 }
 
 func (i *pieceCacheInstance) WriteAt(data []byte, offset int64) (int, error) {

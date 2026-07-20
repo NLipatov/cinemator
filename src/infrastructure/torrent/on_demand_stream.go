@@ -57,7 +57,7 @@ func (m *manager) initializeOnDemandStream(key streamKey, s *streamInfo) {
 			s.mtx.Lock()
 			s.readyErr = err
 			s.fatalErr = err
-			s.status.Phase = "error"
+			s.status.Phase = domain.HlsPhaseError
 			s.status.Message = publicStreamError(err)
 			s.status.LastProgress = time.Now()
 			close(s.ready)
@@ -88,34 +88,29 @@ func (m *manager) initializeOnDemandStream(key streamKey, s *streamInfo) {
 	}
 	if err == nil {
 		info.Seekable = info.Duration > 0
-		if info.Duration > 0 && s.presentationTarget >= info.Duration {
-			err = fmt.Errorf("%w: start position is outside media duration", domain.ErrBadHlsRequest)
-		}
 	}
+	target := m.timeline(info.Duration).locate(s.presentationTarget)
 	directPlay := err == nil && ffmpeg.CanRemuxHLS(info, s.selection)
 	if err == nil {
 		err = func() error {
 			s.playlistMtx.Lock()
 			defer s.playlistMtx.Unlock()
-			var reservation *diskReservation
-			if m.hlsDisk != nil {
-				var reserveErr error
-				reservation, reserveErr = m.hlsDisk.Reserve(estimatedHlsMetadataBytes(info.Duration, m.settings.HlsSegmentDuration(), s.selection.SubtitleTrackIndex >= 0), 8)
-				if reserveErr != nil {
-					return reserveErr
-				}
-				defer reservation.Release()
-			}
-			return ffmpeg.PrepareOnDemandHLS(
-				s.paths.outDir,
-				s.paths.videoPlaylist,
-				s.paths.subtitlePlaylist,
-				s.paths.masterPlaylist,
-				info,
-				s.selection,
-				m.settings.HlsSegmentDuration(),
-				m.settings.HlsWindowSegments(),
-				s.assetVersion,
+			return m.media.publishHls(
+				estimatedHlsMetadataBytes(info.Duration, m.settings.HlsSegmentDuration(), s.selection.SubtitleTrackIndex >= 0),
+				8,
+				func() error {
+					return ffmpeg.PrepareOnDemandHLS(
+						s.paths.outDir,
+						s.paths.videoPlaylist,
+						s.paths.subtitlePlaylist,
+						s.paths.masterPlaylist,
+						info,
+						s.selection,
+						m.settings.HlsSegmentDuration(),
+						m.settings.HlsWindowSegments(),
+						s.assetVersion,
+					)
+				},
 			)
 		}()
 	}
@@ -127,13 +122,18 @@ func (m *manager) initializeOnDemandStream(key streamKey, s *streamInfo) {
 	s.readyErr = err
 	if err != nil {
 		s.fatalErr = err
-		s.status.Phase = "error"
+		s.status.Phase = domain.HlsPhaseError
 		if s.status.Message == "" {
 			s.status.Message = publicStreamError(err)
 		}
 	} else {
-		s.status.Phase = "waiting"
+		s.presentationTarget = target.sourceSeconds
+		s.progressiveAdvertised = target.segment
+		s.progressiveSubtitles = target.segment
+		s.playbackWindow = target.windowBegin
+		s.status.Phase = domain.HlsPhaseWaiting
 		s.status.Mode = ffmpeg.HLSMode(info, s.selection)
+		s.status.TargetSeconds = target.sourceSeconds
 		s.status.Seekable = info.Seekable
 		s.status.Duration = info.Duration
 	}
@@ -146,6 +146,10 @@ func (m *manager) initializeOnDemandStream(key streamKey, s *streamInfo) {
 		return
 	}
 	m.prefetchProgressiveWindow(s, -1)
+}
+
+func (m *manager) timeline(durationSeconds float64) playbackTimeline {
+	return newPlaybackTimeline(m.settings.HlsSegmentDuration(), m.settings.HlsWindowSegments(), durationSeconds)
 }
 
 func estimatedHlsMetadataBytes(duration float64, segmentDuration time.Duration, subtitles bool) uint64 {
@@ -187,9 +191,7 @@ func (m *manager) OpenHlsAsset(ctx context.Context, streamDir, assetName, versio
 			stream.playlistMtx.RLock()
 			unlockPlaylist = stream.playlistMtx.RUnlock
 		}
-		stream.mtx.Lock()
-		currentVersion := stream.assetVersion
-		stream.mtx.Unlock()
+		currentVersion := stream.currentAssetVersion()
 		if assetName != "master.m3u8" && version != currentVersion {
 			if unlockPlaylist != nil {
 				unlockPlaylist()
@@ -197,7 +199,7 @@ func (m *manager) OpenHlsAsset(ctx context.Context, streamDir, assetName, versio
 			stream.generationMtx.RUnlock()
 			return application.HlsAsset{}, domain.ErrHlsPlaylistChanged
 		}
-		asset, err := m.assets.Open(filepath.Join(m.settings.HlsPath(), streamDir, assetName))
+		asset, err := m.media.openHls(filepath.Join(m.settings.HlsPath(), streamDir, assetName))
 		stream.generationMtx.RUnlock()
 		if err == nil {
 			if unlockPlaylist != nil {
@@ -230,13 +232,12 @@ func (a *lockedHlsAsset) Close() error {
 	return a.err
 }
 
-// evictActiveHlsAssets rotates one presentation generation and removes the
-// already selected assets. The caller holds generationMtx from CanEvict through
-// this call so no HTTP open can invalidate that selection.
-func (m *manager) evictActiveHlsAssets(stream *streamInfo, items []hlsCacheItem) (map[string]struct{}, error) {
-	removed := make(map[string]struct{}, len(items))
+// unpublishActiveHlsAssets rotates one presentation generation so the cache
+// coordinator can evict the selected immutable assets. The caller holds
+// generationMtx from selection through physical eviction.
+func (m *manager) unpublishActiveHlsAssets(stream *streamInfo, items []hlsCacheItem) error {
 	if len(items) == 0 {
-		return removed, nil
+		return nil
 	}
 
 	stream.playlistMtx.Lock()
@@ -251,14 +252,14 @@ func (m *manager) evictActiveHlsAssets(stream *streamInfo, items []hlsCacheItem)
 			evictedOwners[owner] = struct{}{}
 		}
 		if index, ok := parseSegmentName(name, "chunk_", ".ts"); ok {
-			owner, _ := segmentWindow(index, 0, m.settings.HlsWindowSegments())
+			owner, _ := m.timeline(0).windowForSegment(index)
 			evictedOwners[owner] = struct{}{}
 		}
 	}
 	stream.mtx.Lock()
 	if stream.closing || stream.fatalErr != nil || stream.assetVersion == "" {
 		stream.mtx.Unlock()
-		return removed, nil
+		return nil
 	}
 	version := fmt.Sprintf("%x", time.Now().UnixNano())
 	info := stream.mediaInfo
@@ -285,65 +286,59 @@ func (m *manager) evictActiveHlsAssets(stream *streamInfo, items []hlsCacheItem)
 		fragments = append(fragments, window...)
 	}
 	stream.mtx.Unlock()
-	var reservation *diskReservation
-	var err error
-	if m.hlsDisk != nil {
-		reservation, err = m.hlsDisk.Reserve(estimatedHlsMetadataBytes(info.Duration, m.settings.HlsSegmentDuration(), selection.SubtitleTrackIndex >= 0), 4)
-		if err != nil {
-			stream.mtx.Lock()
-			stream.fatalErr = err
-			stream.status.Phase = "error"
-			stream.status.Message = publicStreamError(err)
-			stream.status.LastProgress = time.Now()
-			stream.mtx.Unlock()
-			return removed, err
-		}
-		defer reservation.Release()
-	}
-
-	err = ffmpeg.PrepareOnDemandHLS(
-		stream.paths.outDir,
-		stream.paths.videoPlaylist,
-		stream.paths.subtitlePlaylist,
-		stream.paths.masterPlaylist,
-		info,
-		selection,
-		m.settings.HlsSegmentDuration(),
-		m.settings.HlsWindowSegments(),
-		version,
-	)
-	if err == nil {
-		err = ffmpeg.UpdateMaterializedHLS(
-			stream.paths.videoPlaylist,
-			materializedTarget,
-			version,
-			directPlay && ffmpeg.UsesFMP4(info, selection),
-			progressiveSequence,
-			progressiveDiscontinuitySequence,
-			presentationTarget,
-			progressiveEnded,
-			fragments,
-		)
-		if err == nil && ffmpeg.UsesTextSubtitles(info, selection) {
-			err = ffmpeg.UpdateProgressiveSubtitleHLS(
+	err := m.media.publishHls(
+		estimatedHlsMetadataBytes(info.Duration, m.settings.HlsSegmentDuration(), selection.SubtitleTrackIndex >= 0),
+		4,
+		func() error {
+			err := ffmpeg.PrepareOnDemandHLS(
+				stream.paths.outDir,
+				stream.paths.videoPlaylist,
 				stream.paths.subtitlePlaylist,
+				stream.paths.masterPlaylist,
+				info,
+				selection,
 				m.settings.HlsSegmentDuration(),
 				m.settings.HlsWindowSegments(),
 				version,
-				progressiveSubtitles,
-				progressiveLast,
-				progressiveEnded && progressiveSubtitles >= progressiveCount,
 			)
-		}
-	}
+			if err != nil {
+				return err
+			}
+			if err = ffmpeg.UpdateMaterializedHLS(
+				stream.paths.videoPlaylist,
+				materializedTarget,
+				version,
+				directPlay && ffmpeg.UsesFMP4(info, selection),
+				progressiveSequence,
+				progressiveDiscontinuitySequence,
+				presentationTarget,
+				progressiveEnded,
+				fragments,
+			); err != nil {
+				return err
+			}
+			if ffmpeg.UsesTextSubtitles(info, selection) {
+				return ffmpeg.UpdateProgressiveSubtitleHLS(
+					stream.paths.subtitlePlaylist,
+					m.settings.HlsSegmentDuration(),
+					m.settings.HlsWindowSegments(),
+					version,
+					progressiveSubtitles,
+					progressiveLast,
+					progressiveEnded && progressiveSubtitles >= progressiveCount,
+				)
+			}
+			return nil
+		},
+	)
 	stream.mtx.Lock()
 	if err != nil {
 		stream.fatalErr = fmt.Errorf("rotate HLS generation: %w", err)
-		stream.status.Phase = "error"
+		stream.status.Phase = domain.HlsPhaseError
 		stream.status.Message = publicStreamError(stream.fatalErr)
 		stream.status.LastProgress = time.Now()
 		stream.mtx.Unlock()
-		return removed, stream.fatalErr
+		return stream.fatalErr
 	}
 	stream.directWindows = directWindows
 	stream.progressiveSequence = progressiveSequence
@@ -351,17 +346,7 @@ func (m *manager) evictActiveHlsAssets(stream *streamInfo, items []hlsCacheItem)
 	stream.materializedTarget = materializedTarget
 	stream.assetVersion = version
 	stream.mtx.Unlock()
-
-	for _, item := range items {
-		ok, removeErr := m.assets.TryEvict(item.path)
-		if removeErr != nil {
-			return removed, removeErr
-		}
-		if ok {
-			removed[item.path] = struct{}{}
-		}
-	}
-	return removed, nil
+	return nil
 }
 
 func (m *manager) ensureHlsAsset(ctx context.Context, streamDir, assetName, version string) error {
@@ -397,7 +382,14 @@ func (m *manager) ensureHlsAsset(ctx context.Context, streamDir, assetName, vers
 		return domain.ErrHlsPlaylistChanged
 	}
 	if strings.HasSuffix(assetName, ".m3u8") {
-		if assetName == "subs.m3u8" {
+		if assetName == filepath.Base(s.paths.videoPlaylist) {
+			s.mtx.Lock()
+			needsStartup := s.materializedTarget <= 0
+			s.mtx.Unlock()
+			if needsStartup {
+				m.prefetchProgressiveWindow(s, -1)
+			}
+		} else if assetName == "subs.m3u8" {
 			s.mtx.Lock()
 			begin, end := s.progressiveSubtitles, s.progressiveAdvertised
 			s.mtx.Unlock()
@@ -411,8 +403,14 @@ func (m *manager) ensureHlsAsset(ctx context.Context, streamDir, assetName, vers
 	}
 	if directAsset {
 		path := filepath.Join(s.paths.outDir, assetName)
-		if touchExisting(path) {
-			m.prefetchProgressiveWindow(s, owner)
+		s.mtx.Lock()
+		s.playbackWindow = owner
+		s.mtx.Unlock()
+		if m.media.touchHls(path) {
+			s.mtx.Lock()
+			requested := directPrefetchIndexLocked(s, owner, assetName)
+			s.mtx.Unlock()
+			m.prefetchProgressiveWindow(s, requested)
 			return nil
 		}
 		s.mtx.Lock()
@@ -421,26 +419,32 @@ func (m *manager) ensureHlsAsset(ctx context.Context, streamDir, assetName, vers
 		if err := m.ensureVideoSegment(ctx, s, owner); err != nil {
 			return err
 		}
-		if !touchExisting(path) {
+		if !m.media.touchHls(path) {
 			return domain.ErrHlsPlaylistChanged
 		}
-		m.prefetchProgressiveWindow(s, owner)
+		s.mtx.Lock()
+		requested := directPrefetchIndexLocked(s, owner, assetName)
+		s.mtx.Unlock()
+		m.prefetchProgressiveWindow(s, requested)
 		return nil
 	}
 	if index, ok := parseSegmentName(assetName, "chunk_", ".ts"); ok {
 		path := filepath.Join(s.paths.outDir, assetName)
-		if touchExisting(path) {
+		begin, _ := m.timeline(0).windowForSegment(index)
+		s.mtx.Lock()
+		s.playbackWindow = begin
+		s.mtx.Unlock()
+		if m.media.touchHls(path) {
 			m.prefetchProgressiveWindow(s, index)
 			return nil
 		}
 		s.mtx.Lock()
-		begin, _ := segmentWindow(index, 0, m.settings.HlsWindowSegments())
 		delete(s.directWindows, begin)
 		s.mtx.Unlock()
 		if err := m.ensureVideoSegment(ctx, s, index); err != nil {
 			return err
 		}
-		if !touchExisting(path) {
+		if !m.media.touchHls(path) {
 			return domain.ErrHlsPlaylistChanged
 		}
 		m.prefetchProgressiveWindow(s, index)
@@ -450,6 +454,61 @@ func (m *manager) ensureHlsAsset(ctx context.Context, streamDir, assetName, vers
 		return m.ensureSubtitleSegment(ctx, s, index)
 	}
 	return domain.ErrHlsAssetUnsupported
+}
+
+// requestVideoTarget turns a prepare request into work owned by the existing
+// playback session. It never creates a second presentation for a seek.
+func (m *manager) requestVideoTarget(s *streamInfo, target playbackTarget) {
+	if s == nil {
+		return
+	}
+	if !channelClosed(s.ready) {
+		go func() {
+			if s.waitReady(s.ctx) == nil {
+				m.requestVideoTarget(s, target)
+			}
+		}()
+		return
+	}
+
+	s.markPreparing(target.segment, target.sourceSeconds)
+	s.mtx.Lock()
+	if s.closing || s.fatalErr != nil {
+		s.mtx.Unlock()
+		return
+	}
+	if directFragmentsCoverTime(s.directWindows, target.sourceSeconds) {
+		s.mtx.Unlock()
+		s.markReady(target.segment)
+		return
+	}
+	timeline := m.timeline(s.mediaInfo.Duration)
+	if !timeline.containsSegment(target.segment) {
+		s.mtx.Unlock()
+		s.markSegmentError(target.segment, errors.New("video segment out of range"))
+		return
+	}
+	begin := target.segment
+	end := begin + 1
+	_, followEnd := timeline.windowForSegment(begin)
+	if total := timeline.segmentCount(); total > 0 {
+		end = min(end, total)
+	}
+	job, jobCtx, created, err := s.acquireJobLocked(videoSegmentJob, target.segment, begin, end, false, m.scheduler, m.settings.MaxJobsPerStream())
+	if err != nil {
+		s.mtx.Unlock()
+		s.markSegmentError(target.segment, err)
+		return
+	}
+	s.presentationTarget = target.sourceSeconds
+	if created {
+		job.followEnd = followEnd
+		job.targetSeconds = target.sourceSeconds
+	}
+	s.mtx.Unlock()
+	if created {
+		go m.runVideoJob(s, jobCtx, job)
+	}
 }
 
 func (m *manager) ensureVideoSegment(ctx context.Context, s *streamInfo, index int) error {
@@ -465,8 +524,8 @@ func (m *manager) ensureVideoSegment(ctx context.Context, s *streamInfo, index i
 		return fatalErr
 	}
 	path := filepath.Join(s.paths.outDir, videoSegmentName(index))
-	if touchExisting(path) {
-		s.markPreparing(index, m.settings.HlsSegmentDuration())
+	if m.media.touchHls(path) {
+		s.markPreparing(index, m.timeline(0).segmentStart(index))
 		s.markReady(index)
 		m.prefetchProgressiveWindow(s, index)
 		return nil
@@ -484,8 +543,9 @@ func (m *manager) ensureVideoSegment(ctx context.Context, s *streamInfo, index i
 	}
 	total := 0
 	if s.mediaInfo.Duration > 0 {
-		total = segmentCount(s.mediaInfo.Duration, m.settings.HlsSegmentDuration())
-		if index < 0 || index >= total {
+		timeline := m.timeline(s.mediaInfo.Duration)
+		total = timeline.segmentCount()
+		if !timeline.containsSegment(index) {
 			s.mtx.Unlock()
 			return errors.New("video segment out of range")
 		}
@@ -497,7 +557,7 @@ func (m *manager) ensureVideoSegment(ctx context.Context, s *streamInfo, index i
 	}
 	s.mtx.Unlock()
 
-	s.markPreparing(index, m.settings.HlsSegmentDuration())
+	s.markPreparing(index, m.timeline(0).segmentStart(index))
 	s.mtx.Lock()
 	if s.closing {
 		s.mtx.Unlock()
@@ -509,48 +569,42 @@ func (m *manager) ensureVideoSegment(ctx context.Context, s *streamInfo, index i
 		return err
 	}
 	if directPlay {
-		begin, _ := segmentWindow(index, total, m.settings.HlsWindowSegments())
+		begin, _ := m.timeline(s.mediaInfo.Duration).windowForSegment(index)
 		if len(s.directWindows[begin]) > 0 {
 			s.mtx.Unlock()
 			s.markReady(index)
 			return nil
 		}
 	}
-	job := findSegmentJob(s.videoJobs, index)
-	if job == nil {
-		if total <= 0 {
-			total = s.progressiveAdvertised
-		}
-		begin, end := segmentWindow(index, total, m.settings.HlsWindowSegments())
-		cancelAbandonedJobsLocked(s.videoJobs, begin, end)
-		if err := m.reserveJobSlotLocked(s); err != nil {
-			s.mtx.Unlock()
-			s.markSegmentError(index, err)
-			return fmt.Errorf("%w: %v", domain.ErrHlsTemporarilyUnavailable, err)
-		}
-		jobCtx, cancel := context.WithCancel(s.ctx)
-		now := time.Now()
-		job = &segmentJob{begin: begin, end: end, id: segmentJobID("video", begin, end, now), cancel: cancel, done: make(chan struct{}), startedAt: now, lastProgress: now, slotHeld: true}
-		if s.videoJobs == nil {
-			s.videoJobs = make(map[*segmentJob]struct{})
-		}
-		s.videoJobs[job] = struct{}{}
+	if total <= 0 {
+		total = s.progressiveAdvertised
+	}
+	timeline := m.timeline(s.mediaInfo.Duration)
+	begin, end := timeline.windowForSegment(index)
+	job, jobCtx, created, err := s.acquireJobLocked(videoSegmentJob, index, begin, end, false, m.scheduler, m.settings.MaxJobsPerStream())
+	if err != nil {
+		s.mtx.Unlock()
+		s.markSegmentError(index, err)
+		return fmt.Errorf("%w: %v", domain.ErrHlsTemporarilyUnavailable, err)
+	}
+	if created {
+		job.targetSeconds = s.presentationTarget
 		go m.runVideoJob(s, jobCtx, job)
 	}
 	job.waiters++
 	s.mtx.Unlock()
-	var err error
+	var waitErr error
 	if directPlay {
-		err = waitForJob(ctx, job)
+		waitErr = waitForJob(ctx, job)
 	} else {
-		err = waitForGeneratedAsset(ctx, path, job)
+		waitErr = waitForGeneratedAsset(ctx, m.media, path, job)
 	}
-	m.releaseJobWaiter(s, job, err)
-	if err == nil {
+	s.releaseJobWaiter(job, waitErr)
+	if waitErr == nil {
 		s.markReady(index)
 		m.prefetchProgressiveWindow(s, index)
 	}
-	return err
+	return waitErr
 }
 
 // prefetchProgressiveWindow keeps one small, fully generated window ahead of
@@ -560,52 +614,71 @@ func (m *manager) prefetchProgressiveWindow(s *streamInfo, requested int) {
 	window := m.settings.HlsWindowSegments()
 	s.mtx.Lock()
 	if s.closing || s.progressiveEnded ||
-		s.progressiveRetry || (requested >= 0 && requested < max(0, s.progressiveAdvertised-window)) {
+		s.progressiveRetry || !shouldPrefetchProgressiveWindow(requested, s.progressiveAdvertised) {
 		s.mtx.Unlock()
 		return
 	}
 	begin := s.progressiveAdvertised
+	timeline := m.timeline(s.mediaInfo.Duration)
 	if s.directPlay {
-		begin = max(begin, nextDirectWindowBegin(s.directWindows, m.settings.HlsSegmentDuration()))
+		begin = max(begin, nextDirectWindowBegin(s.directWindows, m.timeline(0)))
+		for timeline.containsSegment(begin) && directFragmentsCoverTime(s.directWindows, timeline.segmentStart(begin)+0.001) {
+			begin++
+		}
 	}
 	total := 0
 	if s.mediaInfo.Duration > 0 {
-		total = segmentCount(s.mediaInfo.Duration, m.settings.HlsSegmentDuration())
+		total = timeline.segmentCount()
 		if begin >= total {
 			s.progressiveEnded = true
 			s.mtx.Unlock()
 			return
 		}
 	}
-	if findSegmentJob(s.videoJobs, begin) != nil {
-		s.mtx.Unlock()
-		return
-	}
-	if err := m.reserveJobSlotLocked(s); err != nil {
+	end := progressivePrefetchEnd(begin, total, window, requested < 0)
+	job, jobCtx, created, err := s.acquireJobLocked(videoSegmentJob, begin, begin, end, true, m.scheduler, m.settings.MaxJobsPerStream())
+	if err != nil {
 		s.progressiveRetry = true
-		s.status.Phase = "waiting"
+		s.status.Phase = domain.HlsPhaseWaiting
 		s.status.Message = "The server transcode queue is busy; retrying"
 		s.status.LastProgress = time.Now()
 		s.mtx.Unlock()
 		go m.retryProgressivePrefetch(s)
 		return
 	}
-	jobCtx, cancel := context.WithCancel(s.ctx)
-	now := time.Now()
-	end := begin + window
+	if !created {
+		s.mtx.Unlock()
+		return
+	}
+	job.targetSeconds = s.presentationTarget
+	s.mtx.Unlock()
+	if requested < 0 {
+		s.markPreparing(begin, m.timeline(0).segmentStart(begin))
+	}
+	go m.runVideoJob(s, jobCtx, job)
+}
+
+func shouldPrefetchProgressiveWindow(requested, advertised int) bool {
+	return requested < 0 || requested >= max(0, advertised-1)
+}
+
+func directPrefetchIndexLocked(s *streamInfo, owner int, assetName string) int {
+	fragments := s.directWindows[owner]
+	if len(fragments) > 0 && fragments[len(fragments)-1].Name == assetName {
+		return max(owner, s.progressiveAdvertised-1)
+	}
+	return owner
+}
+
+func progressivePrefetchEnd(begin, total, window int, startup bool) int {
+	if startup {
+		window = 1
+	}
+	end := begin + max(1, window)
 	if total > 0 {
 		end = min(end, total)
 	}
-	job := &segmentJob{begin: begin, end: end, id: segmentJobID("video", begin, end, now), cancel: cancel, done: make(chan struct{}), startedAt: now, lastProgress: now, background: true, slotHeld: true}
-	if s.videoJobs == nil {
-		s.videoJobs = make(map[*segmentJob]struct{})
-	}
-	s.videoJobs[job] = struct{}{}
-	s.mtx.Unlock()
-	if requested < 0 {
-		s.markPreparing(begin, m.settings.HlsSegmentDuration())
-	}
-	go m.runVideoJob(s, jobCtx, job)
+	return end
 }
 
 func (m *manager) retryProgressivePrefetch(s *streamInfo) {
@@ -634,27 +707,19 @@ func (m *manager) prefetchProgressiveSubtitles(s *streamInfo, begin, end int) {
 	begin = min(begin, s.progressiveSubtitles)
 	end = min(end, s.progressiveAdvertised)
 	end = min(end, begin+m.settings.HlsWindowSegments())
-	if begin >= end || findSegmentJob(s.subtitleJobs, begin) != nil {
+	if begin >= end {
 		s.mtx.Unlock()
 		return
 	}
-	if err := m.reserveJobSlotLocked(s); err != nil {
+	job, jobCtx, created, err := s.acquireJobLocked(subtitleSegmentJob, begin, begin, end, true, m.scheduler, m.settings.MaxJobsPerStream())
+	if err != nil {
 		s.mtx.Unlock()
 		return
 	}
-	jobCtx, cancel := context.WithCancel(s.ctx)
-	now := time.Now()
-	job := &segmentJob{
-		begin: begin, end: end,
-		id:     segmentJobID("subtitle", begin, end, now),
-		cancel: cancel, done: make(chan struct{}),
-		startedAt: now, lastProgress: now,
-		background: true, slotHeld: true,
+	if !created {
+		s.mtx.Unlock()
+		return
 	}
-	if s.subtitleJobs == nil {
-		s.subtitleJobs = make(map[*segmentJob]struct{})
-	}
-	s.subtitleJobs[job] = struct{}{}
 	s.mtx.Unlock()
 	go m.runSubtitleJob(s, jobCtx, job)
 }
@@ -670,10 +735,7 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 			s.markJobError(job, job.err)
 		}
 		close(job.done)
-		s.mtx.Lock()
-		delete(s.videoJobs, job)
-		s.mtx.Unlock()
-		m.releaseJobSlot(job)
+		s.finishJob(videoSegmentJob, job)
 		m.enforceCacheLimit()
 	}()
 	ctx, cancel := context.WithTimeout(ctx, windowGenerationTimeout)
@@ -802,10 +864,42 @@ func (m *manager) runVideoJob(s *streamInfo, ctx context.Context, job *segmentJo
 	}
 	if job.err == nil {
 		m.prefetchProgressiveSubtitles(s, job.begin, job.end)
+		m.prefetchVideoRange(s, job.end, job.followEnd, job.targetSeconds)
 	}
 	if job.err != nil && !errors.Is(job.err, context.Canceled) {
 		log.Printf("Generate HLS video window failed: dir=%s segments=[%d,%d): %v", filepath.Base(s.paths.outDir), job.begin, job.end, job.err)
 	}
+}
+
+func (m *manager) prefetchVideoRange(s *streamInfo, begin, end int, targetSeconds float64) {
+	if begin >= end {
+		return
+	}
+	s.mtx.Lock()
+	if s.closing || s.fatalErr != nil || findSegmentJob(s.videoJobs, begin) != nil {
+		s.mtx.Unlock()
+		return
+	}
+	timeline := m.timeline(s.mediaInfo.Duration)
+	for begin < end && directFragmentsCoverTime(s.directWindows, timeline.segmentStart(begin)+0.001) {
+		begin++
+	}
+	if begin >= end {
+		s.mtx.Unlock()
+		return
+	}
+	job, jobCtx, created, err := s.acquireJobLocked(videoSegmentJob, begin, begin, end, true, m.scheduler, m.settings.MaxJobsPerStream())
+	if err != nil {
+		s.mtx.Unlock()
+		return
+	}
+	if !created {
+		s.mtx.Unlock()
+		return
+	}
+	job.targetSeconds = targetSeconds
+	s.mtx.Unlock()
+	go m.runVideoJob(s, jobCtx, job)
 }
 
 func (m *manager) directPrerollBudget(bitrate int64) time.Duration {
@@ -841,7 +935,7 @@ func (m *manager) publishDirectWindow(s *streamInfo, job *segmentJob) error {
 
 func (m *manager) publishTranscodedWindow(s *streamInfo, job *segmentJob) error {
 	fragments := make([]ffmpeg.HLSFragment, 0, len(job.result.Durations))
-	cursor := float64(job.begin) * m.settings.HlsSegmentDuration().Seconds()
+	cursor := m.timeline(0).segmentStart(job.begin)
 	for offset, duration := range job.result.Durations {
 		fragments = append(fragments, ffmpeg.HLSFragment{
 			Start:    cursor,
@@ -886,6 +980,11 @@ func (m *manager) publishMaterializedWindow(
 	if direct {
 		window = appendableDirectFragments(windows, window)
 		if len(window) == 0 && !reachedEnd {
+			target := m.timeline(s.mediaInfo.Duration).segmentStart(job.begin) + 0.001
+			if directFragmentsCoverTime(windows, target) {
+				s.mtx.Unlock()
+				return nil
+			}
 			s.mtx.Unlock()
 			return fmt.Errorf("progressive remux produced no new GOP")
 		}
@@ -899,7 +998,7 @@ func (m *manager) publishMaterializedWindow(
 	advertised := s.progressiveAdvertised
 	ended := s.progressiveEnded
 	assetVersion := s.assetVersion
-	presentationTarget := s.presentationTarget
+	presentationTarget := job.targetSeconds
 	info := s.mediaInfo
 	selection := s.selection
 	progressiveSubtitles := s.progressiveSubtitles
@@ -910,15 +1009,13 @@ func (m *manager) publishMaterializedWindow(
 		targetDuration = max(targetDuration, s.materializedTarget)
 	} else {
 		assetVersion = fmt.Sprintf("%x", time.Now().UnixNano())
-		windows = map[int][]ffmpeg.HLSFragment{job.begin: window}
 		sequence = 0
 		discontinuitySequence = 0
 	}
-	trimMaterializedTail(windows, &sequence, &discontinuitySequence, targetDuration)
 	advertised = max(advertised, advertisedEnd)
 	ended = ended || reachedEnd
 	if s.mediaInfo.Duration > 0 {
-		ended = ended || advertised >= segmentCount(s.mediaInfo.Duration, m.settings.HlsSegmentDuration())
+		ended = ended || advertised >= m.timeline(s.mediaInfo.Duration).segmentCount()
 	}
 	allFragments := make([]ffmpeg.HLSFragment, 0)
 	for _, window := range windows {
@@ -986,74 +1083,74 @@ func maximumFragmentDuration(fragments []ffmpeg.HLSFragment) time.Duration {
 	return maximum
 }
 
-func trimMaterializedTail(windows map[int][]ffmpeg.HLSFragment, mediaSequence, discontinuitySequence *int, targetDuration time.Duration) {
-	owners := make([]int, 0, len(windows))
-	total := 0.0
-	for owner, fragments := range windows {
-		owners = append(owners, owner)
+func materializedPresentationOrigin(windows map[int][]ffmpeg.HLSFragment) (float64, bool) {
+	intervals := make([]playbackInterval, 0)
+	for _, fragments := range windows {
 		for _, fragment := range fragments {
-			total += fragment.Duration
+			intervals = append(intervals, playbackInterval{
+				startSeconds:    fragment.Start,
+				durationSeconds: fragment.Duration,
+			})
 		}
 	}
-	sort.Ints(owners)
-	minimum := 3 * targetDuration.Seconds()
-	for len(owners) > 1 {
-		owner := owners[0]
-		removedDuration := 0.0
-		for _, fragment := range windows[owner] {
-			removedDuration += fragment.Duration
-		}
-		if total-removedDuration < minimum-0.001 {
-			break
-		}
-		*mediaSequence += len(windows[owner])
-		(*discontinuitySequence)++
-		delete(windows, owner)
-		owners = owners[1:]
-		total -= removedDuration
-	}
+	return presentationOrigin(intervals)
 }
 
 func appendableDirectFragments(windows map[int][]ffmpeg.HLSFragment, incoming []ffmpeg.HLSFragment) []ffmpeg.HLSFragment {
-	cursor := math.Inf(-1)
+	existing := make([]ffmpeg.HLSFragment, 0)
 	for _, window := range windows {
-		for _, fragment := range window {
-			cursor = max(cursor, fragment.Start+fragment.Duration)
-		}
+		existing = append(existing, window...)
 	}
 	sort.Slice(incoming, func(i, j int) bool {
 		return incoming[i].Start < incoming[j].Start
 	})
 	result := incoming[:0]
 	for _, fragment := range incoming {
-		end := fragment.Start + fragment.Duration
-		if end <= cursor+0.001 {
+		var ok bool
+		fragment, ok = trimMaterializedOverlap(fragment, existing)
+		if !ok {
 			continue
 		}
-		if !math.IsInf(cursor, -1) {
-			if overlap := cursor - fragment.Start; overlap > 0.001 && overlap <= 0.25 {
-				fragment.Start = cursor
-			} else if fragment.Start < cursor-0.001 {
-				continue
-			}
+		fragment, ok = trimMaterializedOverlap(fragment, result)
+		if !ok {
+			continue
 		}
 		result = append(result, fragment)
-		cursor = fragment.Start + fragment.Duration
 	}
 	return result
 }
 
-func nextDirectWindowBegin(windows map[int][]ffmpeg.HLSFragment, segmentDuration time.Duration) int {
-	if segmentDuration <= 0 {
-		return 0
+func trimMaterializedOverlap(candidate ffmpeg.HLSFragment, fragments []ffmpeg.HLSFragment) (ffmpeg.HLSFragment, bool) {
+	const tolerance = 0.001
+	for _, fragment := range fragments {
+		start := candidate.Start
+		end := start + candidate.Duration
+		otherStart := fragment.Start
+		otherEnd := otherStart + fragment.Duration
+		if start >= otherEnd-tolerance || otherStart >= end-tolerance {
+			continue
+		}
+		if overlap := otherEnd - start; start >= otherStart && overlap <= 0.25 {
+			candidate.Start = otherEnd
+			continue
+		}
+		if overlap := end - otherStart; end <= otherEnd && overlap <= 0.25 {
+			candidate.Duration -= overlap
+			continue
+		}
+		return ffmpeg.HLSFragment{}, false
 	}
+	return candidate, candidate.Duration > tolerance
+}
+
+func nextDirectWindowBegin(windows map[int][]ffmpeg.HLSFragment, timeline playbackTimeline) int {
 	end := 0.0
 	for _, window := range windows {
 		for _, fragment := range window {
 			end = max(end, fragment.Start+fragment.Duration)
 		}
 	}
-	return max(0, int(math.Floor((end+0.001)/segmentDuration.Seconds())))
+	return timeline.locate(end + 0.001).segment
 }
 
 func (m *manager) switchToTranscode(s *streamInfo, current *segmentJob) error {
@@ -1113,7 +1210,7 @@ func (m *manager) reconcileKnownDuration(s *streamInfo, job *segmentJob) error {
 		last := job.fragments[len(job.fragments)-1]
 		actual = last.Start + last.Duration
 	} else {
-		actual = float64(job.begin) * m.settings.HlsSegmentDuration().Seconds()
+		actual = m.timeline(0).segmentStart(job.begin)
 		for _, duration := range job.result.Durations {
 			actual += duration
 		}
@@ -1189,87 +1286,15 @@ func (m *manager) GetHlsStatus(ctx context.Context, streamDir string, targetSeco
 	}
 
 	stats := s.torrent.Stats()
-	usefulBytes := stats.BytesReadUsefulData.Int64()
-	now := time.Now()
-	targetIndex := -1
-	if targetSeconds >= 0 && !math.IsNaN(targetSeconds) && !math.IsInf(targetSeconds, 0) {
-		targetIndex = int(math.Floor(targetSeconds / m.settings.HlsSegmentDuration().Seconds()))
-	}
-	s.mtx.Lock()
-	if usefulBytes > s.lastTorrentBytes {
-		s.lastTorrentBytes = usefulBytes
-	}
-	status := s.status
-	initialized := channelClosed(s.ready)
-	videoJobActive := false
-	subtitleJobActive := false
-	withSubtitles := false
-	directReady := false
-	if targetIndex >= 0 && initialized {
-		status.TargetSeconds = targetSeconds
-		status.Seekable = s.mediaInfo.Seekable
-		status.Duration = s.mediaInfo.Duration
-		status.Message = ""
-		withSubtitles = ffmpeg.UsesTextSubtitles(s.mediaInfo, s.selection)
-		if s.directPlay {
-			begin, _ := segmentWindow(targetIndex, segmentCount(s.mediaInfo.Duration, m.settings.HlsSegmentDuration()), m.settings.HlsWindowSegments())
-			directReady = len(s.directWindows[begin]) > 0
-		}
-		if s.fatalErr != nil {
-			status.Phase = "error"
-			status.Message = publicStreamError(s.fatalErr)
-		} else if failure, ok := s.segmentErrors[targetIndex]; ok {
-			status.Phase = "error"
-			status.Message = failure.message
-			status.StartedAt = failure.at
-			status.LastProgress = failure.at
-		} else {
-			videoJob := findSegmentJob(s.videoJobs, targetIndex)
-			subtitleJob := findSegmentJob(s.subtitleJobs, targetIndex)
-			videoJobActive = videoJob != nil
-			subtitleJobActive = subtitleJob != nil
-			job := videoJob
-			if job == nil {
-				job = subtitleJob
-			}
-			if job != nil {
-				status.Phase = "preparing"
-				status.StartedAt = job.startedAt
-				status.LastProgress = job.lastProgress
-				status.BytesRead = job.bytesRead
-				if status.LastProgress.IsZero() {
-					status.LastProgress = job.startedAt
-				}
-			} else {
-				status.Phase = "waiting"
-				status.StartedAt = now
-				status.LastProgress = now
-			}
-		}
-	}
-	s.mtx.Unlock()
-	if targetIndex >= 0 && initialized && status.Phase != "error" {
-		videoReady := directReady
-		if !videoReady {
-			_, err := os.Stat(filepath.Join(s.paths.outDir, videoSegmentName(targetIndex)))
-			videoReady = err == nil
-		}
-		subtitleReady := !withSubtitles
-		if !subtitleReady {
-			_, err := os.Stat(filepath.Join(s.paths.outDir, subtitleSegmentName(targetIndex)))
-			subtitleReady = err == nil
-		}
-		if videoReady && subtitleReady {
-			status.Phase = "ready"
-			status.Message = ""
-			status.LastProgress = now
-		} else if videoJobActive || subtitleJobActive {
-			status.Phase = "preparing"
-		}
-	}
-	status.ActivePeers = stats.ActivePeers
-	status.TotalPeers = stats.TotalPeers
-	return classifyHlsStatus(status, now), nil
+	status := s.playbackStatus(
+		targetSeconds,
+		m.timeline(s.mediaDuration()),
+		time.Now(),
+		stats.BytesReadUsefulData.Int64(),
+		stats.ActivePeers,
+		stats.TotalPeers,
+	)
+	return status, nil
 }
 
 func channelClosed(ch <-chan struct{}) bool {
@@ -1281,14 +1306,25 @@ func channelClosed(ch <-chan struct{}) bool {
 	}
 }
 
+func directFragmentsCoverTime(windows map[int][]ffmpeg.HLSFragment, target float64) bool {
+	for _, fragments := range windows {
+		for _, fragment := range fragments {
+			if target >= fragment.Start-0.25 && target < fragment.Start+fragment.Duration-0.001 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func classifyHlsStatus(status domain.HlsStatus, now time.Time) domain.HlsStatus {
-	if status.Phase == "probing" || status.Phase == "preparing" {
+	if status.Phase == domain.HlsPhaseProbing || status.Phase == domain.HlsPhasePreparing {
 		idle := now.Sub(status.LastProgress)
 		if status.ActivePeers == 0 && idle >= 5*time.Second {
-			status.Phase = "no_peers"
+			status.Phase = domain.HlsPhaseNoPeers
 			status.Message = "No active peers; discovery is still running"
 		} else if idle >= 15*time.Second {
-			status.Phase = "stalled"
+			status.Phase = domain.HlsPhaseStalled
 			status.Message = "Connected peers or the media worker have not produced data recently"
 		}
 	}
@@ -1312,12 +1348,12 @@ func (m *manager) ensureSubtitleSegment(ctx context.Context, s *streamInfo, inde
 		return errors.New("stream has no text subtitle rendition")
 	}
 	path := filepath.Join(s.paths.outDir, subtitleSegmentName(index))
-	if touchExisting(path) {
-		s.markPreparing(index, m.settings.HlsSegmentDuration())
+	if m.media.touchHls(path) {
+		s.markPreparing(index, m.timeline(0).segmentStart(index))
 		s.markReady(index)
 		return nil
 	}
-	s.markPreparing(index, m.settings.HlsSegmentDuration())
+	s.markPreparing(index, m.timeline(0).segmentStart(index))
 	s.mtx.Lock()
 	if s.closing {
 		s.mtx.Unlock()
@@ -1330,8 +1366,9 @@ func (m *manager) ensureSubtitleSegment(ctx context.Context, s *streamInfo, inde
 	}
 	total := 0
 	if s.mediaInfo.Duration > 0 {
-		total = segmentCount(s.mediaInfo.Duration, m.settings.HlsSegmentDuration())
-		if index < 0 || index >= total {
+		timeline := m.timeline(s.mediaInfo.Duration)
+		total = timeline.segmentCount()
+		if !timeline.containsSegment(index) {
 			s.mtx.Unlock()
 			return errors.New("subtitle segment out of range")
 		}
@@ -1342,32 +1379,24 @@ func (m *manager) ensureSubtitleSegment(ctx context.Context, s *streamInfo, inde
 			return errors.New("subtitle segment is outside the discovered range")
 		}
 	}
-	job := findSegmentJob(s.subtitleJobs, index)
-	if job == nil {
-		begin, end := segmentWindow(index, total, m.settings.HlsWindowSegments())
-		cancelAbandonedJobsLocked(s.subtitleJobs, begin, end)
-		if err := m.reserveJobSlotLocked(s); err != nil {
-			s.mtx.Unlock()
-			s.markSegmentError(index, err)
-			return fmt.Errorf("%w: %v", domain.ErrHlsTemporarilyUnavailable, err)
-		}
-		jobCtx, cancel := context.WithCancel(s.ctx)
-		now := time.Now()
-		job = &segmentJob{begin: begin, end: end, id: segmentJobID("subtitle", begin, end, now), cancel: cancel, done: make(chan struct{}), startedAt: now, lastProgress: now, slotHeld: true}
-		if s.subtitleJobs == nil {
-			s.subtitleJobs = make(map[*segmentJob]struct{})
-		}
-		s.subtitleJobs[job] = struct{}{}
+	begin, end := m.timeline(s.mediaInfo.Duration).windowForSegment(index)
+	job, jobCtx, created, err := s.acquireJobLocked(subtitleSegmentJob, index, begin, end, false, m.scheduler, m.settings.MaxJobsPerStream())
+	if err != nil {
+		s.mtx.Unlock()
+		s.markSegmentError(index, err)
+		return fmt.Errorf("%w: %v", domain.ErrHlsTemporarilyUnavailable, err)
+	}
+	if created {
 		go m.runSubtitleJob(s, jobCtx, job)
 	}
 	job.waiters++
 	s.mtx.Unlock()
-	err := waitForGeneratedAsset(ctx, path, job)
-	m.releaseJobWaiter(s, job, err)
-	if err == nil {
+	waitErr := waitForGeneratedAsset(ctx, m.media, path, job)
+	s.releaseJobWaiter(job, waitErr)
+	if waitErr == nil {
 		s.markReady(index)
 	}
-	return err
+	return waitErr
 }
 
 func (m *manager) runSubtitleJob(s *streamInfo, ctx context.Context, job *segmentJob) {
@@ -1381,10 +1410,7 @@ func (m *manager) runSubtitleJob(s *streamInfo, ctx context.Context, job *segmen
 			s.markJobError(job, job.err)
 		}
 		close(job.done)
-		s.mtx.Lock()
-		delete(s.subtitleJobs, job)
-		s.mtx.Unlock()
-		m.releaseJobSlot(job)
+		s.finishJob(subtitleSegmentJob, job)
 		m.enforceCacheLimit()
 	}()
 	ctx, cancel := context.WithTimeout(ctx, windowGenerationTimeout)
@@ -1415,7 +1441,7 @@ func (m *manager) runSubtitleJob(s *streamInfo, ctx context.Context, job *segmen
 		s.markJobStarted(job)
 		for index := job.begin; index < job.end; index++ {
 			path := filepath.Join(s.paths.outDir, subtitleSegmentName(index))
-			if touchExisting(path) {
+			if m.media.touchHls(path) {
 				continue
 			}
 			if err := ffmpeg.GenerateSubtitleSegment(
@@ -1455,18 +1481,6 @@ func findSegmentJob(jobs map[*segmentJob]struct{}, index int) *segmentJob {
 	return nil
 }
 
-func segmentWindow(index, total, window int) (begin, end int) {
-	if window <= 0 {
-		window = 1
-	}
-	begin = index / window * window
-	end = begin + window
-	if total > 0 {
-		end = min(end, total)
-	}
-	return begin, end
-}
-
 func segmentJobID(kind string, begin, end int, started time.Time) string {
 	return fmt.Sprintf("%s-%d-%d-%d", kind, begin, end, started.UnixNano())
 }
@@ -1481,32 +1495,7 @@ func cancelAbandonedJobsLocked(jobs map[*segmentJob]struct{}, begin, end int) {
 	}
 }
 
-// reserveJobSlotLocked applies both per-stream fairness and a hard global cap.
-// The caller must hold s.mtx until the new job is inserted into its map.
-func (m *manager) reserveJobSlotLocked(s *streamInfo) error {
-	if len(s.videoJobs)+len(s.subtitleJobs) >= m.settings.MaxJobsPerStream() {
-		return errStreamJobLimit
-	}
-	if m.jobs == nil {
-		return nil
-	}
-	select {
-	case m.jobs <- struct{}{}:
-		return nil
-	default:
-		return errStreamJobQueueFull
-	}
-}
-
-func (m *manager) releaseJobSlot(job *segmentJob) {
-	if job == nil || !job.slotHeld || m.jobs == nil {
-		return
-	}
-	job.slotHeld = false
-	<-m.jobs
-}
-
-func (m *manager) releaseJobWaiter(s *streamInfo, job *segmentJob, waitErr error) {
+func (s *streamInfo) releaseJobWaiter(job *segmentJob, waitErr error) {
 	s.mtx.Lock()
 	if job.waiters > 0 {
 		job.waiters--
@@ -1528,37 +1517,24 @@ func (s *streamInfo) markJobStarted(job *segmentJob) {
 }
 
 func (m *manager) withTranscodeSlot(ctx context.Context, run func() error) error {
-	if m.transcodes == nil {
-		return run()
-	}
-	select {
-	case m.transcodes <- struct{}{}:
-		if err := ctx.Err(); err != nil {
-			<-m.transcodes
-			return err
-		}
-		defer func() { <-m.transcodes }()
-		return run()
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return m.scheduler.transcode(ctx, run)
 }
 
-func waitForGeneratedAsset(ctx context.Context, path string, job *segmentJob) error {
+func waitForGeneratedAsset(ctx context.Context, cache *mediaCache, path string, job *segmentJob) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if touchExisting(path) {
+		if cache.touchHls(path) {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-job.done:
-			if touchExisting(path) {
+			if cache.touchHls(path) {
 				return nil
 			}
 			if job.err != nil {
@@ -1589,22 +1565,6 @@ func jobFinished(job *segmentJob) bool {
 	default:
 		return false
 	}
-}
-
-func touchExisting(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return false
-	}
-	if time.Since(info.ModTime()) >= hlsTouchInterval {
-		now := time.Now()
-		_ = os.Chtimes(path, now, now)
-	}
-	return true
-}
-
-func segmentCount(duration float64, segmentDuration time.Duration) int {
-	return int(math.Ceil(duration / segmentDuration.Seconds()))
 }
 
 func videoSegmentName(index int) string {

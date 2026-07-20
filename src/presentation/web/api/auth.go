@@ -1,6 +1,7 @@
 package api
 
 import (
+	"cinemator/internal/buildinfo"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -93,11 +94,13 @@ func (s *HttpServer) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, struct {
-		Enabled       bool `json:"enabled"`
-		Authenticated bool `json:"authenticated"`
+		Enabled       bool   `json:"enabled"`
+		Authenticated bool   `json:"authenticated"`
+		Version       string `json:"version"`
 	}{
 		Enabled:       s.auth != nil,
 		Authenticated: s.auth != nil && s.auth.authenticated(r),
+		Version:       buildinfo.Version,
 	})
 }
 

@@ -24,7 +24,7 @@ func validatePieceCacheCapacity(pieceLength, capacity int64) error {
 	return nil
 }
 
-func newPieceCache(downloadRoot string, capacity int64, disk *diskBudget) (*pieceCacheStorage, error) {
+func newPieceCache(downloadRoot string, budget *cacheBudget, disk *diskBudget) (*pieceCacheStorage, error) {
 	root, err := filepath.Abs(filepath.Join(downloadRoot, pieceCacheDirName))
 	if err != nil {
 		return nil, fmt.Errorf("resolve torrent piece cache: %w", err)
@@ -48,14 +48,14 @@ func newPieceCache(downloadRoot string, capacity int64, disk *diskBudget) (*piec
 		return nil, fmt.Errorf("open torrent piece cache: %w", err)
 	}
 
-	provider := newPieceCacheProvider(cache, root, capacity, disk)
+	provider := newPieceCacheProvider(cache, root, budget, disk)
 	if err := provider.trimToCapacity(); err != nil {
 		return nil, fmt.Errorf("trim torrent piece cache: %w", err)
 	}
 
 	opts := storage.ResourcePiecesOpts{}
-	if capacity > 0 {
-		capacityFn := func() (int64, bool) { return capacity, true }
+	if budget.limit > 0 {
+		capacityFn := func() (int64, bool) { return budget.limit, true }
 		opts.Capacity = &capacityFn
 	}
 	return &pieceCacheStorage{ClientImpl: storage.NewResourcePiecesOpts(provider, opts), provider: provider}, nil

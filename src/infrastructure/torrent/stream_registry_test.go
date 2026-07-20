@@ -1,6 +1,8 @@
 package torrent
 
 import (
+	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -28,7 +30,7 @@ func TestCleanupKeepsStreamRegisteredUntilWorkersAndPublicationStop(t *testing.T
 		videoJobs:    map[*segmentJob]struct{}{job: {}},
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
-	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, assets: assets}
+	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, media: &mediaCache{assets: assets}}
 	finished := make(chan struct{})
 	go func() {
 		manager.cleanup(key)
@@ -74,6 +76,110 @@ func TestCleanupKeepsStreamRegisteredUntilWorkersAndPublicationStop(t *testing.T
 	manager.mu.Unlock()
 	if registered {
 		t.Fatal("cleaned stream remains registered")
+	}
+}
+
+func TestShutdownStreamsStopsWaitingAtItsDeadline(t *testing.T) {
+	root := t.TempDir()
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer assets.Close()
+
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
+	paths := key.paths(root)
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	close(ready)
+	job := &segmentJob{done: make(chan struct{})}
+	stream := &streamInfo{
+		ready:        ready,
+		source:       &torrentSource{},
+		paths:        paths,
+		cleanupDone:  make(chan struct{}),
+		videoJobs:    map[*segmentJob]struct{}{job: {}},
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, media: &mediaCache{assets: assets}}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	err = manager.shutdownStreams(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shutdownStreams() error = %v, want deadline exceeded", err)
+	}
+	stream.mtx.Lock()
+	closing := stream.closing
+	stream.mtx.Unlock()
+	if !closing {
+		t.Fatal("shutdown did not cancel the active stream before waiting")
+	}
+
+	close(job.done)
+	select {
+	case <-stream.cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("stream cleanup did not finish after its worker stopped")
+	}
+}
+
+func TestReuseOrRetireStreamNeverReturnsFailedSession(t *testing.T) {
+	root := t.TempDir()
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer assets.Close()
+
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
+	paths := key.paths(root)
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	ready := make(chan struct{})
+	close(ready)
+	stream := &streamInfo{
+		ready:        ready,
+		fatalErr:     errors.New("failed presentation"),
+		source:       &torrentSource{},
+		paths:        paths,
+		cleanupDone:  make(chan struct{}),
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	manager := &manager{
+		active:      map[streamKey]*streamInfo{key: stream},
+		media:       &mediaCache{assets: assets},
+		torrentUses: make(map[string]*torrentUse),
+	}
+
+	manager.mu.Lock()
+	got, cleanupDone := manager.reuseOrRetireStreamLocked(key, time.Now())
+	manager.mu.Unlock()
+	if got != nil || cleanupDone == nil {
+		t.Fatalf("reuseOrRetireStreamLocked() = (%p, %v), want cleanup only", got, cleanupDone)
+	}
+	stream.mtx.Lock()
+	closing := stream.closing
+	stream.mtx.Unlock()
+	if !closing {
+		t.Fatal("failed stream was not marked closing before registry lock release")
+	}
+
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("failed stream cleanup did not finish")
+	}
+	manager.cleanupWG.Wait()
+	manager.mu.Lock()
+	_, registered := manager.active[key]
+	manager.mu.Unlock()
+	if registered {
+		t.Fatal("failed stream remains registered after cleanup")
 	}
 }
 

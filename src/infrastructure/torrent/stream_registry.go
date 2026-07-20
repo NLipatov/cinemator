@@ -2,8 +2,9 @@ package torrent
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -13,15 +14,8 @@ func (m *manager) CleanupStreams() {
 	now := time.Now()
 	m.mu.Lock()
 	for key, stream := range m.active {
-		stream.mtx.Lock()
-		noViewers := now.Sub(stream.lastView) > m.settings.ViewerTimeout()
-		stream.mtx.Unlock()
-		if noViewers {
-			m.cleanupWG.Add(1)
-			go func() {
-				defer m.cleanupWG.Done()
-				m.cleanup(key)
-			}()
+		if stream.idleAt(now, m.settings.ViewerTimeout()) {
+			m.scheduleStreamCleanupLocked(key, stream)
 		}
 	}
 	m.mu.Unlock()
@@ -30,47 +24,93 @@ func (m *manager) CleanupStreams() {
 }
 
 func (m *manager) cleanup(key streamKey) {
-	m.cleanupMatching(key, nil)
-}
-
-func (m *manager) cleanupIfCurrent(key streamKey, expected *streamInfo) {
-	m.cleanupMatching(key, expected)
-}
-
-func (m *manager) cleanupMatching(key streamKey, expected *streamInfo) {
 	m.mu.Lock()
-	stream, done, clean := m.beginStreamCleanupLocked(key, expected)
+	stream := m.active[key]
+	if stream == nil {
+		m.mu.Unlock()
+		return
+	}
+	done, started := stream.beginClose()
 	m.mu.Unlock()
-	if !clean {
-		if done != nil {
-			<-done
-		}
+	if !started {
+		<-done
 		return
 	}
 	m.finishStreamCleanup(key, stream)
 	m.unregisterCleanedStream(key, stream)
 }
 
-func (m *manager) beginStreamCleanupLocked(key streamKey, expected *streamInfo) (*streamInfo, <-chan struct{}, bool) {
-	stream, ok := m.active[key]
-	if !ok || expected != nil && stream != expected {
-		return nil, nil, false
+func (m *manager) shutdownStreams(ctx context.Context) error {
+	m.mu.Lock()
+	keys := make([]streamKey, 0, len(m.active))
+	for key := range m.active {
+		keys = append(keys, key)
+	}
+	m.mu.Unlock()
+
+	var current sync.WaitGroup
+	for _, key := range keys {
+		current.Add(1)
+		go func() {
+			defer current.Done()
+			m.cleanup(key)
+		}()
+	}
+	done := make(chan struct{})
+	go func() {
+		current.Wait()
+		m.cleanupWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("stop stream workers: %w", ctx.Err())
+	}
+}
+
+// reuseOrRetireStreamLocked returns only a stream that can still accept work.
+// A closing or failed stream keeps ownership of its paths until cleanup ends,
+// so callers must wait for cleanupDone before attempting to publish a successor.
+func (m *manager) reuseOrRetireStreamLocked(key streamKey, now time.Time) (*streamInfo, <-chan struct{}) {
+	stream := m.active[key]
+	if stream == nil {
+		return nil, nil
 	}
 	stream.mtx.Lock()
-	if stream.closing {
-		done := stream.cleanupDone
-		stream.mtx.Unlock()
-		return stream, done, false
-	}
-	if stream.cleanupDone == nil {
-		stream.cleanupDone = make(chan struct{})
-	}
-	stream.closing = true
-	if stream.cancel != nil {
-		stream.cancel()
+	reusable := !stream.closing && stream.fatalErr == nil
+	if reusable {
+		stream.lastView = now
 	}
 	stream.mtx.Unlock()
-	return stream, stream.cleanupDone, true
+	if reusable {
+		return stream, nil
+	}
+	return nil, m.scheduleStreamCleanupLocked(key, stream)
+}
+
+func (m *manager) scheduleStreamCleanupLocked(key streamKey, stream *streamInfo) <-chan struct{} {
+	done, started := stream.beginClose()
+	if !started {
+		return done
+	}
+	m.cleanupWG.Add(1)
+	go func() {
+		defer m.cleanupWG.Done()
+		m.finishStreamCleanup(key, stream)
+		m.unregisterCleanedStream(key, stream)
+	}()
+	return done
+}
+
+func waitForStreamCleanup(ctx context.Context, done <-chan struct{}) error {
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (m *manager) finishStreamCleanup(key streamKey, stream *streamInfo) {
@@ -79,7 +119,7 @@ func (m *manager) finishStreamCleanup(key streamKey, stream *streamInfo) {
 	log.Printf("Cleaning up stream: key=%v, dir=%s", key, stream.paths.outDir)
 	stream.generationMtx.Lock()
 	stream.playlistMtx.Lock()
-	if err := m.assets.RetireTree(stream.paths.outDir); err != nil && !errors.Is(err, errHlsAssetsBusy) {
+	if err := m.media.retireHls(stream.paths.outDir); err != nil {
 		log.Printf("Failed to cleanup directory: %s, err=%v", stream.paths.outDir, err)
 	}
 	stream.playlistMtx.Unlock()
@@ -105,22 +145,13 @@ func waitForStreamWorkers(stream *streamInfo) {
 	if stream.ready != nil {
 		<-stream.ready
 	}
-	stream.mtx.Lock()
-	jobs := make([]*segmentJob, 0, len(stream.videoJobs)+len(stream.subtitleJobs))
-	for job := range stream.videoJobs {
-		jobs = append(jobs, job)
-	}
-	for job := range stream.subtitleJobs {
-		jobs = append(jobs, job)
-	}
-	stream.mtx.Unlock()
-	for _, job := range jobs {
+	for _, job := range stream.activeJobs() {
 		<-job.done
 	}
 }
 
 func (m *manager) resetStreamOutput(paths streamPaths) error {
-	return m.assets.ResetTree(paths.outDir)
+	return m.media.resetHls(paths.outDir)
 }
 
 func (m *manager) TouchStream(_ context.Context, dirName string) {
@@ -130,9 +161,7 @@ func (m *manager) TouchStream(_ context.Context, dirName string) {
 	}
 	m.mu.Lock()
 	if stream, ok := m.active[key]; ok {
-		stream.mtx.Lock()
-		stream.lastView = time.Now()
-		stream.mtx.Unlock()
+		stream.touch(time.Now())
 	}
 	m.mu.Unlock()
 }

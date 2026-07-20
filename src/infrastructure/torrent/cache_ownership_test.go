@@ -82,7 +82,7 @@ func TestDiscardPreviousHlsStreamsExpiresOldProcessOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := discardPreviousHlsStreams(assets, root); err != nil {
+	if err := (&mediaCache{assets: assets}).discardHlsStreams(root); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(old); !errors.Is(err, os.ErrNotExist) {
