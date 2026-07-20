@@ -1611,8 +1611,11 @@ func (m *manager) ensureSubtitleSegment(ctx context.Context, s *streamInfo, inde
 			return errors.New("subtitle segment is outside the discovered range")
 		}
 	}
-	begin, end := m.timeline(s.mediaInfo.Duration).windowForSegment(index)
-	job, jobCtx, created, err := s.acquireJobLocked(subtitleSegmentJob, index, begin, end, false, m.scheduler, m.settings.MaxJobsPerStream())
+	// Subtitle extraction must never delay the foreground video horizon. Produce
+	// only the requested cue segment here; wider subtitle preparation is an
+	// explicitly preemptible background task.
+	begin, end := index, index+1
+	job, jobCtx, created, err := s.acquireJobLocked(subtitleSegmentJob, index, begin, end, true, m.scheduler, m.settings.MaxJobsPerStream())
 	if err != nil {
 		s.mtx.Unlock()
 		s.markSegmentError(index, err)

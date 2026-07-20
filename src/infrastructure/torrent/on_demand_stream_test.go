@@ -593,6 +593,77 @@ func TestSubtitleJobFailureBecomesVisible(t *testing.T) {
 	}
 }
 
+func TestRequestedSubtitleUsesOnePreemptibleSegment(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CINEMATOR_HLS_PATH", root)
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer assets.Close()
+
+	scheduler := newSegmentScheduler(3, 1)
+	holdCtx, releaseWorker := context.WithCancel(context.Background())
+	workerHeld := make(chan struct{})
+	go func() {
+		_ = scheduler.transcode(holdCtx, false, releaseWorker, func() error {
+			close(workerHeld)
+			<-holdCtx.Done()
+			return holdCtx.Err()
+		})
+	}()
+	<-workerHeld
+	defer releaseWorker()
+
+	streamCtx, closeStream := context.WithCancel(context.Background())
+	stream := &streamInfo{
+		ctx:           streamCtx,
+		paths:         streamPaths{outDir: root},
+		mediaInfo:     domain.MediaInfo{Duration: 120, Subtitles: []domain.SubtitleTrack{{Index: 0, Codec: "subrip"}}},
+		selection:     ffmpeg.StreamSelection{SubtitleTrackIndex: 0},
+		videoJobs:     make(map[*segmentJob]struct{}),
+		subtitleJobs:  make(map[*segmentJob]struct{}),
+		segmentErrors: make(map[int]segmentFailure),
+	}
+	manager := &manager{
+		media:     &mediaCache{assets: assets, budget: newCacheBudget(0)},
+		scheduler: scheduler,
+		settings:  settings.NewSettings(),
+	}
+	requestDone := make(chan error, 1)
+	go func() {
+		requestDone <- manager.ensureSubtitleSegment(context.Background(), stream, 7)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	var job *segmentJob
+	for time.Now().Before(deadline) {
+		stream.mtx.Lock()
+		for candidate := range stream.subtitleJobs {
+			job = candidate
+			break
+		}
+		stream.mtx.Unlock()
+		if job != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if job == nil {
+		t.Fatal("requested subtitle job was not admitted")
+	}
+	if job.begin != 7 || job.end != 8 || !job.background {
+		t.Fatalf("subtitle job = [%d,%d) background=%t, want [7,8) background", job.begin, job.end, job.background)
+	}
+
+	closeStream()
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("subtitle request did not stop with its stream")
+	}
+}
+
 func TestImmediateQueueFailureBecomesVisible(t *testing.T) {
 	stream := &streamInfo{
 		status:        domain.HlsStatus{Phase: "preparing"},

@@ -496,6 +496,7 @@
           consecutiveFailures = 0;
           const status = await response.json();
           if (seq !== playback.statusSeq) return;
+          classifyPendingSeek(status);
           renderHlsStatus(status, targetSeconds);
         } catch (error) {
           if (error.name !== 'AbortError' && seq === playback.statusSeq) {
@@ -523,6 +524,12 @@
       poll();
     }
 
+    function classifyPendingSeek(status) {
+      const attempt = playback.presentationAttempt;
+      if (attempt?.kind !== 'seek' || attempt.seekClass !== 'pending') return;
+      attempt.seekClass = status.phase === 'ready' ? 'cached' : 'cold';
+    }
+
     async function waitForHlsReady(streamDir, targetSeconds, signal) {
       for (;;) {
         const statusURL = `/api/hls/status/${encodeURIComponent(streamDir)}?target=${encodeURIComponent(targetSeconds)}`;
@@ -534,10 +541,7 @@
           throw new Error((await response.text()).trim() || `Status request failed (${response.status})`);
         }
         const status = await response.json();
-        const attempt = playback.presentationAttempt;
-        if (attempt?.kind === 'seek' && attempt.seekClass === 'pending') {
-          attempt.seekClass = status.phase === 'ready' ? 'cached' : 'cold';
-        }
+        classifyPendingSeek(status);
         renderHlsStatus(status, targetSeconds);
         if (status.phase === 'ready') return status;
         if (status.phase === 'error') {
@@ -1199,6 +1203,7 @@
       }
       const start = playback.mediaSeekable && Number.isFinite(resumeTime) && resumeTime > 0 ? resumeTime : 0;
       const request = playback.beginRequest(start);
+      playback.stopStatusPolling();
       const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
       const retainedHls = keepPlayerVisible ? playback.hls : null;
@@ -1526,6 +1531,9 @@
       playback.presentedFrameCount = 0;
       playback.stallStartedAt = 0;
       let decodedFrames = 0;
+      let lastUnpresentedMediaTime = Number(video.currentTime) || 0;
+      let unpresentedClockStartedAt = 0;
+      let firstFrameFailureHandled = false;
       const observe = now => observePresentedFrame(Number.isFinite(now) ? now : performance.now());
       if (video.requestVideoFrameCallback) {
         const next = () => {
@@ -1553,7 +1561,25 @@
         const now = performance.now();
         updateQoePlayingTime(now);
         const minimumFrames = frameRate > 0 ? 1 : 2;
-        if (playback.presentedFrameCount < minimumFrames || now - playback.lastPresentedFrameAt < stallThresholdMs || playback.stallStartedAt) return;
+        if (playback.presentedFrameCount < minimumFrames) {
+          const mediaTime = Number(video.currentTime) || 0;
+          if (mediaTime > lastUnpresentedMediaTime + 0.01) {
+            if (!unpresentedClockStartedAt) unpresentedClockStartedAt = now;
+            lastUnpresentedMediaTime = mediaTime;
+          }
+          if (!firstFrameFailureHandled && unpresentedClockStartedAt &&
+            now - unpresentedClockStartedAt >= Math.max(1000, stallThresholdMs)) {
+            firstFrameFailureHandled = true;
+            showWarning(
+              'Video is not rendering',
+              'The media clock is advancing without decoded video frames. Switching to the compatibility fallback.',
+            );
+            useCompatibilityFallback('The original stream did not produce decoded video frames; using the compatibility fallback.');
+            requestPlaybackRecovery('first-frame-missing', true);
+          }
+          return;
+        }
+        if (now - playback.lastPresentedFrameAt < stallThresholdMs || playback.stallStartedAt) return;
         playback.stallStartedAt = now;
         playback.stallWasUnderrun = !playback.timeline.buffered(mediaBufferedRanges(video), video.currentTime);
         playback.qoe.playbackStallCount++;
@@ -1638,14 +1664,16 @@
           }
           return;
         }
-        beginHlsStatusPolling(target, true);
         if (retained) {
           beginPresentationAttempt('seek', target, 'retained');
+          beginHlsStatusPolling(target, true);
           return;
         }
         const duration = Number(playback.mediaInfo?.duration);
         if (duration > 0) {
           startPlayback(Math.min(target, Math.max(0, duration - 0.001)), { keepPlayerVisible: true });
+        } else {
+          beginHlsStatusPolling(target, true);
         }
       }, options);
       video.addEventListener('seeked', () => {

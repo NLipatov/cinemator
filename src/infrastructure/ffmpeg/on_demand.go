@@ -378,6 +378,8 @@ func GenerateDirectWindow(
 	wasCovered := false
 	published := directPublishOutcome{firstPTS: math.NaN()}
 	monitorCtx, stopMonitor := context.WithCancel(ctx)
+	ffmpegCtx, stopFFmpegProcess := context.WithCancel(ctx)
+	defer stopFFmpegProcess()
 	stdin, stopFFmpeg, pipeErr := os.Pipe()
 	if pipeErr != nil {
 		stopMonitor()
@@ -400,9 +402,13 @@ func GenerateDirectWindow(
 		if outcome.covered || outcome.err != nil {
 			_, _ = io.WriteString(stopFFmpeg, "q\n")
 			_ = stopFFmpeg.Close()
+			// FFmpeg can be blocked in a torrent-backed input read and never
+			// consume its control input. Once a complete fragment covers the
+			// requested position, cancel the process as the reliable stop path.
+			stopFFmpegProcess()
 		}
 	}()
-	_, runErr := cli.RunWithStdin(ctx, stdin, "ffmpeg", args...)
+	_, runErr := cli.RunWithStdin(ffmpegCtx, stdin, "ffmpeg", args...)
 	_ = stdin.Close()
 	_ = stopFFmpeg.Close()
 	stopMonitor()

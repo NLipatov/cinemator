@@ -152,6 +152,7 @@ async function openMovie(page, {
   bufferStartOffset = 0,
   hlsSubtitleTrackCount = 0,
   freezeVideoFrames = false,
+  suppressVideoFrames = false,
   fragmentLoadMs = 0,
   initialBufferSeconds = 2,
   blockAutoplayOnce = false,
@@ -159,7 +160,7 @@ async function openMovie(page, {
   const prepareStarts = [];
   let presentationGeneration = 0;
 
-  await page.addInitScript(({ simulateEndSeek, bufferInitial, bufferOffset, subtitleTrackCount, freezeFrames, loadMs, bufferSeconds, blockAutoplay }) => {
+  await page.addInitScript(({ simulateEndSeek, bufferInitial, bufferOffset, subtitleTrackCount, freezeFrames, suppressFrames, loadMs, bufferSeconds, blockAutoplay }) => {
     window.__simulateAttachSeekToEnd = simulateEndSeek;
     window.__bufferInitialFragment = bufferInitial;
     window.__hlsBufferStartOffset = bufferOffset;
@@ -174,6 +175,7 @@ async function openMovie(page, {
     window.__hlsDestroyCount = 0;
     window.__videoPlayCalls = 0;
     window.__freezeVideoFrames = freezeFrames;
+    window.__suppressVideoFrames = suppressFrames;
     window.__fragmentLoadMs = loadMs;
     window.__initialBufferSeconds = bufferSeconds;
     window.__blockAutoplayOnce = blockAutoplay;
@@ -195,6 +197,7 @@ async function openMovie(page, {
         const id = ++window.__videoFrameCallbackID;
         const timer = setTimeout(() => {
           if (window.__cancelledVideoFrameCallbacks.has(id)) return;
+          if (window.__suppressVideoFrames) return;
           window.__presentedFrameCallbacks++;
           if (window.__freezeVideoFrames && window.__presentedFrameCallbacks > 1) return;
           callback(performance.now(), {
@@ -234,6 +237,7 @@ async function openMovie(page, {
     bufferOffset: bufferStartOffset,
     subtitleTrackCount: hlsSubtitleTrackCount,
     freezeFrames: freezeVideoFrames,
+    suppressFrames: suppressVideoFrames,
     loadMs: fragmentLoadMs,
     bufferSeconds: initialBufferSeconds,
     blockAutoplay: blockAutoplayOnce,
@@ -390,6 +394,26 @@ test('detects frozen video frames even while the player clock can advance', asyn
     stallFreeSession: false,
   });
   await expect.poll(() => prepareStarts, { timeout: 7000 }).toEqual([0, 0]);
+});
+
+test('falls back when the media clock advances before any video frame is decoded', async ({ page }) => {
+  const prepareRequests = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname === '/api/hls/prepare') prepareRequests.push(url);
+  });
+  await openMovie(page, { suppressVideoFrames: true });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__videoPlayCalls)).toBe(1);
+
+  await page.locator('video').evaluate(video => {
+    window.__unpresentedClock = setInterval(() => { video.currentTime += 0.1; }, 100);
+  });
+
+  await expect.poll(() => prepareRequests.length, { timeout: 4000 }).toBe(2);
+  expect(prepareRequests[1].searchParams.get('transcode')).toBe('1');
+  await expect(page.locator('#mediaDecision')).toContainText('compatibility fallback');
+  await page.evaluate(() => clearInterval(window.__unpresentedClock));
 });
 
 test('records autoplay rejection and restarts timing from the confirming play action', async ({ page }) => {
