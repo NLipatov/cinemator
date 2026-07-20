@@ -53,6 +53,12 @@ async function openLiveMovie(page) {
     .toBe(true);
   await expect.poll(() => video.evaluate(element => element.videoWidth), { timeout: 30_000 })
     .toBeGreaterThan(0);
+  const decodedFrames = await video.evaluate(element =>
+    element.getVideoPlaybackQuality?.().totalVideoFrames ?? element.webkitDecodedFrameCount ?? 0,
+  );
+  await expect.poll(() => video.evaluate(element =>
+    element.getVideoPlaybackQuality?.().totalVideoFrames ?? element.webkitDecodedFrameCount ?? 0,
+  ), { timeout: 30_000 }).toBeGreaterThan(decodedFrames + 5);
   return { telemetry, video };
 }
 
@@ -117,6 +123,7 @@ test.describe('live torrent playback', () => {
     const { telemetry, video } = await openLiveMovie(page);
     await video.evaluate(element => {
       window.__liveVideo = element;
+      element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
       element.currentTime = 120;
     });
     await expect.poll(() => telemetry.prepareStarts.at(-1)).toBe(120);
@@ -125,6 +132,15 @@ test.describe('live torrent playback', () => {
     expect(await page.evaluate(() => document.getElementById('video') === window.__liveVideo)).toBe(true);
     await expect.poll(() => video.evaluate(element => element.currentTime), { timeout: 120_000 })
       .toBeGreaterThan(120.5);
+    const decodedFrames = await video.evaluate(element =>
+      element.getVideoPlaybackQuality?.().totalVideoFrames ?? element.webkitDecodedFrameCount ?? 0,
+    );
+    await expect.poll(() => video.evaluate(element =>
+      element.getVideoPlaybackQuality?.().totalVideoFrames ?? element.webkitDecodedFrameCount ?? 0,
+    ), { timeout: 30_000 }).toBeGreaterThan(decodedFrames + 5);
+    await expect.poll(() => video.evaluate(element => element.currentTime), { timeout: 120_000 })
+      .toBeGreaterThan(126);
+    expect(await video.evaluate(element => element.currentTime)).toBeLessThan(150);
     expect(telemetry.consoleErrors).toEqual([]);
   });
 });

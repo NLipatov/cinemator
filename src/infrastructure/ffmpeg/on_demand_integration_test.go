@@ -73,6 +73,7 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 	if err := os.MkdirAll(directDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	var publishedDirect []HLSFragment
 	direct, err := GenerateDirectWindow(
 		context.Background(), source, directDir,
 		domain.MediaInfo{
@@ -84,12 +85,22 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 		},
 		StreamSelection{AudioTrackIndex: 0},
 		1, 1, 6*time.Second, 30*time.Second,
+		func(fragment HLSFragment) error {
+			if _, err := os.Stat(filepath.Join(directDir, fragment.Name)); err != nil {
+				return err
+			}
+			publishedDirect = append(publishedDirect, fragment)
+			return nil
+		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(direct.Fragments) == 0 || direct.Fragments[0].Start >= 6 {
 		t.Fatalf("direct window = %+v, want preroll before 6s", direct)
+	}
+	if len(publishedDirect) != len(direct.Fragments) {
+		t.Fatalf("published direct fragments = %d, result = %d", len(publishedDirect), len(direct.Fragments))
 	}
 	directProbe := runMediaCommand(t, "ffprobe",
 		"-v", "error", "-select_streams", "v:0",
@@ -110,7 +121,7 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 			AudioTracks: []domain.AudioTrack{{Codec: "aac"}},
 		},
 		StreamSelection{AudioTrackIndex: 0},
-		0, 5, 6*time.Second, 30*time.Second,
+		0, 5, 6*time.Second, 30*time.Second, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +149,7 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 			AudioTracks: []domain.AudioTrack{{Codec: "ac3", Channels: 6}},
 		},
 		StreamSelection{AudioTrackIndex: 0},
-		0, 2, 6*time.Second, 30*time.Second,
+		0, 2, 6*time.Second, 30*time.Second, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -255,7 +266,7 @@ func TestGenerateDirectWindowCoalescesFrequentKeyframes(t *testing.T) {
 		context.Background(), source, dir,
 		domain.MediaInfo{Duration: 4, VideoCodec: "h264", Width: 160, Height: 90},
 		StreamSelection{SubtitleTrackIndex: -1},
-		0, 2, 2*time.Second, 30*time.Second,
+		0, 2, 2*time.Second, 30*time.Second, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -312,7 +323,7 @@ func TestGenerateDirectWindowPreservesFMP4Video(t *testing.T) {
 					HDR:          true,
 				},
 				StreamSelection{SubtitleTrackIndex: -1},
-				0, 1, 2*time.Second, 30*time.Second,
+				0, 1, 2*time.Second, 30*time.Second, nil,
 			)
 			if err != nil {
 				t.Fatal(err)
@@ -365,7 +376,7 @@ func TestAnalyzeTailDurationBeyondSeekWindow(t *testing.T) {
 		context.Background(), source, outDir,
 		domain.MediaInfo{Duration: 40, VideoCodec: "h264", Width: 64, Height: 64},
 		StreamSelection{SubtitleTrackIndex: -1},
-		2, 1, 6*time.Second, 30*time.Second,
+		2, 1, 6*time.Second, 30*time.Second, nil,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -385,13 +396,18 @@ func TestAnalyzeTailDurationBeyondSeekWindow(t *testing.T) {
 		context.Background(), longGOP, t.TempDir(),
 		domain.MediaInfo{Duration: 40, VideoCodec: "h264", Width: 64, Height: 64},
 		StreamSelection{SubtitleTrackIndex: -1},
-		5, 1, 6*time.Second, 40*time.Second,
+		5, 1, 6*time.Second, 40*time.Second, nil,
 	)
 	if err != nil {
 		t.Fatalf("final long-GOP window fell back to transcoding: %v", err)
 	}
 	if !tail.ReachedEnd || len(tail.Fragments) == 0 {
 		t.Fatalf("final long-GOP window = %+v, want a finalized direct tail", tail)
+	}
+	for _, fragment := range tail.Fragments {
+		if fragment.Duration > 6.25 {
+			t.Fatalf("long-GOP fragment duration = %.3fs, want at most the configured 6s boundary", fragment.Duration)
+		}
 	}
 }
 

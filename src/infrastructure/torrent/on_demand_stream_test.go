@@ -114,12 +114,31 @@ func TestIndependentSegmentJobsDoNotCancelEachOther(t *testing.T) {
 
 func TestEnsureHlsAssetRejectsStaleGeneration(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	root := t.TempDir()
+	paths := key.paths(root)
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	direct := "direct_000000_0000.ts"
+	if err := os.WriteFile(filepath.Join(paths.outDir, direct), []byte("immutable"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ready := make(chan struct{})
 	close(ready)
-	stream := &streamInfo{ready: ready, assetVersion: "current"}
-	manager := &manager{active: map[streamKey]*streamInfo{key: stream}}
+	stream := &streamInfo{ready: ready, assetVersion: "current", paths: paths}
+	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, media: &mediaCache{assets: assets}}
 	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), "index.m3u8", "stale"); !errors.Is(err, domain.ErrHlsPlaylistChanged) {
 		t.Fatalf("stale generation error = %v", err)
+	}
+	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), direct, "stale"); err != nil {
+		t.Fatalf("immutable stale segment error = %v", err)
+	}
+	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), "direct_000000_0001.ts", "stale"); !errors.Is(err, domain.ErrHlsPlaylistChanged) {
+		t.Fatalf("missing stale segment error = %v", err)
 	}
 	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), "master.m3u8", ""); err != nil {
 		t.Fatalf("master playlist without version error = %v", err)
@@ -408,6 +427,57 @@ func TestDirectFragmentsReportTheRequestedTimeReady(t *testing.T) {
 	}
 }
 
+func TestMaterializedPresentationExcludesDisjointCachedWindows(t *testing.T) {
+	windows := map[int][]ffmpeg.HLSFragment{
+		0:   {{Start: 0, Duration: 30, Name: "start.ts"}},
+		193: {{Start: 386, Duration: 30, Name: "middle.ts"}},
+		660: {{Start: 1320, Duration: 30, Name: "target.ts"}},
+	}
+	fragments := materializedFragmentsForTarget(windows, 1320)
+	if len(fragments) != 1 || fragments[0].Name != "target.ts" {
+		t.Fatalf("target presentation = %#v", fragments)
+	}
+	if origin, ok := materializedPresentationOrigin(windows, 1320); !ok || origin != 1320 {
+		t.Fatalf("target origin = %.3f, %t", origin, ok)
+	}
+}
+
+func TestPublishCachedTargetRebuildsOnlyItsContinuousPresentation(t *testing.T) {
+	dir := t.TempDir()
+	stream := &streamInfo{
+		paths: streamPaths{
+			outDir:           dir,
+			videoPlaylist:    filepath.Join(dir, "index.m3u8"),
+			subtitlePlaylist: filepath.Join(dir, "subs.m3u8"),
+			masterPlaylist:   filepath.Join(dir, "master.m3u8"),
+		},
+		assetVersion:       "old",
+		directPlay:         true,
+		selection:          ffmpeg.StreamSelection{AudioTrackIndex: -1, SubtitleTrackIndex: -1},
+		mediaInfo:          domain.MediaInfo{Duration: 300},
+		presentationTarget: 0,
+		directWindows: map[int][]ffmpeg.HLSFragment{
+			0:   {{Start: 0, Duration: 30, Name: "start.ts"}},
+			100: {{Start: 200, Duration: 30, Name: "target.ts"}},
+		},
+	}
+	manager := &manager{settings: settings.NewSettings(), media: &mediaCache{}}
+	target := manager.timeline(stream.mediaInfo.Duration).locate(220)
+	if err := manager.publishCachedTarget(stream, target); err != nil {
+		t.Fatal(err)
+	}
+	playlist, err := os.ReadFile(stream.paths.videoPlaylist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(playlist), "start.ts") || !strings.Contains(string(playlist), "target.ts") {
+		t.Fatalf("cached target presentation:\n%s", playlist)
+	}
+	if stream.presentationTarget != 220 || stream.progressiveSequence != target.segment || stream.assetVersion == "old" {
+		t.Fatalf("cached target state = target %.1f sequence %d version %q", stream.presentationTarget, stream.progressiveSequence, stream.assetVersion)
+	}
+}
+
 func TestParseDirectSegmentOwner(t *testing.T) {
 	for _, name := range []string{"direct_000015_0003.ts", "direct_000015_0003.m4s"} {
 		owner, ok := parseDirectSegmentOwner(name)
@@ -569,6 +639,13 @@ func TestPublishingLargerTargetDurationKeepsMaterializedHistory(t *testing.T) {
 	if len(stream.directWindows) != 2 || len(stream.directWindows[0]) != 1 {
 		t.Fatalf("rotated materialized history = %#v", stream.directWindows)
 	}
+	playlist, err := os.ReadFile(stream.paths.videoPlaylist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(playlist), "first.m4s") || !strings.Contains(string(playlist), "distant.m4s") {
+		t.Fatalf("active presentation contains disjoint cache history:\n%s", playlist)
+	}
 }
 
 func TestDirectFragmentsCanBeAddedBeforeExistingHistory(t *testing.T) {
@@ -585,7 +662,7 @@ func TestDirectFragmentsCanBeAddedBeforeExistingHistory(t *testing.T) {
 	}
 }
 
-func TestDuplicateDirectWindowPublicationSucceedsWhenAlreadyMaterialized(t *testing.T) {
+func TestDirectWindowPublicationExtendsAnExistingOwner(t *testing.T) {
 	dir := t.TempDir()
 	stream := &streamInfo{
 		paths: streamPaths{
@@ -594,18 +671,23 @@ func TestDuplicateDirectWindowPublicationSucceedsWhenAlreadyMaterialized(t *test
 			subtitlePlaylist: filepath.Join(dir, "subs.m3u8"),
 			masterPlaylist:   filepath.Join(dir, "master.m3u8"),
 		},
-		assetVersion:  "current",
-		directPlay:    true,
-		mediaInfo:     domain.MediaInfo{Duration: 300},
-		directWindows: map[int][]ffmpeg.HLSFragment{3: {{Start: 6, Duration: 2, Name: "existing.m4s"}}},
+		assetVersion:       "current",
+		directPlay:         true,
+		presentationTarget: 6,
+		mediaInfo:          domain.MediaInfo{Duration: 300},
+		directWindows:      map[int][]ffmpeg.HLSFragment{3: {{Start: 6, Duration: 2, Name: "existing.m4s"}}},
 	}
 	manager := &manager{settings: settings.NewSettings()}
-	job := &segmentJob{begin: 3}
-	duplicate := []ffmpeg.HLSFragment{{Start: 6, Duration: 2, Name: "duplicate.m4s"}}
-	if err := manager.publishMaterializedWindow(stream, job, duplicate, true, true, 4, false); err != nil {
+	job := &segmentJob{begin: 3, targetSeconds: 6}
+	extension := []ffmpeg.HLSFragment{
+		{Start: 6, Duration: 2, Name: "duplicate.m4s"},
+		{Start: 8, Duration: 2, Name: "extension.m4s"},
+	}
+	if err := manager.publishMaterializedWindow(stream, job, extension, true, true, 5, false); err != nil {
 		t.Fatal(err)
 	}
-	if len(stream.directWindows) != 1 || stream.directWindows[3][0].Name != "existing.m4s" {
+	if len(stream.directWindows) != 1 || len(stream.directWindows[3]) != 2 ||
+		stream.directWindows[3][0].Name != "existing.m4s" || stream.directWindows[3][1].Name != "extension.m4s" {
 		t.Fatalf("materialized windows = %#v", stream.directWindows)
 	}
 }
@@ -627,26 +709,17 @@ func TestNextDirectWindowStartsAfterMaterializedSourceCoverage(t *testing.T) {
 	}
 }
 
-func TestProgressivePrefetchDoesNotOverlapCoveredGapBeforeActiveJob(t *testing.T) {
-	active := &segmentJob{begin: 2, end: 15, done: make(chan struct{})}
-	stream := &streamInfo{
-		ctx:                   context.Background(),
-		directPlay:            true,
-		mediaInfo:             domain.MediaInfo{Duration: 120},
-		progressiveAdvertised: 1,
-		directWindows: map[int][]ffmpeg.HLSFragment{
-			0: {{Start: 0, Duration: 2.1, Name: "first.m4s"}},
-		},
-		videoJobs:    map[*segmentJob]struct{}{active: {}},
-		subtitleJobs: make(map[*segmentJob]struct{}),
+func TestNextUncoveredDirectSegmentRequiresTheWholeSegment(t *testing.T) {
+	timeline := newPlaybackTimeline(2*time.Second, 15, 120)
+	windows := map[int][]ffmpeg.HLSFragment{
+		0: {{Start: 0, Duration: 2.1, Name: "first.m4s"}},
 	}
-	manager := &manager{
-		settings:  settings.NewSettings(),
-		scheduler: newSegmentScheduler(4, 1),
+	if begin := nextUncoveredDirectSegment(windows, timeline, 0, 15); begin != 1 {
+		t.Fatalf("next uncovered segment = %d, want 1", begin)
 	}
-	manager.prefetchProgressiveWindow(stream, 1)
-	if len(stream.videoJobs) != 1 {
-		t.Fatalf("video jobs = %d, want existing job only", len(stream.videoJobs))
+	windows[0][0].Duration = 4
+	if begin := nextUncoveredDirectSegment(windows, timeline, 0, 15); begin != 2 {
+		t.Fatalf("next uncovered segment = %d, want 2", begin)
 	}
 }
 

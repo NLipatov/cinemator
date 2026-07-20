@@ -132,6 +132,36 @@ func TestSessionAdmissionCancelsSupersededUnobservedTarget(t *testing.T) {
 	second.releaseAdmission()
 }
 
+func TestSessionAdmissionReplacesOverlappingBackgroundWorkForAViewer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &streamInfo{
+		ctx:          ctx,
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	scheduler := newSegmentScheduler(2, 1)
+
+	stream.mtx.Lock()
+	background, backgroundCtx, _, err := stream.acquireJobLocked(videoSegmentJob, 10, 10, 25, true, scheduler, 2)
+	if err != nil {
+		stream.mtx.Unlock()
+		t.Fatal(err)
+	}
+	foreground, _, created, err := stream.acquireJobLocked(videoSegmentJob, 12, 12, 13, false, scheduler, 2)
+	stream.mtx.Unlock()
+	if err != nil || !created || foreground == background {
+		t.Fatalf("foreground admission = %p, %v, created=%t; background=%p", foreground, err, created, background)
+	}
+	select {
+	case <-backgroundCtx.Done():
+	default:
+		t.Fatal("overlapping background work was not canceled")
+	}
+	background.releaseAdmission()
+	foreground.releaseAdmission()
+}
+
 func TestStreamKeyPaths(t *testing.T) {
 	root := t.TempDir()
 	paths := (streamKey{InfoHash: "hash", Index: 2, Audio: 0, Subtitle: 3}).paths(root)

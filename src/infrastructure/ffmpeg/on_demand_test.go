@@ -34,7 +34,7 @@ func TestPublishFileWithoutReplacementKeepsPublishedAsset(t *testing.T) {
 	}
 }
 
-func TestPrepareOnDemandHLSAdvertisesNoUnmaterializedAssets(t *testing.T) {
+func TestPrepareOnDemandHLSPublishesVirtualTextSubtitleTimeline(t *testing.T) {
 	dir := t.TempDir()
 	info := domain.MediaInfo{
 		Duration:  30,
@@ -60,14 +60,20 @@ func TestPrepareOnDemandHLSAdvertisesNoUnmaterializedAssets(t *testing.T) {
 	assertFileContains(t, dir+"/master.m3u8", "SUBTITLES=\"subs\"")
 	assertFileContains(t, dir+"/master.m3u8", "BANDWIDTH=150000000")
 	assertFileContains(t, dir+"/master.m3u8", "index.m3u8?v=v1")
-	for _, playlist := range []string{dir + "/index.m3u8", dir + "/subs.m3u8"} {
-		data, err := os.ReadFile(playlist)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(string(data), ".ts") || strings.Contains(string(data), ".vtt") ||
-			strings.Contains(string(data), ".m4s") || strings.Contains(string(data), "#EXT-X-ENDLIST") {
-			t.Fatalf("initial playlist advertises unmaterialized media:\n%s", data)
+	video, err := os.ReadFile(dir + "/index.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(video), ".ts") || strings.Contains(string(video), ".m4s") || strings.Contains(string(video), "#EXT-X-ENDLIST") {
+		t.Fatalf("initial video playlist advertises unmaterialized media:\n%s", video)
+	}
+	subtitles, err := os.ReadFile(dir + "/subs.m3u8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"#EXT-X-MEDIA-SEQUENCE:0", "subs_000000.vtt?v=v1", "subs_000001.vtt?v=v1", "subs_000002.vtt?v=v1", "#EXT-X-ENDLIST"} {
+		if !strings.Contains(string(subtitles), want) {
+			t.Fatalf("virtual subtitle playlist missing %q:\n%s", want, subtitles)
 		}
 	}
 }
@@ -154,6 +160,9 @@ func TestBuildMaterializedPlaylistContainsOnlyMaterializedFragments(t *testing.T
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("progressive direct playlist contains %q:\n%s", unwanted, got)
 		}
+	}
+	if strings.Contains(got, "#EXT-X-INDEPENDENT-SEGMENTS") {
+		t.Fatalf("split direct playlist claims independent segments:\n%s", got)
 	}
 }
 

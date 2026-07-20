@@ -106,14 +106,19 @@
       constructor() { this.reset(); }
       reset() {
         this.sourceStart = 0;
+        this.presentationOrigin = 0;
         this.mediaAnchor = null;
         this.absolute = false;
       }
       configure({ sourceStart, duration, presentationOrigin, seekable }) {
         this.sourceStart = Math.max(0, Number(sourceStart) || 0);
+        this.presentationOrigin = Math.max(0, Number(presentationOrigin) || 0);
         this.mediaAnchor = null;
         this.absolute = Boolean(seekable && Number.isFinite(duration) && duration > 0);
-        return this.absolute ? Number(presentationOrigin) : undefined;
+        return this.absolute ? this.presentationOrigin : undefined;
+      }
+      hlsTime(sourceTime) {
+        return this.absolute ? Math.max(0, sourceTime - this.presentationOrigin) : sourceTime;
       }
       sourceTime(currentTime) {
         if (currentTime === undefined) return this.sourceStart;
@@ -155,6 +160,7 @@
         this.streamDir = null;
         this.generation = '';
         this.attaching = false;
+        this.userSeekIntentUntil = 0;
         this.mediaSeekable = true;
         this.mediaInfo = null;
         this.mode = '';
@@ -226,6 +232,7 @@
       playback.streamDir = null;
       playback.generation = '';
       playback.attaching = false;
+      playback.userSeekIntentUntil = 0;
       playback.timeline.reset();
       const mediaDialog = $('mediaInfoDialog');
       if (mediaDialog?.open) mediaDialog.close();
@@ -1174,7 +1181,8 @@
         const playlistURL = new URL(prepared.playlist, window.location.href);
         const reusesPresentation = retainedHls && playback.hls === retainedHls &&
           prepared.stream === playback.streamDir &&
-          readyStatus.generation && readyStatus.generation === playback.generation;
+          readyStatus.generation && readyStatus.generation === playback.generation &&
+          Math.abs((retainedHls.config?.timelineOffset || 0) - presentationOrigin) < 0.001;
         if (retainedHls && playback.hls === retainedHls && !reusesPresentation) {
           destroyVideoAndHls({ resetLayout: false });
         }
@@ -1183,7 +1191,7 @@
         showPlaybackNotice();
         beginHlsStatusPolling(start);
         if (reusesPresentation) {
-          retainedHls.startLoad?.(start);
+          retainedHls.startLoad?.(playback.timeline.hlsTime(start));
           return;
         }
         const m3u8 = playlistURL.pathname + '?t=' + Date.now();
@@ -1329,8 +1337,16 @@
         showPlaybackNotice();
         removeWarning();
       }, options);
+      const markUserSeekIntent = () => {
+        playback.userSeekIntentUntil = Date.now() + 1500;
+      };
+      video.addEventListener('pointerdown', markUserSeekIntent, options);
+      video.addEventListener('keydown', markUserSeekIntent, options);
       video.addEventListener('seeking', () => {
-        if (playback.attaching) return;
+        const userInitiated = Date.now() <= playback.userSeekIntentUntil;
+        playback.userSeekIntentUntil = 0;
+        if (playback.attaching && !userInitiated) return;
+        playback.attaching = false;
         const target = playback.timeline.sourceTime(video.currentTime);
         const retained = playback.timeline.contains(
           target,
@@ -1341,7 +1357,7 @@
           if (playback.isRequesting(target)) return;
           playback.cancelRequest();
           if (retained) {
-            if (playback.hls?.startLoad) playback.hls.startLoad(target);
+            if (playback.hls?.startLoad) playback.hls.startLoad(playback.timeline.hlsTime(target));
             playback.lastActivityAt = Date.now();
             removeWarning();
             showPlaybackNotice();
@@ -1427,17 +1443,26 @@
       let mainFragBuffered = false;
       let playbackStartRequested = false;
       function currentPositionBuffered() {
-        return playback.timeline.buffered(mediaBufferedRanges(video), video.currentTime);
+        const ranges = mediaBufferedRanges(video);
+        if (playback.timeline.buffered(ranges, video.currentTime)) return true;
+        if (!playback.timeline.absolute) return false;
+        const next = ranges.find(range => range.start > video.currentTime && range.start - video.currentTime <= 0.25);
+        if (!next) return false;
+        video.currentTime = next.start;
+        return true;
       }
       function markStreamActive() {
         mainFragBuffered = currentPositionBuffered();
-        if (!mainFragBuffered) return;
+        if (!mainFragBuffered) return false;
+        playback.attaching = false;
+        playback.userSeekIntentUntil = 0;
         playback.timeline.anchor(video.currentTime);
         playback.nativeRetries = 0;
         playback.lastActivityAt = Date.now();
         playback.forcedRecoveryAttempts = 0;
         showPlaybackNotice();
         removeWarning();
+        return true;
       }
       function markPlaybackProgress() {
         playback.lastActivityAt = Date.now();
@@ -1472,7 +1497,7 @@
           seekable: playback.mediaSeekable,
         });
         playback.hls = new Hls({
-          startPosition: playback.timeline.absolute ? Math.max(sourceStart, presentationStart) : -1,
+          autoStartLoad: false,
           timelineOffset: playback.timeline.absolute ? presentationStart : undefined,
           initialLiveManifestSize: 1,
           liveSyncMode: 'buffered',
@@ -1499,14 +1524,27 @@
           playlistLoadPolicy: longHlsLoadPolicy(),
         });
         playback.hls.on(Hls.Events.MANIFEST_PARSED, () => {
-          playback.attaching = false;
           playback.lastActivityAt = Date.now();
+          if (playback.timeline.absolute && Math.abs(video.currentTime - sourceStart) > 0.01) {
+            video.currentTime = sourceStart;
+          }
+          playback.hls.startLoad(playback.timeline.absolute
+            ? 0
+            : -1);
           if (enableSubtitles && playback.hls.subtitleTracks && playback.hls.subtitleTracks.length > 0) {
             playback.hls.subtitleTrack = 0;
             playback.hls.subtitleDisplay = true;
             showSubtitleTextTracks(video);
             reapplySubtitleDelay();
           }
+        });
+        let initialLevelPositioned = false;
+        playback.hls.on(Hls.Events.LEVEL_LOADED, () => {
+          if (initialLevelPositioned) return;
+          initialLevelPositioned = true;
+          playback.hls.startLoad(playback.timeline.absolute
+            ? 0
+            : -1);
         });
         playback.hls.on(Hls.Events.MEDIA_ATTACHED, (evt, data) => {
           const mediaSource = data?.mediaSource;
@@ -1530,8 +1568,7 @@
         playback.hls.on(Hls.Events.FRAG_LOADED, markPlaybackProgress);
         playback.hls.on(Hls.Events.FRAG_BUFFERED, (evt, data) => {
           if (!data?.frag || data.frag.type === 'main') {
-            markStreamActive();
-            requestPlaybackStart();
+            if (markStreamActive()) requestPlaybackStart();
           }
         });
         playback.hls.on(Hls.Events.ERROR, (evt, data) => {
@@ -1567,10 +1604,9 @@
           : video);
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
-        video.addEventListener('loadedmetadata', () => { playback.attaching = false; }, { once: true, signal: playback.events.signal });
+        video.addEventListener('loadedmetadata', () => { playback.lastActivityAt = Date.now(); }, { once: true, signal: playback.events.signal });
         video.addEventListener('canplay', () => {
-          markStreamActive();
-          requestPlaybackStart();
+          if (markStreamActive()) requestPlaybackStart();
         }, { once: true, signal: playback.events.signal });
         video.addEventListener('playing', markStreamActive, eventOptions);
         video.addEventListener('progress', markPlaybackProgress, eventOptions);

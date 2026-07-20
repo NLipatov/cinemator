@@ -76,6 +76,14 @@ func (t playbackTimeline) segmentStart(index int) float64 {
 	return float64(max(0, index)) * t.segmentDuration.Seconds()
 }
 
+func (t playbackTimeline) segmentEnd(index int) float64 {
+	end := t.segmentStart(index + 1)
+	if t.durationSeconds > 0 {
+		end = min(end, t.durationSeconds)
+	}
+	return end
+}
+
 func (t playbackTimeline) containsSegment(index int) bool {
 	if index < 0 {
 		return false

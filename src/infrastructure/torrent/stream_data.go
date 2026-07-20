@@ -357,7 +357,7 @@ func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTime
 		status.Seekable = s.mediaInfo.Seekable
 		status.Duration = s.mediaInfo.Duration
 		status.Message = ""
-		if origin, ok := materializedPresentationOrigin(s.directWindows); ok {
+		if origin, ok := materializedPresentationOrigin(s.directWindows, s.presentationTarget); ok {
 			status.PresentationOriginSeconds = origin
 		}
 		publishedReady = directFragmentsCoverTime(s.directWindows, targetSeconds)
@@ -461,7 +461,10 @@ func (s *streamInfo) acquireJobLocked(kind segmentJobKind, requestIndex, begin, 
 		name = "subtitle"
 	}
 	if job := findSegmentJob(jobs, requestIndex); job != nil {
-		return job, nil, false, nil
+		if kind != videoSegmentJob || background || !job.background || job.cancel == nil {
+			return job, nil, false, nil
+		}
+		job.cancel()
 	}
 	if kind == videoSegmentJob && !background {
 		cancelAbandonedJobsLocked(jobs, begin, end)

@@ -6,6 +6,7 @@ const fakeHls = String.raw`
   class FakeHls {
     static Events = {
       MANIFEST_PARSED: 'manifestParsed',
+      LEVEL_LOADED: 'levelLoaded',
       MEDIA_ATTACHED: 'mediaAttached',
       SUBTITLE_TRACK_LOADED: 'subtitleTrackLoaded',
       SUBTITLE_TRACK_SWITCH: 'subtitleTrackSwitch',
@@ -21,7 +22,7 @@ const fakeHls = String.raw`
     constructor(config) {
       this.config = config;
       this.handlers = new Map();
-      this.subtitleTracks = [];
+      this.subtitleTracks = Array.from({ length: window.__hlsSubtitleTrackCount || 0 }, () => ({}));
       window.__hlsConfigs.push(config);
       window.__hlsInstances.push(this);
     }
@@ -41,7 +42,10 @@ const fakeHls = String.raw`
       const media = input.media || input;
       this.media = media;
       const requestedDuration = input.overrides?.duration;
-      media.play = () => Promise.resolve();
+      media.play = () => {
+        window.__videoPlayCalls++;
+        return Promise.resolve();
+      };
       window.__hlsAttachments.push({
         duration: requestedDuration,
         timelineOffset: this.config.timelineOffset,
@@ -57,26 +61,31 @@ const fakeHls = String.raw`
           mediaSource: { readyState: 'open', duration: requestedDuration },
         });
         const requestedStart = Number(this.source.match(/stream-([0-9.]+)/)?.[1] || 0);
+        const earlySeek = Number(media.currentTime) || 0;
+        const start = this.config.timelineOffset || 0;
+        this.latestLevelDetails = { fragments: [{ start, duration: 2 }] };
+        this.emit(FakeHls.Events.MANIFEST_PARSED);
+        this.emit(FakeHls.Events.LEVEL_LOADED);
+        const requestedLoad = Number(this.startLoadPosition);
+        const loadPosition = requestedLoad >= 0
+          ? requestedLoad + start
+          : earlySeek > 0.25
+          ? earlySeek
+          : requestedStart;
+        window.__hlsLoadPositions.push(loadPosition);
+        this.latestLevelDetails = {
+          fragments: [{ start, duration: Math.max(2, requestedStart - start + 2) }],
+        };
         if (window.__simulateAttachSeekToEnd && requestedStart > 0 && Number.isFinite(requestedDuration)) {
           media.currentTime = requestedDuration;
           media.dispatchEvent(new Event('seeking'));
         }
-        const earlySeek = Number(media.currentTime) || 0;
-        const configuredStart = Number(this.config.startPosition);
-        const loadPosition = configuredStart >= 0
-          ? configuredStart
-          : earlySeek > 0.25
-          ? earlySeek + (this.config.timelineOffset || 0)
-          : requestedStart;
-        window.__hlsLoadPositions.push(loadPosition);
-        const start = this.config.timelineOffset || 0;
-        this.latestLevelDetails = { fragments: [{ start, duration: 2 }] };
-        this.emit(FakeHls.Events.MANIFEST_PARSED);
-        if (window.__bufferInitialFragment && Math.abs(loadPosition - requestedStart) <= 0.25) {
+        if (window.__bufferInitialFragment && loadPosition <= requestedStart + 0.25) {
           media.currentTime = requestedStart;
+          const bufferStart = requestedStart + (requestedStart > 0 ? window.__hlsBufferStartOffset : 0);
           Object.defineProperty(media, 'buffered', {
             configurable: true,
-            value: { length: 1, start: () => requestedStart, end: () => requestedStart + 2 },
+            value: { length: 1, start: () => bufferStart, end: () => requestedStart + 2 },
           });
           this.emit(FakeHls.Events.FRAG_BUFFERED, { frag: { type: 'main' } });
         }
@@ -84,7 +93,10 @@ const fakeHls = String.raw`
       queueMicrotask(finishAttachment);
     }
     stopLoad() { window.__hlsStopLoads++; }
-    startLoad(position) { window.__hlsStartLoads.push(position); }
+    startLoad(position) {
+      this.startLoadPosition = position;
+      window.__hlsStartLoads.push(position);
+    }
     slideLiveWindow(start) {
       this.latestLevelDetails = { fragments: [{ start, duration: 2 }] };
       if (this.config.liveSyncMode !== 'buffered') this.media.currentTime = start;
@@ -108,13 +120,17 @@ async function openMovie(page, {
   simulateAttachSeekToEnd = false,
   stableStream = false,
   bufferInitialFragment = true,
+  bufferStartOffset = 0,
+  hlsSubtitleTrackCount = 0,
 } = {}) {
   const prepareStarts = [];
   let presentationGeneration = 0;
 
-  await page.addInitScript(({ simulateEndSeek, bufferInitial }) => {
+  await page.addInitScript(({ simulateEndSeek, bufferInitial, bufferOffset, subtitleTrackCount }) => {
     window.__simulateAttachSeekToEnd = simulateEndSeek;
     window.__bufferInitialFragment = bufferInitial;
+    window.__hlsBufferStartOffset = bufferOffset;
+    window.__hlsSubtitleTrackCount = subtitleTrackCount;
     window.__hlsConfigs = [];
     window.__hlsInstances = [];
     window.__hlsSources = [];
@@ -123,6 +139,7 @@ async function openMovie(page, {
     window.__hlsStopLoads = 0;
     window.__hlsStartLoads = [];
     window.__hlsDestroyCount = 0;
+    window.__videoPlayCalls = 0;
     class FakeEventSource {
       addEventListener() {}
       close() {}
@@ -138,7 +155,12 @@ async function openMovie(page, {
         }),
       },
     });
-  }, { simulateEndSeek: simulateAttachSeekToEnd, bufferInitial: bufferInitialFragment });
+  }, {
+    simulateEndSeek: simulateAttachSeekToEnd,
+    bufferInitial: bufferInitialFragment,
+    bufferOffset: bufferStartOffset,
+    subtitleTrackCount: hlsSubtitleTrackCount,
+  });
 
   await page.route('https://cdn.jsdelivr.net/npm/hls.js@1.6.13', route => route.fulfill({
     contentType: 'text/javascript',
@@ -208,7 +230,9 @@ async function openMovie(page, {
         json: customStatus ? { generation, ...customStatus } : {
           phase: 'ready',
           targetSeconds,
-          presentationOriginSeconds: Math.floor(Math.floor(targetSeconds / 2) / 15) * 30,
+          presentationOriginSeconds: stableStream
+            ? 0
+            : Math.floor(Math.floor(targetSeconds / 2) / 15) * 30,
           generation,
           bytesRead: 1024,
           activePeers: 1,
@@ -239,6 +263,19 @@ test('exposes the complete source duration before the full torrent is available'
   });
 });
 
+test('enables the selected text subtitle rendition', async ({ page }) => {
+  await openMovie(page, {
+    hlsSubtitleTrackCount: 1,
+    mediaInfo: { subtitles: [{ index: 0, codec: 'subrip', language: 'eng' }] },
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await page.locator('#subtitleSelect').selectOption('0');
+  await page.getByRole('button', { name: 'Play', exact: true }).click();
+
+  await expect.poll(() => page.evaluate(() => window.__hlsInstances.at(-1)?.subtitleTrack)).toBe(0);
+  await expect.poll(() => page.evaluate(() => window.__hlsInstances.at(-1)?.subtitleDisplay)).toBe(true);
+});
+
 test('starts at the first published timestamp when it is later than zero', async ({ page }) => {
   await openMovie(page, {
     getHlsStatus: targetSeconds => ({
@@ -253,7 +290,7 @@ test('starts at the first published timestamp when it is later than zero', async
   await page.getByRole('button', { name: 'Select tracks' }).click();
 
   await expect.poll(() => page.evaluate(() => window.__hlsConfigs.length)).toBe(1);
-  await expect.poll(() => page.evaluate(() => window.__hlsConfigs[0].startPosition)).toBe(0.083333);
+  await expect.poll(() => page.evaluate(() => window.__hlsStartLoads[0])).toBe(0);
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments[0].timelineOffset)).toBe(0.083333);
   await expect.poll(() => page.evaluate(() => window.__hlsLoadPositions[0])).toBe(0.083333);
 });
@@ -279,8 +316,36 @@ test('uses the server presentation origin without deriving a nominal window orig
 
   await expect.poll(() => prepareStarts).toEqual([0, 7199]);
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.at(-1).timelineOffset)).toBe(7168.25);
-  await expect.poll(() => page.evaluate(() => window.__hlsConfigs.at(-1).startPosition)).toBe(7199);
-  await expect.poll(() => page.evaluate(() => window.__hlsLoadPositions.at(-1))).toBe(7199);
+  await expect.poll(() => page.evaluate(() => window.__hlsStartLoads.at(-1))).toBe(0);
+  await expect.poll(() => page.evaluate(() => window.__hlsLoadPositions.at(-1))).toBe(7168.25);
+});
+
+test('starts from the closest decoded frame after a 22 minute seek', async ({ page }) => {
+  const prepareStarts = await openMovie(page, {
+    bufferStartOffset: 0.062,
+    getHlsStatus: targetSeconds => ({
+      phase: 'ready',
+      targetSeconds,
+      presentationOriginSeconds: targetSeconds > 0 ? 1319.109 : 0,
+      bytesRead: 1024,
+      activePeers: 1,
+      totalPeers: 1,
+    }),
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+  const initialPlayCalls = await page.evaluate(() => window.__videoPlayCalls);
+
+  await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.currentTime = 1320;
+    video.dispatchEvent(new Event('seeking'));
+  });
+
+  await expect.poll(() => prepareStarts).toEqual([0, 1320]);
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(1320.062);
+  await expect.poll(() => page.evaluate(() => window.__videoPlayCalls)).toBeGreaterThan(initialPlayCalls);
 });
 
 test('rejects seekable playback when the server omits the presentation origin', async ({ page }) => {
@@ -323,7 +388,7 @@ test('keeps the same player and buffers an unmaterialized HLS position', async (
     duration,
     timelineOffset: 7170,
   });
-  await expect.poll(() => page.evaluate(() => window.__hlsLoadPositions.at(-1))).toBe(7199);
+  await expect.poll(() => page.evaluate(() => window.__hlsLoadPositions.at(-1))).toBe(7170);
   await expect.poll(() => page.evaluate(() => document.getElementById('video') === window.__videoBeforeSeek)).toBe(true);
   await expect.poll(() => page.locator('video').evaluate(video => video.duration)).toBe(duration);
   await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(7199);
@@ -384,6 +449,7 @@ test('accepts a seek before the first media fragment is buffered', async ({ page
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
 
   await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 600;
     video.dispatchEvent(new Event('seeking'));
   });
@@ -547,7 +613,7 @@ test('cancels an unready forward seek when returning to retained history', async
     video.dispatchEvent(new Event('seeking'));
   });
 
-  await expect.poll(() => page.evaluate(() => window.__hlsStartLoads)).toEqual([24]);
+  await expect.poll(() => page.evaluate(() => window.__hlsStartLoads)).toEqual([0, 0, 24]);
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
   await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
   await expect.poll(() => page.evaluate(() => document.getElementById('video') === window.__videoBeforeSeek)).toBe(true);

@@ -79,7 +79,16 @@ func PrepareOnDemandHLS(
 
 	withSubtitles := UsesTextSubtitles(info, selection)
 	if withSubtitles {
-		subtitles := buildProgressiveMediaPlaylist(seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion, 0, 0, false)
+		segmentCount := 0
+		lastDuration := 0.0
+		ended := false
+		if info.Duration > 0 {
+			segmentCount = int(math.Ceil(info.Duration / seconds))
+			lastDuration = info.Duration - float64(segmentCount-1)*seconds
+			ended = true
+			windowSegments = max(windowSegments, segmentCount)
+		}
+		subtitles := buildProgressiveMediaPlaylist(seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion, segmentCount, lastDuration, ended)
 		if err := writeFileAtomic(subtitlePlaylist, []byte(subtitles), 0644); err != nil {
 			return err
 		}
@@ -169,6 +178,13 @@ type DirectWindowResult struct {
 	ReachedEnd bool
 }
 
+type directPublishOutcome struct {
+	fragments []HLSFragment
+	firstPTS  float64
+	covered   bool
+	err       error
+}
+
 // DirectWindowGenerationDuration is the maximum input span a direct window
 // reads while looking for its closing keyframe.
 func DirectWindowGenerationDuration(segmentCount int, segmentDuration, prerollBudget time.Duration) time.Duration {
@@ -250,7 +266,6 @@ func buildMaterializedPlaylist(
 	b.WriteString("#EXTM3U\n")
 	if fmp4 {
 		b.WriteString("#EXT-X-VERSION:7\n")
-		b.WriteString("#EXT-X-INDEPENDENT-SEGMENTS\n")
 	} else {
 		b.WriteString("#EXT-X-VERSION:3\n")
 	}
@@ -299,6 +314,7 @@ func GenerateDirectWindow(
 	selection StreamSelection,
 	firstSegment, segmentCount int,
 	segmentDuration, prerollBudget time.Duration,
+	onPublished func(HLSFragment) error,
 ) (DirectWindowResult, error) {
 	if !CanRemuxHLS(info, selection) {
 		return DirectWindowResult{}, ErrRemuxNeedsTranscode
@@ -347,12 +363,12 @@ func GenerateDirectWindow(
 	)
 	if fmp4 {
 		args = append(args,
-			"-hls_flags", "temp_file+independent_segments",
+			"-hls_flags", "temp_file+split_by_time",
 			"-hls_segment_type", "fmp4",
 			"-hls_fmp4_init_filename", "init.mp4",
 		)
 	} else {
-		args = append(args, "-hls_flags", "temp_file")
+		args = append(args, "-hls_flags", "temp_file+split_by_time")
 	}
 	args = append(args,
 		"-hls_segment_filename", filepath.Join(workDir, "part_%06d"+segmentExtension),
@@ -360,6 +376,7 @@ func GenerateDirectWindow(
 		filepath.Join(workDir, "window.m3u8"),
 	)
 	wasCovered := false
+	published := directPublishOutcome{firstPTS: math.NaN()}
 	var runErr error
 	if info.Duration <= 0 {
 		_, runErr = cli.RunWithStdin(ctx, nil, "ffmpeg", args...)
@@ -370,10 +387,21 @@ func GenerateDirectWindow(
 			stopMonitor()
 			return DirectWindowResult{}, fmt.Errorf("create FFmpeg control pipe: %w", pipeErr)
 		}
-		covered := make(chan struct{}, 1)
+		publishResult := make(chan directPublishOutcome, 1)
 		go func() {
-			if waitForDirectCoverage(monitorCtx, workDir, wantedEnd.Seconds(), fmp4) {
-				covered <- struct{}{}
+			outcome := publishDirectCoverage(
+				monitorCtx,
+				workDir,
+				outDir,
+				firstSegment,
+				start.Seconds(),
+				wantedEnd.Seconds(),
+				prerollBudget,
+				fmp4,
+				onPublished,
+			)
+			publishResult <- outcome
+			if outcome.covered || outcome.err != nil {
 				_, _ = io.WriteString(stopFFmpeg, "q\n")
 				_ = stopFFmpeg.Close()
 			}
@@ -382,10 +410,10 @@ func GenerateDirectWindow(
 		_ = stdin.Close()
 		_ = stopFFmpeg.Close()
 		stopMonitor()
-		select {
-		case <-covered:
-			wasCovered = true
-		default:
+		published = <-publishResult
+		wasCovered = published.covered
+		if published.err != nil {
+			return DirectWindowResult{}, published.err
 		}
 	}
 	if runErr != nil && !wasCovered {
@@ -401,9 +429,12 @@ func GenerateDirectWindow(
 	if len(durations) == 0 {
 		return DirectWindowResult{}, fmt.Errorf("%w: FFmpeg produced no GOPs", ErrRemuxNeedsTranscode)
 	}
-	firstPTS, err := probeFirstDirectVideoPTS(ctx, workDir, fmp4)
-	if err != nil {
-		return DirectWindowResult{}, fmt.Errorf("%w: %v", ErrRemuxNeedsTranscode, err)
+	firstPTS := published.firstPTS
+	if math.IsNaN(firstPTS) {
+		firstPTS, err = probeFirstDirectVideoPTS(ctx, workDir, fmp4)
+		if err != nil {
+			return DirectWindowResult{}, fmt.Errorf("%w: %v", ErrRemuxNeedsTranscode, err)
+		}
 	}
 	startSeconds := start.Seconds()
 	if firstPTS > startSeconds+0.25 || startSeconds-firstPTS > prerollBudget.Seconds()+0.25 {
@@ -441,56 +472,121 @@ func GenerateDirectWindow(
 	}
 
 	result := DirectWindowResult{
-		Fragments:  make([]HLSFragment, 0, last+1),
+		Fragments:  append(make([]HLSFragment, 0, last+1), published.fragments...),
 		ReachedEnd: reachedEnd,
 	}
 	initName := ""
 	if fmp4 {
 		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, firstSegment)
-		if err := publishFileWithoutReplacement(filepath.Join(workDir, "init.mp4"), filepath.Join(outDir, initName)); err != nil {
-			return DirectWindowResult{}, fmt.Errorf("publish direct HLS init segment: %w", err)
+		if len(result.Fragments) == 0 {
+			if err := publishFileWithoutReplacement(filepath.Join(workDir, "init.mp4"), filepath.Join(outDir, initName)); err != nil {
+				return DirectWindowResult{}, fmt.Errorf("publish direct HLS init segment: %w", err)
+			}
 		}
 	}
 	cursor = firstPTS
 	for index := 0; index <= last; index++ {
+		duration := durations[index]
+		if index < len(result.Fragments) {
+			cursor += duration
+			continue
+		}
 		name := fmt.Sprintf("%s%0*d_%04d%s", directSegmentPrefix, segmentNumberWidth, firstSegment, index, segmentExtension)
 		if err := publishFileWithoutReplacement(filepath.Join(workDir, fmt.Sprintf("part_%06d%s", index, segmentExtension)), filepath.Join(outDir, name)); err != nil {
 			return DirectWindowResult{}, fmt.Errorf("publish direct HLS segment: %w", err)
 		}
-		result.Fragments = append(result.Fragments, HLSFragment{
+		fragment := HLSFragment{
 			Start:    cursor,
-			Duration: durations[index],
+			Duration: duration,
 			Name:     name,
 			Init:     initName,
-		})
-		cursor += durations[index]
+		}
+		result.Fragments = append(result.Fragments, fragment)
+		if onPublished != nil {
+			if err := onPublished(fragment); err != nil {
+				return DirectWindowResult{}, err
+			}
+		}
+		cursor += duration
 	}
 	return result, nil
 }
 
-func waitForDirectCoverage(ctx context.Context, workDir string, wantedEnd float64, fmp4 bool) bool {
+func publishDirectCoverage(
+	ctx context.Context,
+	workDir, outDir string,
+	firstSegment int,
+	start, wantedEnd float64,
+	prerollBudget time.Duration,
+	fmp4 bool,
+	onPublished func(HLSFragment) error,
+) directPublishOutcome {
+	outcome := directPublishOutcome{firstPTS: math.NaN()}
 	ticker := time.NewTicker(generationPollInterval)
 	defer ticker.Stop()
-	firstPTS := math.NaN()
+	segmentExtension := ".ts"
+	initName := ""
+	if fmp4 {
+		segmentExtension = ".m4s"
+		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, firstSegment)
+	}
+	cursor := 0.0
 	for {
 		durations, err := readAllGeneratedDurations(filepath.Join(workDir, "window.m3u8"))
 		if err == nil && len(durations) > 0 {
-			if math.IsNaN(firstPTS) {
-				firstPTS, err = probeFirstDirectVideoPTS(ctx, workDir, fmp4)
-			}
-			if err == nil {
-				end := firstPTS
-				for _, duration := range durations {
-					end += duration
+			if math.IsNaN(outcome.firstPTS) {
+				outcome.firstPTS, err = probeFirstDirectVideoPTS(ctx, workDir, fmp4)
+				if err != nil && ctx.Err() != nil {
+					outcome.firstPTS = math.NaN()
+					return outcome
 				}
-				if end >= wantedEnd-0.05 {
-					return true
+				if err == nil && (outcome.firstPTS > start+0.25 || start-outcome.firstPTS > prerollBudget.Seconds()+0.25) {
+					err = fmt.Errorf("%w: nearest keyframe is %.3fs from target", ErrRemuxNeedsTranscode, start-outcome.firstPTS)
+				}
+				cursor = outcome.firstPTS
+				if err == nil && fmp4 {
+					err = publishFileWithoutReplacement(filepath.Join(workDir, "init.mp4"), filepath.Join(outDir, initName))
+					if err != nil {
+						err = fmt.Errorf("publish direct HLS init segment: %w", err)
+					}
+				}
+			}
+			if err != nil {
+				outcome.err = fmt.Errorf("%w: %v", ErrRemuxNeedsTranscode, err)
+				return outcome
+			}
+			for index := len(outcome.fragments); index < len(durations); index++ {
+				source := filepath.Join(workDir, fmt.Sprintf("part_%06d%s", index, segmentExtension))
+				if _, err := os.Stat(source); err != nil {
+					if os.IsNotExist(err) {
+						break
+					}
+					outcome.err = err
+					return outcome
+				}
+				name := fmt.Sprintf("%s%0*d_%04d%s", directSegmentPrefix, segmentNumberWidth, firstSegment, index, segmentExtension)
+				if err := publishFileWithoutReplacement(source, filepath.Join(outDir, name)); err != nil {
+					outcome.err = fmt.Errorf("publish direct HLS segment: %w", err)
+					return outcome
+				}
+				fragment := HLSFragment{Start: cursor, Duration: durations[index], Name: name, Init: initName}
+				outcome.fragments = append(outcome.fragments, fragment)
+				cursor += fragment.Duration
+				if onPublished != nil {
+					if err := onPublished(fragment); err != nil {
+						outcome.err = err
+						return outcome
+					}
+				}
+				if cursor >= wantedEnd-0.05 {
+					outcome.covered = true
+					return outcome
 				}
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return false
+			return outcome
 		case <-ticker.C:
 		}
 	}
