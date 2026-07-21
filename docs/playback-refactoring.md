@@ -1,8 +1,12 @@
 # Playback refactoring
 
+Status: implementation plan
+
 This document is the execution contract for simplifying on-demand playback.
 The behavioral target remains defined by
-[`on-demand-hls-target-model.md`](on-demand-hls-target-model.md).
+[`on-demand-hls-target-model.md`](on-demand-hls-target-model.md). Current
+release guarantees are registered in
+[`product-contract.md`](product-contract.md).
 
 ## Invariants
 

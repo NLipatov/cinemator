@@ -1,12 +1,15 @@
 # On-demand HLS target model
 
-Status: draft specification
+Status: aspirational architecture specification
 
 ## Purpose
 
 This document defines the target playback model for streaming large torrent
 files from hosts with bounded local storage. It is the source of truth for the
-on-demand HLS architecture, its degradation rules, and its acceptance criteria.
+intended on-demand HLS architecture, its degradation rules, and its acceptance
+criteria. It includes work that is not implemented. Current guarantees and
+their automated evidence are registered in
+[`product-contract.md`](product-contract.md).
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**
 describe normative requirements.
@@ -83,8 +86,9 @@ requested target can be resolved to a safe random-access point with bounded
 sparse reads.
 
 - The application exposes the full source duration independently of HLS.
-- Initial play and every nonlocal seek create a new presentation generation
-  with a new playlist URL.
+- Initial play creates a presentation generation. A nonlocal forward seek MAY
+  extend the same legal presentation; a seek before its media sequence or an
+  incompatible selection creates a new generation and playlist URL.
 - Its first playable fragment is fully materialized before it is advertised;
   the configured forward window is staged immediately after the first media
   request.
@@ -305,17 +309,18 @@ playlist. It omits `EXT-X-PLAYLIST-TYPE` so that legal head removal is possible.
   source duration remains out-of-band session state and is projected onto the
   managed player's media timeline.
 
-A random seek outside the current prepared presentation does not rewrite that
-playlist or move its sequence backwards. It prepares a new presentation
-generation under a new playlist URL. The managed client offsets each bounded
-presentation to its absolute source time and overrides the MediaSource duration
-with the known source duration. Native player controls therefore expose one
-full-duration timeline; a seek outside the current buffered or advertised range
-is translated into a new bounded presentation at that source position.
-If the user returns to the retained presentation while that replacement is
-still preparing, the client cancels the pending switch and resumes the retained
-presentation. A completed presentation covering the requested source time is
-reusable even when it was originally prepared from a different start position.
+A random seek outside the current prepared presentation never moves its media
+sequence backwards or rewrites immutable segment identities. The server MAY
+append a legal forward target to the existing generation. A backward target
+before the current media sequence, or a target requiring an incompatible
+profile, prepares a new generation under a new playlist URL. The managed client
+offsets each bounded presentation to its absolute source time and overrides the
+MediaSource duration with the known source duration. Native player controls
+therefore expose one full-duration timeline. If the user returns to retained
+media while other work is preparing, the client cancels the pending target and
+resumes the retained presentation. A completed presentation covering the
+requested source time is reusable even when it was originally prepared from a
+different start position.
 
 Unknown-duration sources keep the bounded presentation timeline until duration
 becomes known. A native-HLS-only fallback that cannot apply the managed timeline
@@ -616,7 +621,8 @@ availability, playback mode, and a public error when terminal.
 
 The prepare result does not expose a playlist URL until the initial bounded
 window and every asset referenced by that initial playlist are complete. It
-returns a new presentation generation and its source-time mapping.
+returns the reusable current generation or a new generation, plus the
+server-authoritative source-time mapping.
 
 When a text subtitle track is selected, the cue segment covering the requested
 source position is a required presentation asset. The target MUST NOT become
@@ -632,17 +638,19 @@ the source-time mapping for display, recovery, Media Session actions, and the
 next prepare request. The native `<video>` seek range MUST NOT be presented as
 the complete source range when it represents only a bounded LIVE window.
 
-On initial play and a seek outside the current presentation, the client MUST:
+On initial play and a seek outside currently readable media, the client MUST:
 
 1. pause or stop hls.js loading;
 2. preserve the requested playback position;
 3. display preparation state and progress;
 4. prepare the target and a bounded forward horizon;
-5. destroy the old hls.js instance and its `MediaSource`, then create a new
-   instance and `MediaSource` before exposing the new timeline mapping;
-6. attach the newly returned playlist URL and resume from its mapped local
-   presentation position after readiness;
-7. show a terminal error or an explicit compatibility choice if preparation
+5. preserve the existing hls.js instance and `MediaSource` when the server
+   keeps the presentation generation stable;
+6. only when the server returns a different generation, destroy the old hls.js
+   instance and `MediaSource`, attach the new playlist URL, and apply its
+   source-time mapping;
+7. resume from the mapped target after readiness;
+8. show a terminal error or an explicit compatibility choice if preparation
    fails.
 
 `stopLoad()` or flushing ranges alone is not a generation reset. Reusing a
@@ -938,7 +946,8 @@ shows:
   encountering a later oversized GOP rolls to a new generation.
 - Video, audio, and subtitle rendition updates remain aligned through append,
   head eviction, discontinuity, and finalization.
-- A random seek outside the active presentation uses a new playlist URL.
+- A forward seek may extend the active presentation without changing its URL;
+  a seek before its media sequence uses a new generation and playlist URL.
 - Adjacent direct segments contain neither duplicated nor missing source GOPs.
 - Every init/configuration transition is declared correctly.
 
@@ -948,8 +957,9 @@ shows:
   through hls.js meet the readiness and mapped-start criteria below.
 - At least ten nonsequential seeks in one session do not corrupt the timeline,
   duplicate audio, or duplicate canonical assets unnecessarily.
-- Every presentation switch destroys the old hls.js instance and `MediaSource`
-  and creates new ones before the new local timeline is attached.
+- A stable generation keeps the existing hls.js instance and `MediaSource`.
+  An actual generation switch destroys both before the new timeline mapping is
+  attached.
 - Playback crosses multiple independently generated windows without decoder,
   SourceBuffer, timestamp, or A/V synchronization errors.
 - Seeking back after cache eviction reuses a retained content asset or publishes
@@ -1059,8 +1069,9 @@ Implementation SHOULD proceed in independently verifiable stages:
    leases, atomic publication, retention deadlines, and startup cleanup.
 4. Generate canonical HLS fMP4 init and validated direct segment assets.
 5. Implement prepare so it returns only a fully materialized initial manifest.
-6. Move the hls.js player to stop, prepare, recreate its media pipeline, and
-   attach a new presentation around uncached seeks.
+6. Move the hls.js player to stop and prepare missing media while preserving a
+   stable generation; recreate its media pipeline only for an actual generation
+   change.
 7. Separate audio and subtitle renditions and canonical content-addressed asset
    identities.
 8. Replace boolean fallback with the finite resolved-profile catalog.

@@ -113,7 +113,10 @@ docker compose up -d cinemator
 
 ## Small disks and on-demand HLS
 
-The normative future architecture is documented in
+The current playback invariants, metrics, enforcement status, and audit gaps
+are documented in the
+[Playback product contract](docs/product-contract.md). The future architecture
+is documented in the
 [On-demand HLS target model](docs/on-demand-hls-target-model.md). This section
 describes the currently deployed behavior and configuration.
 

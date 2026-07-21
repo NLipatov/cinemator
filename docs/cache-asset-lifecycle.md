@@ -1,6 +1,6 @@
 # Cache asset lifecycle and disk admission
 
-Status: draft specification
+Status: aspirational lifecycle specification
 
 ## Purpose
 
@@ -9,6 +9,11 @@ for files on bounded local storage. It closes the class of failures in which a
 cache cleaner unlinks a file that is still open, the file disappears from
 directory-based accounting, and its blocks remain allocated until the last
 descriptor closes.
+
+This is the intended complete lifecycle and includes durability, quarantine,
+mapping, and multi-process coordination work that is not implemented. Current
+guarantees and their automated evidence are registered in
+[`product-contract.md`](product-contract.md).
 
 This specification is normative for generated HLS assets, torrent pieces,
 temporary output, and every Cinemator or child-process handle to those files.

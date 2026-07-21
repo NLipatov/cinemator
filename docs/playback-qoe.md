@@ -1,6 +1,6 @@
 # Playback QoE target
 
-Status: draft normative specification
+Status: normative metric and target-SLO specification
 
 ## Purpose
 
@@ -11,6 +11,11 @@ quality preservation, bounded resources, and disk admission remain hard
 constraints. Within those constraints, implementation work is evaluated jointly
 by time to useful playback and playback continuity; neither metric may be
 improved by knowingly regressing the other outside its SLO.
+
+The current implementation and enforcement status of every invariant and SLO
+is tracked in [`product-contract.md`](product-contract.md). A target in this
+document is not described as a current guarantee unless that registry lists
+gating evidence for it.
 
 The key words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY**
 describe normative requirements.

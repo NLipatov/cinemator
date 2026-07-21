@@ -21,8 +21,11 @@
 - Test through public behavior whenever possible.
 - Keep test-only helpers package-private.
 
-# Streaming performance
+# Product contract
 
-- Streaming changes must not regress the startup and playback-continuity SLOs in
-  `docs/playback-qoe.md`; run the required QoE tests when changing the playback
-  critical path.
+- `docs/product-contract.md` is the canonical registry of current playback
+  invariants, important metrics, and enforcement status. Do not describe a
+  target-only requirement as a current guarantee.
+- Streaming changes must not regress its invariants or the startup and
+  playback-continuity SLOs in `docs/playback-qoe.md`. Update the registry and
+  run the required QoE tests when changing the playback critical path.
