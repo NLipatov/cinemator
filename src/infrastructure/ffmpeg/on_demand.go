@@ -879,13 +879,20 @@ func GenerateSubtitleSegment(
 	tmp := outputPath + ".tmp"
 	_ = os.Remove(tmp)
 	defer os.Remove(tmp)
+	segmentStartTime := time.Duration(segmentIndex) * segmentDuration
+	segmentStart := formatDuration(segmentStartTime)
+	segmentEnd := formatDuration(segmentStartTime + segmentDuration)
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostats",
 		"-y",
 		"-fflags", "+genpts",
-		"-ss", formatDuration(time.Duration(segmentIndex) * segmentDuration),
+		// Input seeking keeps distant subtitle requests cheap. Preserve source
+		// timestamps so a cue repeated across adjacent WebVTT segments retains
+		// the same timing and hls.js can identify it as the same cue.
+		"-ss", segmentStart,
+		"-copyts",
 		"-i", inputURL,
-		"-t", formatDuration(segmentDuration),
+		"-to", segmentEnd,
 		"-map", fmt.Sprintf("0:s:%d", subtitleTrack),
 		"-c:s", "webvtt",
 		"-f", "webvtt",
@@ -894,7 +901,7 @@ func GenerateSubtitleSegment(
 	if _, err := cli.RunWithStdin(ctx, nil, "ffmpeg", args...); err != nil {
 		return err
 	}
-	if err := addWebVTTTimestampMap(tmp, time.Duration(segmentIndex)*segmentDuration); err != nil {
+	if err := addWebVTTTimestampMap(tmp, segmentStartTime); err != nil {
 		return err
 	}
 	return publishFileWithoutReplacement(tmp, outputPath)
@@ -911,12 +918,26 @@ func addWebVTTTimestampMap(path string, mediaOffset time.Duration) error {
 	}
 	const ptsWrap = int64(1) << 33
 	mpegTS := int64(math.Round(mediaOffset.Seconds()*90000)) % ptsWrap
-	header := fmt.Sprintf("X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:%d\n", mpegTS)
+	header := fmt.Sprintf("X-TIMESTAMP-MAP=LOCAL:%s,MPEGTS:%d\n", formatWebVTTTimestamp(mediaOffset), mpegTS)
 	mapped := make([]byte, 0, len(data)+len(header))
 	mapped = append(mapped, data[:lineEnd+1]...)
 	mapped = append(mapped, header...)
 	mapped = append(mapped, data[lineEnd+1:]...)
 	return os.WriteFile(path, mapped, 0644)
+}
+
+func formatWebVTTTimestamp(value time.Duration) string {
+	if value < 0 {
+		value = 0
+	}
+	totalMillis := value.Milliseconds()
+	hours := totalMillis / int64(time.Hour/time.Millisecond)
+	totalMillis %= int64(time.Hour / time.Millisecond)
+	minutes := totalMillis / int64(time.Minute/time.Millisecond)
+	totalMillis %= int64(time.Minute / time.Millisecond)
+	seconds := totalMillis / int64(time.Second/time.Millisecond)
+	millis := totalMillis % int64(time.Second/time.Millisecond)
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", hours, minutes, seconds, millis)
 }
 
 func formatDuration(value time.Duration) string {

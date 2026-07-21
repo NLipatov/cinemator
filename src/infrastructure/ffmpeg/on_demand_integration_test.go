@@ -228,23 +228,53 @@ func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 	}
 
 	srt := filepath.Join(dir, "subs.srt")
-	if err := os.WriteFile(srt, []byte("1\n00:00:05,000 --> 00:00:08,000\ncrosses boundary\n\n2\n00:00:07,000 --> 00:00:09,000\nsecond window\n"), 0644); err != nil {
+	if err := os.WriteFile(srt, []byte("1\n00:00:05,000 --> 00:00:08,000\ncrosses boundary\n\n2\n00:00:06,000 --> 00:00:06,500\nstarts at boundary\n\n3\n00:00:07,000 --> 00:00:09,000\nsecond window\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	withSubs := filepath.Join(dir, "source-with-subs.mkv")
 	runMediaCommand(t, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", source, "-i", srt, "-map", "0", "-map", "1", "-c", "copy", "-c:s", "srt", withSubs)
-	vtt := filepath.Join(dir, "subs_000001.vtt")
-	if err := GenerateSubtitleSegment(context.Background(), withSubs, vtt, 0, 1, 6*time.Second); err != nil {
+	firstVTT := filepath.Join(dir, "subs_000000.vtt")
+	if err := GenerateSubtitleSegment(context.Background(), withSubs, firstVTT, 0, 0, 6*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	data, err := os.ReadFile(vtt)
+	firstData, err := os.ReadFile(firstVTT)
 	if err != nil {
 		t.Fatal(err)
 	}
-	text := string(data)
-	if !strings.Contains(text, "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:540000") || !strings.Contains(text, "crosses boundary") || !strings.Contains(text, "second window") {
-		t.Fatalf("unexpected WebVTT segment:\n%s", text)
+	secondVTT := filepath.Join(dir, "subs_000001.vtt")
+	if err := GenerateSubtitleSegment(context.Background(), withSubs, secondVTT, 0, 1, 6*time.Second); err != nil {
+		t.Fatal(err)
 	}
+	secondData, err := os.ReadFile(secondVTT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstText := string(firstData)
+	secondText := string(secondData)
+	if !strings.Contains(firstText, "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0") || !strings.Contains(firstText, "crosses boundary") {
+		t.Fatalf("unexpected first WebVTT segment:\n%s", firstText)
+	}
+	if !strings.Contains(secondText, "X-TIMESTAMP-MAP=LOCAL:00:00:06.000,MPEGTS:540000") || !strings.Contains(secondText, "crosses boundary") || !strings.Contains(secondText, "starts at boundary") || !strings.Contains(secondText, "second window") {
+		t.Fatalf("unexpected second WebVTT segment:\n%s\nfirst segment:\n%s", secondText, firstText)
+	}
+	firstTiming := webVTTCueTiming(firstText, "crosses boundary")
+	secondTiming := webVTTCueTiming(secondText, "crosses boundary")
+	if firstTiming == "" || secondTiming != firstTiming {
+		t.Fatalf("cross-boundary cue timing changed between segments: %q != %q\n%s\n%s", firstTiming, secondTiming, firstText, secondText)
+	}
+	if got := strings.Count(firstText+secondText, "starts at boundary"); got != 1 {
+		t.Fatalf("boundary cue was published %d times, want once:\n%s\n%s", got, firstText, secondText)
+	}
+}
+
+func webVTTCueTiming(contents, cueText string) string {
+	lines := strings.Split(contents, "\n")
+	for index, line := range lines {
+		if strings.TrimSpace(line) == cueText && index > 0 {
+			return strings.TrimSpace(lines[index-1])
+		}
+	}
+	return ""
 }
 
 func TestGenerateDirectWindowCoalescesFrequentKeyframes(t *testing.T) {

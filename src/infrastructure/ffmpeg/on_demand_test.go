@@ -215,7 +215,13 @@ func TestAddWebVTTTimestampMapUsesAbsoluteMediaTime(t *testing.T) {
 	if err := addWebVTTTimestampMap(path, 6*time.Second); err != nil {
 		t.Fatal(err)
 	}
-	assertFileContains(t, path, "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:540000")
+	assertFileContains(t, path, "X-TIMESTAMP-MAP=LOCAL:00:00:06.000,MPEGTS:540000")
+}
+
+func TestFormatWebVTTTimestampPreservesLongMediaOffsets(t *testing.T) {
+	if got := formatWebVTTTimestamp(2*time.Hour + 3*time.Minute + 4*time.Second + 5*time.Millisecond); got != "02:03:04.005" {
+		t.Fatalf("formatWebVTTTimestamp() = %q", got)
+	}
 }
 
 func TestGenerateVideoWindowRejectsRangePastDuration(t *testing.T) {
