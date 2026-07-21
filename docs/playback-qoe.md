@@ -32,11 +32,44 @@ fragment while generation of the forward reserve remains foreground work. When
 measured delivery is marginal, the player MAY wait for a larger initial reserve
 if that is predicted to avoid an immediate interruption.
 
+A selected subtitle track is part of useful playback rather than an optional
+startup enhancement. Time to useful playback therefore ends only after the
+subtitle segment covering the requested position is ready; attaching video
+without the selected track does not satisfy the startup or seek objective.
+
 No buffering policy can provide uninterrupted source-quality playback when
 available delivery capacity remains below the selected representation's
 required bitrate. That condition MUST be reported as source waiting or
 insufficient delivery capacity; it MUST NOT look like an indefinitely active
 CPU job or an unexplained player freeze.
+
+### Playback ownership and monotonicity
+
+After the first frame of a presentation is shown, only an explicit user command
+may change its source position or replace its media presentation. Explicit
+commands are Play on another file, a committed seek, and an audio or subtitle
+selection change. Playlist refreshes, buffer underruns, `waiting`, `stalled`,
+decoder errors, worker loss, cache pressure, and background recovery are not
+user commands.
+
+Without a committed user seek, presented source time MUST be monotonic. During
+an interruption it may remain fixed, but it MUST NOT jump backward, jump
+forward, restart at zero, or switch to a different presentation. The player
+MUST retain the full-duration timeline and the last presented position while it
+waits. A runtime failure that cannot continue in place is a visible terminal
+error; it MUST NOT be hidden by destroying and rebuilding the active
+`MediaSource`.
+
+Automated tests MUST assert this ownership contract across delayed fragments,
+playlist errors, empty forward buffers, and unsolicited media `seeking` events.
+They verify that the video element, hls.js instance, duration, and last
+presented position remain stable until the user issues a command.
+
+The same ownership rule applies to server work. A committed cold seek MUST
+retire superseded video jobs and preempt subtitle extraction or forward
+prefetch when admission is full. A late request for a fragment from the old
+presentation is not a user command: it MUST NOT cancel, retarget, publish over,
+or report a terminal capacity error for the active seek.
 
 ## Metric definitions
 
@@ -393,6 +426,31 @@ hash or internal stream identifier MAY be used in diagnostic logs.
 
 Tests exercise public behavior and MUST NOT add production hooks solely for
 measurement.
+
+### Gated regression contract
+
+The following user-visible regressions are release-gating. The named tests run
+in the ordinary pull-request workflow; a skipped media integration test is a CI
+configuration failure because the workflow verifies `ffmpeg` and `ffprobe`
+before running Go tests.
+
+| Contract | Gating coverage |
+| --- | --- |
+| Full source duration remains visible while only part of the stream is materialized | Playwright: `exposes the complete source duration before the full torrent is available` |
+| Delayed or failed forward fragments never replace the player, erase duration, or move source time | Playwright: `never replaces or rewinds active playback when the next HLS fragment is delayed`, `restores the last presented position after an unsolicited media seek`, and `keeps source time monotonic while the HLS presentation advances across five windows` |
+| A committed seek owns its exact target; older work cannot snap it back, jump to a live edge, or win a seek storm | Playwright seek tests covering 0 seconds, 22 minutes, retained history, delayed preparation, repeated events, and latest-target wins |
+| Temporary `429`/`503` admission pressure remains waitable and a newer seek cancels the old retries | Playwright: `retries transient streaming capacity without replacing the player or losing the seek target` and `cancels capacity retries when the user commits a newer seek` |
+| A selected text subtitle is part of readiness at startup and after a cold seek; fatal subtitle loss stops playback visibly | Playwright selected-subtitle tests plus Go scheduler/status tests `TestPlaybackStatusWaitsForSelectedSubtitleTarget`, `TestRequestedSubtitleWaitsForTargetVideoThenPreemptsItsRemainder`, and `TestSelectedSubtitleJobFailureFailsItsPlaybackTarget` |
+| Advancing media time without new decoded video frames is detected as a playback stall | Playwright: `detects frozen video frames even while the player clock can advance` |
+| The real backend path produces decodable video and audio, selected WebVTT at the initial and distant targets, one reusable presentation, and a fast cached return | Go integration: `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` using a local BitTorrent seeder and real FFmpeg/ffprobe |
+| Capped torrent storage cannot recurse until goroutine stack overflow | Go integration: `TestForkReaderBoundsCappedStorageRetriesUntilCancellation` against the selected torrent fork |
+| Unsupported tracker schemes cannot panic request handlers | Go: `TestAddMagnetIgnoresUnsupportedTrackerSchemes`; HTTP error behavior is covered by Playwright |
+| Cache pressure preserves leased and active HLS assets and synchronizes evicted torrent-piece completion | Go cache, asset-store, and `TestPieceEvictionUpdatesTorrentCompletion` integration tests |
+
+The opt-in `tests/e2e/live.spec.mjs` suite remains observational because public
+torrent availability is nondeterministic. The 30-minute sustainable and
+marginal-rate benchmarks below are also not yet pull-request gates; they MUST
+not be described as guaranteed until a controlled-rate fixture runs them in CI.
 
 The deterministic suite includes:
 

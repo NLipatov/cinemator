@@ -143,6 +143,9 @@ func TestEnsureHlsAssetRejectsStaleGeneration(t *testing.T) {
 	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), "master.m3u8", ""); err != nil {
 		t.Fatalf("master playlist without version error = %v", err)
 	}
+	if err := manager.ensureHlsAsset(context.Background(), key.dirName(), "master.m3u8", "stale"); !errors.Is(err, domain.ErrHlsPlaylistChanged) {
+		t.Fatalf("versioned stale master error = %v", err)
+	}
 }
 
 func TestVideoPlaylistRequestRestartsStartupGeneration(t *testing.T) {
@@ -311,21 +314,56 @@ func TestStartedSegmentJobSurvivesDisconnectedWaiter(t *testing.T) {
 	}
 }
 
-func TestNewWindowCancelsAbandonedStartedJob(t *testing.T) {
+func TestExplicitTargetCancelsSupersededStartedJob(t *testing.T) {
 	canceled := false
 	job := &segmentJob{begin: 0, end: 5, done: make(chan struct{}), started: true, cancel: func() { canceled = true }}
-	cancelAbandonedJobsLocked(map[*segmentJob]struct{}{job: {}}, 10, 15)
+	jobs := map[*segmentJob]struct{}{job: {}}
+	claimVideoTargetLocked(jobs, 10, 15, 20)
 	if !canceled {
-		t.Fatal("abandoned old window was not canceled for a newer seek")
+		t.Fatal("superseded old window was not canceled for an explicit seek")
+	}
+	if len(jobs) != 0 {
+		t.Fatal("superseded old window retained presentation ownership")
 	}
 }
 
-func TestNewWindowKeepsOverlappingOrObservedJob(t *testing.T) {
-	for _, job := range []*segmentJob{
-		{begin: 10, end: 15, done: make(chan struct{}), cancel: func() { t.Error("overlapping job was canceled") }},
-		{begin: 0, end: 5, done: make(chan struct{}), waiters: 1, cancel: func() { t.Error("observed job was canceled") }},
-	} {
-		cancelAbandonedJobsLocked(map[*segmentJob]struct{}{job: {}}, 10, 15)
+func TestExplicitTargetKeepsAndRetargetsOverlappingJob(t *testing.T) {
+	job := &segmentJob{
+		begin:         10,
+		end:           15,
+		done:          make(chan struct{}),
+		targetSeconds: 20,
+		cancel:        func() { t.Error("overlapping job was canceled") },
+	}
+	jobs := map[*segmentJob]struct{}{job: {}}
+	claimVideoTargetLocked(jobs, 12, 13, 24)
+	if len(jobs) != 1 || job.targetSeconds != 24 {
+		t.Fatalf("overlapping target = jobs:%d target:%.1f, want 1/24", len(jobs), job.targetSeconds)
+	}
+}
+
+func TestRetiredVideoJobCannotPublishPresentation(t *testing.T) {
+	jobCtx, cancel := context.WithCancel(context.Background())
+	job := &segmentJob{
+		begin:         0,
+		end:           1,
+		done:          make(chan struct{}),
+		ctx:           jobCtx,
+		targetSeconds: 0,
+	}
+	stream := &streamInfo{
+		directPlay:    true,
+		videoJobs:     make(map[*segmentJob]struct{}),
+		directWindows: make(map[int][]ffmpeg.HLSFragment),
+	}
+	cancel()
+	manager := &manager{settings: settings.NewSettings()}
+	err := manager.publishMaterializedWindow(stream, job, []ffmpeg.HLSFragment{{Start: 0, Duration: 2, Name: "retired.ts"}}, true, true, 1, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("retired publish = %v, want canceled", err)
+	}
+	if len(stream.directWindows) != 0 {
+		t.Fatalf("retired job changed presentation: %#v", stream.directWindows)
 	}
 }
 
@@ -580,20 +618,28 @@ func TestReserveJobSlotEnforcesGlobalAndPerStreamLimits(t *testing.T) {
 	}
 }
 
-func TestSubtitleJobFailureBecomesVisible(t *testing.T) {
+func TestSelectedSubtitleJobFailureFailsItsPlaybackTarget(t *testing.T) {
 	job := &segmentJob{begin: 0, end: 1, done: make(chan struct{})}
 	stream := &streamInfo{
-		status:       domain.HlsStatus{Phase: "preparing"},
-		subtitleJobs: map[*segmentJob]struct{}{job: {}},
+		status:        domain.HlsStatus{Phase: "preparing"},
+		statusSegment: 0,
+		subtitleJobs:  map[*segmentJob]struct{}{job: {}},
+		segmentErrors: make(map[int]segmentFailure),
 	}
 	stream.markJobError(job, errors.New("ffmpeg failed"))
 
-	if stream.status.Phase != "error" || !strings.Contains(stream.status.Message, "FFmpeg") {
+	if stream.status.Phase != domain.HlsPhaseError || stream.status.Message == "" {
 		t.Fatalf("status = %+v", stream.status)
+	}
+	if job.stage != domain.HlsStageError {
+		t.Fatalf("job stage = %q, want error", job.stage)
+	}
+	if _, ok := stream.segmentErrors[0]; !ok {
+		t.Fatalf("selected subtitle failure was not recorded: %+v", stream.segmentErrors)
 	}
 }
 
-func TestRequestedSubtitleUsesOnePreemptibleSegment(t *testing.T) {
+func TestRequestedSubtitleWaitsForTargetVideoThenPreemptsItsRemainder(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	assets, err := newHlsAssetStore(root)
@@ -616,12 +662,14 @@ func TestRequestedSubtitleUsesOnePreemptibleSegment(t *testing.T) {
 	defer releaseWorker()
 
 	streamCtx, closeStream := context.WithCancel(context.Background())
+	foreground := &segmentJob{begin: 0, end: 8, done: make(chan struct{})}
 	stream := &streamInfo{
 		ctx:           streamCtx,
 		paths:         streamPaths{outDir: root},
 		mediaInfo:     domain.MediaInfo{Duration: 120, Subtitles: []domain.SubtitleTrack{{Index: 0, Codec: "subrip"}}},
 		selection:     ffmpeg.StreamSelection{SubtitleTrackIndex: 0},
-		videoJobs:     make(map[*segmentJob]struct{}),
+		directWindows: make(map[int][]ffmpeg.HLSFragment),
+		videoJobs:     map[*segmentJob]struct{}{foreground: {}},
 		subtitleJobs:  make(map[*segmentJob]struct{}),
 		segmentErrors: make(map[int]segmentFailure),
 	}
@@ -634,6 +682,14 @@ func TestRequestedSubtitleUsesOnePreemptibleSegment(t *testing.T) {
 	go func() {
 		requestDone <- manager.ensureSubtitleSegment(context.Background(), stream, 7)
 	}()
+	time.Sleep(150 * time.Millisecond)
+	stream.mtx.Lock()
+	if len(stream.subtitleJobs) != 0 {
+		stream.mtx.Unlock()
+		t.Fatal("subtitle job was admitted before its target video")
+	}
+	stream.directWindows[7] = []ffmpeg.HLSFragment{{Start: 14, Duration: 2, Name: videoSegmentName(7)}}
+	stream.mtx.Unlock()
 
 	deadline := time.Now().Add(time.Second)
 	var job *segmentJob
@@ -652,8 +708,14 @@ func TestRequestedSubtitleUsesOnePreemptibleSegment(t *testing.T) {
 	if job == nil {
 		t.Fatal("requested subtitle job was not admitted")
 	}
-	if job.begin != 7 || job.end != 8 || !job.background {
-		t.Fatalf("subtitle job = [%d,%d) background=%t, want [7,8) background", job.begin, job.end, job.background)
+	if job.begin != 7 || job.end != 8 || job.background {
+		t.Fatalf("subtitle job = [%d,%d) background=%t, want required foreground [7,8)", job.begin, job.end, job.background)
+	}
+	stream.mtx.Lock()
+	_, videoActive := stream.videoJobs[foreground]
+	stream.mtx.Unlock()
+	if videoActive {
+		t.Fatal("published target subtitle did not preempt the speculative video remainder")
 	}
 
 	closeStream()
@@ -743,6 +805,7 @@ func TestPublishingMaterializedWindowKeepsHistoryUntilCachePressure(t *testing.T
 	}
 	manager := &manager{settings: settings.NewSettings()}
 	job := &segmentJob{begin: 3}
+	stream.videoJobs = map[*segmentJob]struct{}{job: {}}
 	fragments := []ffmpeg.HLSFragment{{Start: 90, Duration: 30, Name: videoSegmentName(3)}}
 	if err := manager.publishMaterializedWindow(stream, job, fragments, false, true, 4, false); err != nil {
 		t.Fatal(err)
@@ -775,6 +838,7 @@ func TestPublishingLargerTargetDurationKeepsMaterializedHistory(t *testing.T) {
 	}
 	manager := &manager{settings: settings.NewSettings()}
 	job := &segmentJob{begin: 100, targetSeconds: 200}
+	stream.videoJobs = map[*segmentJob]struct{}{job: {}}
 	fragments := []ffmpeg.HLSFragment{{Start: 200, Duration: 8, Name: "distant.m4s"}}
 	if err := manager.publishMaterializedWindow(stream, job, fragments, true, true, 101, false); err != nil {
 		t.Fatal(err)
@@ -782,12 +846,52 @@ func TestPublishingLargerTargetDurationKeepsMaterializedHistory(t *testing.T) {
 	if len(stream.directWindows) != 2 || len(stream.directWindows[0]) != 1 {
 		t.Fatalf("rotated materialized history = %#v", stream.directWindows)
 	}
+	if stream.assetVersion != "current" {
+		t.Fatalf("forward seek generation = %q, want current", stream.assetVersion)
+	}
 	playlist, err := os.ReadFile(stream.paths.videoPlaylist)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(playlist), "first.m4s") || !strings.Contains(string(playlist), "distant.m4s") {
 		t.Fatalf("active presentation contains disjoint cache history:\n%s", playlist)
+	}
+}
+
+func TestExtendingCurrentPresentationDoesNotRotateGeneration(t *testing.T) {
+	dir := t.TempDir()
+	stream := &streamInfo{
+		paths: streamPaths{
+			outDir:           dir,
+			videoPlaylist:    filepath.Join(dir, "index.m3u8"),
+			subtitlePlaylist: filepath.Join(dir, "subs.m3u8"),
+			masterPlaylist:   filepath.Join(dir, "master.m3u8"),
+		},
+		assetVersion:       "current",
+		directPlay:         true,
+		selection:          ffmpeg.StreamSelection{AudioTrackIndex: -1, SubtitleTrackIndex: -1},
+		materializedTarget: 2 * time.Second,
+		mediaInfo:          domain.MediaInfo{Duration: 300},
+		directWindows: map[int][]ffmpeg.HLSFragment{
+			0: {{Start: 0, Duration: 2, Name: "first.m4s"}},
+		},
+	}
+	manager := &manager{settings: settings.NewSettings()}
+	job := &segmentJob{begin: 1, targetSeconds: 0}
+	stream.videoJobs = map[*segmentJob]struct{}{job: {}}
+	extension := []ffmpeg.HLSFragment{{Start: 2, Duration: 8, Name: "extension.m4s"}}
+	if err := manager.publishMaterializedWindow(stream, job, extension, true, true, 5, false); err != nil {
+		t.Fatal(err)
+	}
+	if stream.assetVersion != "current" {
+		t.Fatalf("generation = %q, want current", stream.assetVersion)
+	}
+	playlist, err := os.ReadFile(stream.paths.videoPlaylist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(playlist), "first.m4s?v=current") || !strings.Contains(string(playlist), "extension.m4s?v=current") {
+		t.Fatalf("extended presentation is incomplete:\n%s", playlist)
 	}
 }
 
@@ -822,6 +926,7 @@ func TestDirectWindowPublicationExtendsAnExistingOwner(t *testing.T) {
 	}
 	manager := &manager{settings: settings.NewSettings()}
 	job := &segmentJob{begin: 3, targetSeconds: 6}
+	stream.videoJobs = map[*segmentJob]struct{}{job: {}}
 	extension := []ffmpeg.HLSFragment{
 		{Start: 6, Duration: 2, Name: "duplicate.m4s"},
 		{Start: 8, Duration: 2, Name: "extension.m4s"},
@@ -863,6 +968,19 @@ func TestNextUncoveredDirectSegmentRequiresTheWholeSegment(t *testing.T) {
 	windows[0][0].Duration = 4
 	if begin := nextUncoveredDirectSegment(windows, timeline, 0, 15); begin != 2 {
 		t.Fatalf("next uncovered segment = %d, want 2", begin)
+	}
+}
+
+func TestDirectPrefetchOverlapsThePreviousNominalSegment(t *testing.T) {
+	timeline := newPlaybackTimeline(2*time.Second, 15, 120)
+	windows := map[int][]ffmpeg.HLSFragment{
+		0: {{Start: 0, Duration: 4, Name: "first.m4s"}},
+	}
+	if begin := nextDirectPrefetchBegin(windows, timeline, 2, timeline.segmentCount()); begin != 1 {
+		t.Fatalf("direct prefetch begin = %d, want 1", begin)
+	}
+	if begin := nextDirectPrefetchBegin(nil, timeline, 0, timeline.segmentCount()); begin != 0 {
+		t.Fatalf("initial direct prefetch begin = %d, want 0", begin)
 	}
 }
 

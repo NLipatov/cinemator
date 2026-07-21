@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"cinemator/domain"
+	"cinemator/infrastructure/ffmpeg"
 	"context"
 	"errors"
 	"os"
@@ -41,9 +42,37 @@ func TestPlaybackStatusPublishesCurrentAssetGeneration(t *testing.T) {
 		status:       domain.HlsStatus{Phase: domain.HlsPhaseWaiting},
 	}
 
-	status := stream.playbackStatus(-1, playbackTimeline{}, time.Now(), 0, 0, 0)
+	status := stream.playbackStatus(-1, playbackTimeline{}, time.Now(), 0, 0, 0, true)
 	if status.Generation != "generation-2" {
 		t.Fatalf("generation = %q, want generation-2", status.Generation)
+	}
+}
+
+func TestPlaybackStatusWaitsForSelectedSubtitleTarget(t *testing.T) {
+	ready := make(chan struct{})
+	close(ready)
+	stream := &streamInfo{
+		ready: ready,
+		mediaInfo: domain.MediaInfo{
+			Duration: 120,
+			Seekable: true,
+		},
+		directWindows: map[int][]ffmpeg.HLSFragment{
+			0: {{Start: 0, Duration: 2, Name: videoSegmentName(0)}},
+		},
+		status:       domain.HlsStatus{Phase: domain.HlsPhasePreparing},
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	timeline := newPlaybackTimeline(2*time.Second, 15, 120)
+
+	waiting := stream.playbackStatus(0, timeline, time.Now(), 0, 1, 1, false)
+	if waiting.Phase != domain.HlsPhasePreparing || waiting.Message != "Preparing selected subtitles" {
+		t.Fatalf("status before subtitle = %+v", waiting)
+	}
+	readyStatus := stream.playbackStatus(0, timeline, time.Now(), 0, 1, 1, true)
+	if readyStatus.Phase != domain.HlsPhaseReady {
+		t.Fatalf("status after subtitle = %+v", readyStatus)
 	}
 }
 
@@ -124,7 +153,7 @@ func TestSessionAdmissionDeduplicatesOneTarget(t *testing.T) {
 	first.releaseAdmission()
 }
 
-func TestSessionAdmissionCancelsSupersededUnobservedTarget(t *testing.T) {
+func TestSessionAdmissionExplicitTargetCancelsSupersededUnobservedTarget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	stream := &streamInfo{
@@ -140,6 +169,7 @@ func TestSessionAdmissionCancelsSupersededUnobservedTarget(t *testing.T) {
 		stream.mtx.Unlock()
 		t.Fatal(err)
 	}
+	claimVideoTargetLocked(stream.videoJobs, 10, 15, 20)
 	second, _, _, err := stream.acquireJobLocked(videoSegmentJob, 10, 10, 15, false, scheduler, 2)
 	stream.mtx.Unlock()
 	if err != nil {
@@ -182,6 +212,151 @@ func TestSessionAdmissionReplacesOverlappingBackgroundWorkForAViewer(t *testing.
 	}
 	background.releaseAdmission()
 	foreground.releaseAdmission()
+}
+
+func TestSessionAdmissionRequiredSubtitleReplacesBackgroundSubtitle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &streamInfo{
+		ctx:          ctx,
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	scheduler := newSegmentScheduler(2, 1)
+
+	stream.mtx.Lock()
+	background, backgroundCtx, _, err := stream.acquireJobLocked(subtitleSegmentJob, 12, 12, 13, true, scheduler, 2)
+	if err != nil {
+		stream.mtx.Unlock()
+		t.Fatal(err)
+	}
+	required, _, created, err := stream.acquireJobLocked(subtitleSegmentJob, 12, 12, 13, false, scheduler, 2)
+	stream.mtx.Unlock()
+	if err != nil || !created || required == background || required.background {
+		t.Fatalf("required subtitle admission = %p, %v, created=%t; background=%p", required, err, created, background)
+	}
+	select {
+	case <-backgroundCtx.Done():
+	default:
+		t.Fatal("required subtitle did not cancel its background predecessor")
+	}
+	background.releaseAdmission()
+	required.releaseAdmission()
+}
+
+func TestSessionAdmissionForegroundPreemptsFullBackgroundBacklog(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &streamInfo{
+		ctx:          ctx,
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	scheduler := newSegmentScheduler(3, 1)
+
+	stream.mtx.Lock()
+	observed, _, _, err := stream.acquireJobLocked(videoSegmentJob, 0, 0, 1, false, scheduler, 3)
+	if err != nil {
+		stream.mtx.Unlock()
+		t.Fatal(err)
+	}
+	observed.waiters = 1
+	_, firstSubtitleCtx, _, err := stream.acquireJobLocked(subtitleSegmentJob, 0, 0, 1, true, scheduler, 3)
+	if err != nil {
+		stream.mtx.Unlock()
+		t.Fatal(err)
+	}
+	_, secondSubtitleCtx, _, err := stream.acquireJobLocked(subtitleSegmentJob, 1, 1, 2, true, scheduler, 3)
+	if err != nil {
+		stream.mtx.Unlock()
+		t.Fatal(err)
+	}
+	foreground, _, created, err := stream.acquireJobLocked(videoSegmentJob, 10, 10, 11, false, scheduler, 3)
+	stream.mtx.Unlock()
+	if err != nil || !created {
+		t.Fatalf("foreground admission = %v, created=%t", err, created)
+	}
+	select {
+	case <-firstSubtitleCtx.Done():
+	case <-secondSubtitleCtx.Done():
+	default:
+		t.Fatal("foreground work did not preempt the background subtitle backlog")
+	}
+	if len(stream.videoJobs)+len(stream.subtitleJobs) != 3 || len(scheduler.jobs) != 3 {
+		t.Fatalf("jobs after preemption = session:%d scheduler:%d, want 3/3", len(stream.videoJobs)+len(stream.subtitleJobs), len(scheduler.jobs))
+	}
+	observed.releaseAdmission()
+	foreground.releaseAdmission()
+}
+
+func TestExplicitTargetRetiresObservedPreviousWindow(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &streamInfo{
+		ctx:          ctx,
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	scheduler := newSegmentScheduler(1, 1)
+
+	stream.mtx.Lock()
+	previous, previousCtx, _, err := stream.acquireJobLocked(videoSegmentJob, 0, 0, 1, false, scheduler, 1)
+	if err != nil {
+		stream.mtx.Unlock()
+		t.Fatal(err)
+	}
+	previous.waiters = 1
+	claimVideoTargetLocked(stream.videoJobs, 100, 101, 200)
+	next, _, created, err := stream.acquireJobLocked(videoSegmentJob, 100, 100, 101, false, scheduler, 1)
+	stream.mtx.Unlock()
+	if err != nil || !created {
+		t.Fatalf("new target admission = %v, created=%t", err, created)
+	}
+	select {
+	case <-previousCtx.Done():
+	default:
+		t.Fatal("previous observed target was not canceled")
+	}
+	if _, exists := stream.videoJobs[previous]; exists {
+		t.Fatal("previous target still owns the stream admission")
+	}
+	if len(scheduler.jobs) != 1 {
+		t.Fatalf("scheduler jobs = %d, want only the new target", len(scheduler.jobs))
+	}
+	previous.releaseAdmission()
+	next.releaseAdmission()
+}
+
+func TestFragmentDemandCannotSupersedeExplicitTarget(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := &streamInfo{
+		ctx:          ctx,
+		videoJobs:    make(map[*segmentJob]struct{}),
+		subtitleJobs: make(map[*segmentJob]struct{}),
+	}
+	scheduler := newSegmentScheduler(1, 1)
+
+	stream.mtx.Lock()
+	target, targetCtx, _, err := stream.acquireJobLocked(videoSegmentJob, 100, 100, 101, false, scheduler, 1)
+	if err != nil {
+		stream.mtx.Unlock()
+		t.Fatal(err)
+	}
+	_, _, _, fragmentErr := stream.acquireJobLocked(videoSegmentJob, 0, 0, 1, false, scheduler, 1)
+	stream.mtx.Unlock()
+	if !errors.Is(fragmentErr, errStreamJobLimit) {
+		t.Fatalf("stale fragment admission = %v, want stream limit", fragmentErr)
+	}
+	select {
+	case <-targetCtx.Done():
+		t.Fatal("fragment demand canceled the explicit playback target")
+	default:
+	}
+	if _, active := stream.videoJobs[target]; !active {
+		t.Fatal("explicit playback target lost presentation ownership")
+	}
+	target.releaseAdmission()
 }
 
 func TestStreamKeyPaths(t *testing.T) {

@@ -414,6 +414,13 @@ func GenerateDirectWindow(
 	stopMonitor()
 	published = <-publishResult
 	wasCovered = published.covered
+	// Cancellation owns the result of a retired playback job. The publisher can
+	// be probing a just-written fragment when the job is superseded; that probe
+	// may then report a remux-shaped error even though the source and codecs are
+	// valid. Never let that race switch the whole playback session to transcode.
+	if err := ctx.Err(); err != nil {
+		return DirectWindowResult{}, err
+	}
 	if published.err != nil {
 		return DirectWindowResult{}, published.err
 	}
@@ -537,10 +544,6 @@ func publishDirectCoverage(
 		if err == nil && len(durations) > 0 {
 			if math.IsNaN(outcome.firstPTS) {
 				outcome.firstPTS, err = probeFirstDirectVideoPTS(ctx, workDir, fmp4)
-				if err != nil && ctx.Err() != nil {
-					outcome.firstPTS = math.NaN()
-					return outcome
-				}
 				if err == nil && (outcome.firstPTS > start+0.25 || start-outcome.firstPTS > prerollBudget.Seconds()+0.25) {
 					err = fmt.Errorf("%w: nearest keyframe is %.3fs from target", ErrRemuxNeedsTranscode, start-outcome.firstPTS)
 				}
@@ -553,6 +556,13 @@ func publishDirectCoverage(
 				}
 			}
 			if err != nil {
+				// GenerateDirectWindow stops this monitor after FFmpeg exits so it
+				// can perform one final synchronous scan. Cancellation can race the
+				// probe completion; it is not evidence that remux is unsupported.
+				if ctx.Err() != nil {
+					outcome.firstPTS = math.NaN()
+					return outcome
+				}
 				outcome.err = fmt.Errorf("%w: %v", ErrRemuxNeedsTranscode, err)
 				return outcome
 			}

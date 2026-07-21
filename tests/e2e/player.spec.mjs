@@ -142,6 +142,7 @@ const fakeHls = String.raw`
 
 async function openMovie(page, {
   beforePrepare,
+  prepareResponse,
   fileListError,
   getHlsStatus,
   mediaInfo = {},
@@ -291,6 +292,11 @@ async function openMovie(page, {
       const start = Number(url.searchParams.get('start'));
       prepareStarts.push(start);
       await beforePrepare?.(start);
+      const response = await prepareResponse?.(start, prepareStarts.length);
+      if (response) {
+        await route.fulfill(response);
+        return;
+      }
       presentationGeneration++;
       const stream = stableStream ? 'stream-stable' : `stream-${start}-${presentationGeneration}`;
       await route.fulfill({
@@ -352,7 +358,14 @@ test('bounds the HLS buffer by duration and bytes instead of a fixed 12 seconds'
     maxBufferLength: 30,
     maxMaxBufferLength: 60,
     maxBufferSize: 128 * 1024 * 1024,
+    liveSyncDurationCount: 1,
+    liveMaxLatencyDurationCount: 1_000_000,
+    maxLiveSyncPlaybackRate: 1,
+    maxBufferHole: 0,
+    nudgeMaxRetry: 0,
+    nudgeOnVideoHole: false,
   });
+  await expect.poll(() => page.evaluate(() => new URL(window.__hlsSources[0], location.href).searchParams.get('v'))).toBe('generation-1');
 });
 
 test('reduces 8K forward duration to respect the client byte ceiling', async ({ page }) => {
@@ -393,7 +406,80 @@ test('detects frozen video frames even while the player clock can advance', asyn
     playbackStallCount: 1,
     stallFreeSession: false,
   });
-  await expect.poll(() => prepareStarts, { timeout: 7000 }).toEqual([0, 0]);
+  expect(prepareStarts).toEqual([0]);
+  await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
+});
+
+test('waits for the next fragment without rebuilding the stream on buffer underrun', async ({ page }) => {
+  const prepareStarts = await openMovie(page, { freezeVideoFrames: true });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThanOrEqual(1);
+
+  await page.locator('video').evaluate(video => {
+    Object.defineProperty(video, 'buffered', {
+      configurable: true,
+      value: { length: 0, start: () => 0, end: () => 0 },
+    });
+  });
+
+  await expect.poll(() => page.evaluate(() => window.__qoeSummaries.at(-1)), { timeout: 6000 }).toMatchObject({
+    playbackStallCount: 1,
+    rebufferCount: 1,
+  });
+  expect(prepareStarts).toEqual([0]);
+  await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
+});
+
+test('never replaces or rewinds active playback when the next HLS fragment is delayed', async ({ page }) => {
+  const prepareStarts = await openMovie(page, { initialBufferSeconds: 18 });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThanOrEqual(1);
+
+  await page.locator('video').evaluate(video => {
+    window.__activeVideoBeforeUnderrun = video;
+    video.currentTime = 16;
+    video.dispatchEvent(new Event('timeupdate'));
+  });
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(16);
+
+  await page.locator('video').evaluate(video => {
+    Object.defineProperty(video, 'buffered', {
+      configurable: true,
+      value: { length: 0, start: () => 0, end: () => 0 },
+    });
+    video.dispatchEvent(new Event('waiting'));
+    window.__hlsInstances[0].emit(window.Hls.Events.ERROR, {
+      fatal: true,
+      details: 'levelLoadError',
+      response: { code: 409 },
+    });
+  });
+
+  await page.waitForTimeout(500);
+  expect(prepareStarts).toEqual([0]);
+  expect(await page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
+  expect(await page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+  expect(await page.evaluate(() => document.getElementById('video') === window.__activeVideoBeforeUnderrun)).toBe(true);
+  await expect.poll(() => page.locator('video').evaluate(video => video.duration)).toBe(duration);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(16);
+});
+
+test('restores the last presented position after an unsolicited media seek', async ({ page }) => {
+  const prepareStarts = await openMovie(page, { initialBufferSeconds: 18 });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThanOrEqual(1);
+
+  await page.locator('video').evaluate(async video => {
+    video.currentTime = 16;
+    await new Promise(resolve => setTimeout(resolve, 150));
+    video.currentTime = 0;
+    video.dispatchEvent(new Event('seeking'));
+  });
+
+  expect(prepareStarts).toEqual([0]);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(16);
+  await expect.poll(() => page.locator('video').evaluate(video => video.duration)).toBe(duration);
+  await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
 });
 
 test('falls back when the media clock advances before any video frame is decoded', async ({ page }) => {
@@ -485,6 +571,72 @@ test('enables the selected text subtitle rendition', async ({ page }) => {
   await expect.poll(() => page.evaluate(() => window.__hlsInstances.at(-1)?.subtitleDisplay)).toBe(true);
 });
 
+test('does not attach playback until the selected subtitle target is ready', async ({ page }) => {
+  let subtitlesReady = false;
+  await openMovie(page, {
+    hlsSubtitleTrackCount: 1,
+    mediaInfo: { subtitles: [{ index: 0, codec: 'subrip', language: 'eng' }] },
+    getHlsStatus: targetSeconds => subtitlesReady ? {
+      phase: 'ready',
+      stage: 'ready',
+      targetSeconds,
+      presentationOriginSeconds: 0,
+      activePeers: 1,
+      totalPeers: 1,
+    } : {
+      phase: 'preparing',
+      stage: 'queued',
+      message: 'Preparing selected subtitles',
+      targetSeconds,
+      activePeers: 1,
+      totalPeers: 1,
+    },
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await page.locator('#subtitleSelect').selectOption('0');
+  await page.getByRole('button', { name: 'Play', exact: true }).click();
+
+  await expect(page.locator('#warn-detail')).toContainText('Preparing selected subtitles');
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(0);
+
+  subtitlesReady = true;
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => window.__hlsInstances.at(-1)?.subtitleTrack)).toBe(0);
+  await expect.poll(() => page.evaluate(() => window.__hlsInstances.at(-1)?.subtitleDisplay)).toBe(true);
+});
+
+test('stops instead of silently continuing without selected subtitles', async ({ page }) => {
+  const prepareStarts = await openMovie(page, {
+    hlsSubtitleTrackCount: 1,
+    mediaInfo: { subtitles: [{ index: 0, codec: 'subrip', language: 'eng' }] },
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await page.locator('#subtitleSelect').selectOption('0');
+  await page.getByRole('button', { name: 'Play', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsInstances.length)).toBe(1);
+
+  await page.evaluate(() => {
+    window.__hlsInstances[0].emit(window.Hls.Events.ERROR, {
+      fatal: false,
+      details: 'fragLoadError',
+      frag: { type: 'subtitle' },
+    });
+  });
+  await expect(page.locator('#playerMsg')).not.toContainText('Subtitle error');
+
+  await page.evaluate(() => {
+    window.__hlsInstances[0].emit(window.Hls.Events.ERROR, {
+      fatal: true,
+      details: 'fragLoadError',
+      frag: { type: 'subtitle' },
+    });
+  });
+  await expect(page.locator('#playerMsg')).toContainText('The selected subtitles could not be loaded');
+  await expect.poll(() => page.locator('video').evaluate(video => video.paused)).toBe(true);
+  expect(prepareStarts).toEqual([0]);
+  await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
+});
+
 test('starts at the first published timestamp when it is later than zero', async ({ page }) => {
   await openMovie(page, {
     getHlsStatus: targetSeconds => ({
@@ -519,6 +671,7 @@ test('uses the server presentation origin without deriving a nominal window orig
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
 
   await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 7199;
     video.dispatchEvent(new Event('seeking'));
   });
@@ -584,6 +737,7 @@ test('keeps the same player and buffers an unmaterialized HLS position', async (
 
   await page.locator('video').evaluate(video => {
     window.__videoBeforeSeek = video;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     Object.defineProperty(video, 'currentTime', { configurable: true, writable: true, value: 7199 });
     video.dispatchEvent(new Event('seeking'));
   });
@@ -607,12 +761,21 @@ test('keeps the same player and buffers an unmaterialized HLS position', async (
 });
 
 test('does not reattach a stable server presentation after a cold seek', async ({ page }) => {
-  const prepareStarts = await openMovie(page, { stableStream: true });
+  const prepareStarts = await openMovie(page, {
+    stableStream: true,
+    getHlsStatus: targetSeconds => ({
+      phase: 'ready',
+      targetSeconds,
+      presentationOriginSeconds: targetSeconds,
+      generation: 'generation-stable',
+    }),
+  });
   await page.getByRole('button', { name: 'Select tracks' }).click();
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
 
   await page.locator('video').evaluate(video => {
     window.__videoBeforeStableSeek = video;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 7199;
     video.dispatchEvent(new Event('seeking'));
   });
@@ -640,6 +803,7 @@ test('reattaches a stable stream when its playlist generation changed', async ({
 
   generation = 'second';
   await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 600;
     video.dispatchEvent(new Event('seeking'));
   });
@@ -684,6 +848,7 @@ test('does not snap back or replace the player while a clicked position is loadi
 
   await page.locator('video').evaluate(video => {
     window.__videoBeforeSeek = video;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     Object.defineProperty(video, 'currentTime', { configurable: true, writable: true, value: 7199 });
     video.dispatchEvent(new Event('seeking'));
   });
@@ -702,6 +867,105 @@ test('does not snap back or replace the player while a clicked position is loadi
   await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(7199);
 });
 
+test('retries transient streaming capacity without replacing the player or losing the seek target', async ({ page }) => {
+  let capacityFailures = 0;
+  const prepareStarts = await openMovie(page, {
+    stableStream: true,
+    prepareResponse: start => {
+      if (start !== 600 || capacityFailures++ >= 2) return null;
+      return {
+        status: 503,
+        headers: { 'Retry-After': '0.01' },
+        body: 'The server is at its configured streaming capacity; retry shortly',
+      };
+    },
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  await page.locator('video').evaluate(video => {
+    window.__videoBeforeCapacitySeek = video;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.currentTime = 600;
+    video.dispatchEvent(new Event('seeking'));
+  });
+
+  await expect.poll(() => prepareStarts).toEqual([0, 600, 600, 600]);
+  expect(await page.evaluate(() => document.getElementById('video') === window.__videoBeforeCapacitySeek)).toBe(true);
+  expect(await page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(600);
+  await expect.poll(() => page.locator('video').evaluate(video => video.duration)).toBe(duration);
+  await expect(page.locator('#playerMsg')).not.toContainText('configured streaming capacity');
+});
+
+test('cancels capacity retries when the user commits a newer seek', async ({ page }) => {
+  const prepareStarts = await openMovie(page, {
+    stableStream: true,
+    prepareResponse: start => start === 600 ? {
+      status: 503,
+      headers: { 'Retry-After': '1' },
+      body: 'The server is at its configured streaming capacity; retry shortly',
+    } : null,
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.currentTime = 600;
+    video.dispatchEvent(new Event('seeking'));
+  });
+  await expect.poll(() => prepareStarts).toEqual([0, 600]);
+
+  await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.currentTime = 1200;
+    video.dispatchEvent(new Event('seeking'));
+  });
+  await expect.poll(() => prepareStarts).toEqual([0, 600, 1200]);
+  await page.waitForTimeout(1100);
+  expect(prepareStarts).toEqual([0, 600, 1200]);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(1200);
+});
+
+test('keeps a cold seek pending until its selected subtitle segment is ready', async ({ page }) => {
+  let distantSubtitlesReady = false;
+  const prepareStarts = await openMovie(page, {
+    stableStream: true,
+    hlsSubtitleTrackCount: 1,
+    mediaInfo: { subtitles: [{ index: 0, codec: 'subrip', language: 'eng' }] },
+    getHlsStatus: targetSeconds => ({
+      phase: targetSeconds === 600 && !distantSubtitlesReady ? 'preparing' : 'ready',
+      stage: targetSeconds === 600 && !distantSubtitlesReady ? 'queued' : 'ready',
+      message: targetSeconds === 600 && !distantSubtitlesReady ? 'Preparing selected subtitles' : '',
+      targetSeconds,
+      presentationOriginSeconds: 0,
+      activePeers: 1,
+      totalPeers: 1,
+    }),
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await page.locator('#subtitleSelect').selectOption('0');
+  await page.getByRole('button', { name: 'Play', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  await page.locator('video').evaluate(video => {
+    window.__videoBeforeSubtitleSeek = video;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.currentTime = 600;
+    video.dispatchEvent(new Event('seeking'));
+  });
+  await expect.poll(() => prepareStarts).toEqual([0, 600]);
+  await expect(page.locator('#warn-detail')).toContainText('Preparing selected subtitles');
+  expect(await page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+  expect(await page.evaluate(() => document.getElementById('video') === window.__videoBeforeSubtitleSeek)).toBe(true);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(600);
+
+  distantSubtitlesReady = true;
+  await expect.poll(() => page.evaluate(() => window.__hlsStartLoads.at(-1))).toBe(600);
+  await expect.poll(() => page.evaluate(() => window.__hlsInstances.at(-1)?.subtitleTrack)).toBe(0);
+});
+
 test('only the latest cold seek may replace the active presentation', async ({ page }) => {
   let releaseFirstSeek;
   const firstSeekBlocked = new Promise(resolve => { releaseFirstSeek = resolve; });
@@ -712,12 +976,14 @@ test('only the latest cold seek may replace the active presentation', async ({ p
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
 
   await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 100;
     video.dispatchEvent(new Event('seeking'));
   });
   await expect.poll(() => prepareStarts).toEqual([0, 100]);
 
   await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 200;
     video.dispatchEvent(new Event('seeking'));
   });
@@ -738,6 +1004,7 @@ test('coalesces a burst of nonsequential seeks and keeps only the final target',
 
   await page.locator('video').evaluate(video => {
     window.__videoBeforeSeekBurst = video;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     for (const target of [100, 900, 200, 800, 300, 700, 400, 600, 500, 1000]) {
       video.currentTime = target;
       video.dispatchEvent(new Event('seeking'));
@@ -751,6 +1018,34 @@ test('coalesces a burst of nonsequential seeks and keeps only the final target',
   await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(1000);
 });
 
+test('coalesces scrub positions emitted across multiple animation frames', async ({ page }) => {
+  const statusTargets = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/api/hls/status/')) statusTargets.push(Number(url.searchParams.get('target')));
+  });
+  const prepareStarts = await openMovie(page);
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  await page.locator('video').evaluate(async video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    for (const target of [100, 200, 300]) {
+      video.currentTime = target;
+      video.dispatchEvent(new Event('seeking'));
+      video.dispatchEvent(new Event('seeked'));
+      video.dispatchEvent(new Event('waiting'));
+      video.dispatchEvent(new Event('stalled'));
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  });
+
+  await expect.poll(() => prepareStarts).toEqual([0, 300]);
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(300);
+  expect(statusTargets.filter(target => target > 0).every(target => target === 300)).toBe(true);
+});
+
 test('coalesces repeated seeking events for the same cold position', async ({ page }) => {
   let releasePrepare;
   const prepareBlocked = new Promise(resolve => { releasePrepare = resolve; });
@@ -762,6 +1057,7 @@ test('coalesces repeated seeking events for the same cold position', async ({ pa
 
   await page.locator('video').evaluate(video => {
     window.__videoBeforeRepeatedSeek = video;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 100;
     video.dispatchEvent(new Event('seeking'));
   });
@@ -783,6 +1079,7 @@ test('ignores a media attachment seek to the live edge', async ({ page }) => {
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
 
   await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 600;
     video.dispatchEvent(new Event('seeking'));
   });
@@ -805,6 +1102,7 @@ test('cancels an unready forward seek when returning to retained history', async
 
   await page.locator('video').evaluate(video => {
     window.__videoBeforeSeek = video;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     window.__hlsInstances.at(-1).latestLevelDetails = {
       fragments: Array.from({ length: 31 }, (_, index) => ({ start: index * 2, duration: 2 })),
     };
@@ -818,11 +1116,12 @@ test('cancels an unready forward seek when returning to retained history', async
   await expect.poll(() => prepareStarts).toEqual([0, 7199]);
 
   await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 24;
     video.dispatchEvent(new Event('seeking'));
   });
 
-  await expect.poll(() => page.evaluate(() => window.__hlsStartLoads)).toEqual([0, 0, 24]);
+  await expect.poll(() => page.evaluate(() => window.__hlsStartLoads)).toEqual([0, 24]);
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
   await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
   await expect.poll(() => page.evaluate(() => document.getElementById('video') === window.__videoBeforeSeek)).toBe(true);
@@ -840,6 +1139,7 @@ test('seeking back to zero creates a fresh presentation instead of jumping to th
 
   await page.locator('video').evaluate(video => {
     const activeHls = window.__hlsInstances.at(-1);
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     activeHls.latestLevelDetails = { fragments: [{ start: 16, duration: 2 }] };
     Object.defineProperty(video, 'buffered', {
       configurable: true,
@@ -867,6 +1167,7 @@ test('seeking within retained HLS history reuses the current presentation', asyn
 
   await page.locator('video').evaluate(video => {
     const activeHls = window.__hlsInstances.at(-1);
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     activeHls.latestLevelDetails = {
       fragments: Array.from({ length: 16 }, (_, index) => ({ start: index * 2, duration: 2 })),
     };
@@ -907,6 +1208,7 @@ test('reports a seek that needs preparation as cold', async ({ page }) => {
 
   await page.locator('video').evaluate(video => {
     window.__hlsInstances.at(-1).latestLevelDetails = { fragments: [{ start: 0, duration: 2 }] };
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     Object.defineProperty(video, 'buffered', {
       configurable: true,
       value: { length: 1, start: () => 0, end: () => 2 },
@@ -939,6 +1241,30 @@ test('does not chase the live edge when the prepared window advances', async ({ 
   await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(50);
 });
 
+test('keeps source time monotonic while the HLS presentation advances across five windows', async ({ page }) => {
+  const prepareStarts = await openMovie(page, { initialBufferSeconds: 180 });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  const observed = await page.locator('video').evaluate(video => {
+    window.__videoBeforeWindowAdvance = video;
+    const values = [];
+    for (const sourceTime of [1, 31, 61, 91, 121, 151]) {
+      video.currentTime = sourceTime;
+      video.dispatchEvent(new Event('timeupdate'));
+      window.__hlsInstances.at(-1).slideLiveWindow(Math.max(0, sourceTime - 1));
+      values.push(video.currentTime);
+    }
+    return values;
+  });
+
+  expect(observed).toEqual([1, 31, 61, 91, 121, 151]);
+  expect(prepareStarts).toEqual([0]);
+  expect(await page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
+  expect(await page.evaluate(() => document.getElementById('video') === window.__videoBeforeWindowAdvance)).toBe(true);
+  await expect.poll(() => page.locator('video').evaluate(video => video.duration)).toBe(duration);
+});
+
 test('surfaces a failed torrent request without retrying it in a loop', async ({ page }) => {
   let requests = 0;
   await openMovie(page, {
@@ -963,6 +1289,7 @@ test('keeps unknown-duration playback progressive instead of inventing a full ti
     timelineOffset: undefined,
   });
   await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
     video.currentTime = 50;
     video.dispatchEvent(new Event('seeking'));
   });

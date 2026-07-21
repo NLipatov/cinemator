@@ -79,16 +79,6 @@ type streamInfo struct {
 	closing                          bool
 }
 
-type streamCacheSnapshot struct {
-	paths                streamPaths
-	publishing           bool
-	videoJobs            []*segmentJob
-	subtitleJobs         []*segmentJob
-	directWindows        map[int][]ffmpeg.HLSFragment
-	playbackWindow       int
-	progressiveSubtitles int
-}
-
 func (s *streamInfo) touch(now time.Time) {
 	s.mtx.Lock()
 	s.lastView = now
@@ -137,40 +127,51 @@ func (s *streamInfo) reserveJobLocked(scheduler *segmentScheduler, maximum int, 
 	if s.closing {
 		return nil, context.Canceled
 	}
+	// Foreground playback demand must not lose to speculative work owned by the
+	// same stream. Retire lazy subtitles first, then video prefetch, before
+	// applying the per-stream limit. The process-wide scheduler applies the same
+	// policy across streams.
+	for len(s.videoJobs)+len(s.subtitleJobs) >= maximum && !background {
+		if retireFirstBackgroundJobLocked(s.subtitleJobs) || retireFirstBackgroundJobLocked(s.videoJobs) {
+			continue
+		}
+		break
+	}
 	if len(s.videoJobs)+len(s.subtitleJobs) >= maximum {
 		return nil, errStreamJobLimit
 	}
 	return scheduler.reserveJob(background, cancel)
 }
 
+func retireFirstBackgroundJobLocked(jobs map[*segmentJob]struct{}) bool {
+	for job := range jobs {
+		if !job.background || jobFinished(job) {
+			continue
+		}
+		retireSegmentJobLocked(jobs, job)
+		return true
+	}
+	return false
+}
+
+func retireSegmentJobLocked(jobs map[*segmentJob]struct{}, job *segmentJob) {
+	if job == nil {
+		return
+	}
+	if _, exists := jobs[job]; !exists {
+		return
+	}
+	delete(jobs, job)
+	if job.cancel != nil {
+		job.cancel()
+	}
+	job.releaseAdmission()
+}
+
 func (s *streamInfo) currentAssetVersion() string {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	return s.assetVersion
-}
-
-func (s *streamInfo) cacheSnapshot() streamCacheSnapshot {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	snapshot := streamCacheSnapshot{
-		paths:                s.paths,
-		publishing:           s.ready != nil && !channelClosed(s.ready),
-		videoJobs:            make([]*segmentJob, 0, len(s.videoJobs)),
-		subtitleJobs:         make([]*segmentJob, 0, len(s.subtitleJobs)),
-		directWindows:        make(map[int][]ffmpeg.HLSFragment, len(s.directWindows)),
-		playbackWindow:       s.playbackWindow,
-		progressiveSubtitles: s.progressiveSubtitles,
-	}
-	for job := range s.videoJobs {
-		snapshot.videoJobs = append(snapshot.videoJobs, job)
-	}
-	for job := range s.subtitleJobs {
-		snapshot.subtitleJobs = append(snapshot.subtitleJobs, job)
-	}
-	for owner, fragments := range s.directWindows {
-		snapshot.directWindows[owner] = append([]ffmpeg.HLSFragment(nil), fragments...)
-	}
-	return snapshot
 }
 
 func (s *streamInfo) recordSourceRange(jobID string, offset, length int64) {
@@ -338,7 +339,8 @@ func (s *streamInfo) markJobStage(job *segmentJob, stage domain.HlsStage) {
 		job.lastSourceProgress = now
 		job.lastOutputProgress = now
 	}
-	if s.statusSegment >= job.begin && s.statusSegment < job.end {
+	_, videoJob := s.videoJobs[job]
+	if videoJob && s.statusSegment >= job.begin && s.statusSegment < job.end {
 		s.status.Stage = stage
 		s.status.LastProgress = now
 	}
@@ -363,12 +365,16 @@ func (s *streamInfo) markJobError(job *segmentJob, err error) {
 	s.mtx.Lock()
 	_, videoJob := s.videoJobs[job]
 	_, subtitleJob := s.subtitleJobs[job]
+	if !videoJob && !subtitleJob {
+		s.mtx.Unlock()
+		return
+	}
+	job.stage = domain.HlsStageError
 	if s.fatalErr == nil && (videoJob || subtitleJob) {
 		if s.segmentErrors == nil {
 			s.segmentErrors = make(map[int]segmentFailure)
 		}
 		failure := segmentFailure{message: publicStreamError(err), at: time.Now()}
-		job.stage = domain.HlsStageError
 		for index := job.begin; index < job.end; index++ {
 			s.segmentErrors[index] = failure
 		}
@@ -417,22 +423,18 @@ func (s *streamInfo) markSegmentError(index int, err error) {
 }
 
 func (s *streamInfo) markJobCanceled(job *segmentJob) {
+	if job == nil {
+		return
+	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	if s.fatalErr != nil || s.statusSegment < job.begin || s.statusSegment >= job.end {
 		return
 	}
 	if _, ok := s.videoJobs[job]; !ok {
-		if _, ok := s.subtitleJobs[job]; !ok {
-			return
-		}
+		return
 	}
 	for other := range s.videoJobs {
-		if other != job && s.statusSegment >= other.begin && s.statusSegment < other.end && !jobFinished(other) {
-			return
-		}
-	}
-	for other := range s.subtitleJobs {
 		if other != job && s.statusSegment >= other.begin && s.statusSegment < other.end && !jobFinished(other) {
 			return
 		}
@@ -518,7 +520,7 @@ func playbackReadaheadBytes(maximum, pieceLength, bitrate int64, horizon time.Du
 
 // playbackStatus is the session's single read model for phase transitions.
 // The manager supplies only external torrent counters and the pure timeline.
-func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTimeline, now time.Time, usefulBytes int64, activePeers, totalPeers int) domain.HlsStatus {
+func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTimeline, now time.Time, usefulBytes int64, activePeers, totalPeers int, subtitlesReady bool) domain.HlsStatus {
 	targetIndex := -1
 	hasTarget := targetSeconds >= 0 && !math.IsNaN(targetSeconds) && !math.IsInf(targetSeconds, 0)
 
@@ -584,6 +586,31 @@ func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTime
 			if status.LastProgress.IsZero() {
 				status.LastProgress = videoJob.startedAt
 			}
+		} else if publishedReady && !subtitlesReady {
+			status.Phase = domain.HlsPhasePreparing
+			status.Stage = domain.HlsStageQueued
+			status.Message = "Preparing selected subtitles"
+			status.StartedAt = now
+			status.LastProgress = now
+			if subtitleJob := findSegmentJob(s.subtitleJobs, targetIndex); subtitleJob != nil {
+				videoJobActive = true
+				status.Stage = subtitleJob.stage
+				status.WorkClass = "foreground"
+				status.StartedAt = subtitleJob.startedAt
+				status.LastProgress = subtitleJob.lastProgress
+				status.BytesRead = subtitleJob.bytesRead
+				status.PublishedBytes = subtitleJob.publishedBytes
+				status.RequestedRangeStart = subtitleJob.requestedRangeStart
+				status.RequestedRangeEnd = subtitleJob.requestedRangeEnd
+				requestedRangeStart = subtitleJob.requestedRangeStart
+				requestedRangeEnd = subtitleJob.requestedRangeEnd
+				if len(subtitleJob.requestedPieces) > 0 {
+					requestedPieces = make(map[int]bool, len(subtitleJob.requestedPieces))
+					for index, complete := range subtitleJob.requestedPieces {
+						requestedPieces[index] = complete
+					}
+				}
+			}
 		} else {
 			status.Phase = domain.HlsPhaseWaiting
 			status.Stage = domain.HlsStageWaitingSource
@@ -619,7 +646,7 @@ func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTime
 	}
 
 	if targetIndex >= 0 && initialized && status.Phase != domain.HlsPhaseError {
-		if publishedReady {
+		if publishedReady && subtitlesReady {
 			status.Phase = domain.HlsPhaseReady
 			status.Stage = domain.HlsStageReady
 			status.Message = ""
@@ -692,6 +719,8 @@ type segmentJob struct {
 	fragments           []ffmpeg.HLSFragment
 	directEnd           bool
 	releaseSlot         func()
+	releaseOnce         sync.Once
+	ctx                 context.Context
 	targetSeconds       float64
 }
 
@@ -744,13 +773,10 @@ func (s *streamInfo) acquireJobLocked(kind segmentJobKind, requestIndex, begin, 
 		name = "subtitle"
 	}
 	if job := findSegmentJob(jobs, requestIndex); job != nil {
-		if kind != videoSegmentJob || background || !job.background || job.cancel == nil {
+		if background || !job.background || job.cancel == nil {
 			return job, nil, false, nil
 		}
-		job.cancel()
-	}
-	if kind == videoSegmentJob && !background {
-		cancelAbandonedJobsLocked(jobs, begin, end)
+		retireSegmentJobLocked(jobs, job)
 	}
 	jobCtx, cancel := context.WithCancel(s.ctx)
 	releaseSlot, err := s.reserveJobLocked(scheduler, maximum, background, cancel)
@@ -772,6 +798,7 @@ func (s *streamInfo) acquireJobLocked(kind segmentJobKind, requestIndex, begin, 
 		stage:              domain.HlsStageQueued,
 		background:         background,
 		releaseSlot:        releaseSlot,
+		ctx:                jobCtx,
 	}
 	if jobs == nil {
 		jobs = make(map[*segmentJob]struct{})
@@ -797,10 +824,14 @@ func (s *streamInfo) finishJob(kind segmentJobKind, job *segmentJob) {
 }
 
 func (j *segmentJob) releaseAdmission() {
-	if j != nil && j.releaseSlot != nil {
-		j.releaseSlot()
-		j.releaseSlot = nil
+	if j == nil {
+		return
 	}
+	j.releaseOnce.Do(func() {
+		if j.releaseSlot != nil {
+			j.releaseSlot()
+		}
+	})
 }
 
 type segmentFailure struct {

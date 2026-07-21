@@ -80,6 +80,28 @@ async function prepareAt(page, prepareURL, start) {
   return prepared;
 }
 
+async function samplePlaybackClock(video, durationMS = 15_000) {
+  return video.evaluate(async (element, sampleDurationMS) => {
+    const startedAt = performance.now();
+    const samples = [];
+    while (performance.now() - startedAt < sampleDurationMS) {
+      samples.push({
+        mediaTime: element.currentTime,
+        wallTime: (performance.now() - startedAt) / 1000,
+      });
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    samples.push({
+      mediaTime: element.currentTime,
+      wallTime: (performance.now() - startedAt) / 1000,
+    });
+    return {
+      playbackRate: element.playbackRate,
+      samples,
+    };
+  }, durationMS);
+}
+
 test.describe('live torrent playback', () => {
   test.skip(!baseURL || !magnet, 'requires CINEMATOR_LIVE_BASE_URL and CINEMATOR_LIVE_MAGNET');
 
@@ -95,7 +117,7 @@ test.describe('live torrent playback', () => {
     await expect.poll(() => first.telemetry.preparedStreams.length).toBeGreaterThan(0);
     await expect.poll(() => second.telemetry.preparedStreams.length).toBeGreaterThan(0);
 
-    expect(first.telemetry.preparedStreams[0]).toBe(second.telemetry.preparedStreams[0]);
+    expect(first.telemetry.preparedStreams.at(-1)).toBe(second.telemetry.preparedStreams.at(-1));
     expect(first.telemetry.transcodeFlags[0]).toBe(0);
     expect(second.telemetry.transcodeFlags[0]).toBe(0);
     const secondTime = await second.video.evaluate(element => element.currentTime);
@@ -109,11 +131,12 @@ test.describe('live torrent playback', () => {
     test.setTimeout(2 * 60 * 1000);
     const { telemetry } = await openLiveMovie(page);
     await expect.poll(() => telemetry.preparedStreams.length).toBeGreaterThan(0);
-    const initialStream = telemetry.preparedStreams[0];
-    const distant = await prepareAt(page, telemetry.prepareURLs[0], 600);
-    const retained = await prepareAt(page, telemetry.prepareURLs[0], 0);
-    expect(distant.stream).toBe(initialStream);
-    expect(retained.stream).toBe(initialStream);
+    const activeStream = telemetry.preparedStreams.at(-1);
+    const activePrepareURL = telemetry.prepareURLs.at(-1);
+    const distant = await prepareAt(page, activePrepareURL, 600);
+    const retained = await prepareAt(page, activePrepareURL, 0);
+    expect(distant.stream).toBe(activeStream);
+    expect(retained.stream).toBe(activeStream);
     expect(new URL(telemetry.prepareURLs[0]).searchParams.get('transcode')).toBe('0');
     expect(telemetry.consoleErrors).toEqual([]);
   });
@@ -121,26 +144,40 @@ test.describe('live torrent playback', () => {
   test('keeps one presentation while seeking', async ({ page }) => {
     test.setTimeout(2 * 60 * 1000);
     const { telemetry, video } = await openLiveMovie(page);
+    const activeStream = telemetry.preparedStreams.at(-1);
+    const preparedBeforeSeek = telemetry.preparedStreams.length;
     await video.evaluate(element => {
       window.__liveVideo = element;
       element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
       element.currentTime = 120;
     });
     await expect.poll(() => telemetry.prepareStarts.at(-1)).toBe(120);
-    await expect.poll(() => telemetry.preparedStreams.length).toBeGreaterThan(1);
-    expect(new Set(telemetry.preparedStreams)).toEqual(new Set([telemetry.preparedStreams[0]]));
+    await expect.poll(() => telemetry.preparedStreams.length).toBeGreaterThan(preparedBeforeSeek);
+    expect(new Set(telemetry.preparedStreams.slice(preparedBeforeSeek))).toEqual(new Set([activeStream]));
     expect(await page.evaluate(() => document.getElementById('video') === window.__liveVideo)).toBe(true);
     await expect.poll(() => video.evaluate(element => element.currentTime), { timeout: 120_000 })
       .toBeGreaterThan(120.5);
+    const resumedAt = await video.evaluate(element => element.currentTime);
+    expect(resumedAt).toBeLessThan(124);
     const decodedFrames = await video.evaluate(element =>
       element.getVideoPlaybackQuality?.().totalVideoFrames ?? element.webkitDecodedFrameCount ?? 0,
     );
     await expect.poll(() => video.evaluate(element =>
       element.getVideoPlaybackQuality?.().totalVideoFrames ?? element.webkitDecodedFrameCount ?? 0,
     ), { timeout: 30_000 }).toBeGreaterThan(decodedFrames + 5);
-    await expect.poll(() => video.evaluate(element => element.currentTime), { timeout: 120_000 })
-      .toBeGreaterThan(126);
-    expect(await video.evaluate(element => element.currentTime)).toBeLessThan(150);
+    const clock = await samplePlaybackClock(video);
+    expect(clock.playbackRate).toBe(1);
+    for (let index = 1; index < clock.samples.length; index += 1) {
+      const previous = clock.samples[index - 1];
+      const current = clock.samples[index];
+      expect(current.mediaTime).toBeGreaterThanOrEqual(previous.mediaTime - 0.1);
+      expect(current.mediaTime - previous.mediaTime)
+        .toBeLessThanOrEqual(current.wallTime - previous.wallTime + 0.75);
+    }
+    const first = clock.samples[0];
+    const last = clock.samples.at(-1);
+    expect(last.mediaTime).toBeGreaterThan(first.mediaTime + 1);
+    expect(last.mediaTime - first.mediaTime).toBeLessThanOrEqual(last.wallTime - first.wallTime + 1.5);
     expect(telemetry.consoleErrors).toEqual([]);
   });
 });

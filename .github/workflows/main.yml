@@ -16,6 +16,7 @@ on:
       - 'playwright.config.mjs'
       - 'src/**'
       - 'tests/e2e/**'
+      - 'docs/**'
       - 'version.txt'
 
 permissions:
@@ -37,6 +38,11 @@ jobs:
         with:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
+
+      - name: Verify media integration tools
+        run: |
+          ffmpeg -version
+          ffprobe -version
 
       - name: Test
         working-directory: src

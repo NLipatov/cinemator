@@ -398,6 +398,13 @@ reconstructed with potentially different bytes under its old immutable
 identities. A persisted immutable VOD manifest remains servable unchanged
 through `validUntil`.
 
+An active presentation is an immutable cache lease. Cache enforcement MUST NOT
+remove files from its presentation directory, rotate its generation, rewrite
+its playlists, or make an attached playlist URL stale. Reproducible torrent
+pieces and inactive HLS presentations are reclaimed first. If protected active
+bytes leave insufficient headroom, admission of new generation work fails;
+cache pressure never mutates playback that is already attached.
+
 Publishing a playlist version atomically persists the `retainUntil` deadline
 calculated from every published version that references each complete asset.
 Publishing a VOD manifest likewise persists its `validUntil` lease before the
@@ -611,6 +618,14 @@ The prepare result does not expose a playlist URL until the initial bounded
 window and every asset referenced by that initial playlist are complete. It
 returns a new presentation generation and its source-time mapping.
 
+When a text subtitle track is selected, the cue segment covering the requested
+source position is a required presentation asset. The target MUST NOT become
+`ready` and the client MUST NOT attach its HLS presentation until both the video
+fragment and that subtitle segment are complete. Required subtitle extraction
+runs after the target video fragment and before speculative video or subtitle
+prefetch. Capacity pressure waits and retries this work; it MUST NOT silently
+drop the selected track or attach video-only playback.
+
 The managed player uses an application-owned full-duration timeline and seek
 control. Browser media time is presentation-local and MUST be translated through
 the source-time mapping for display, recovery, Media Session actions, and the
@@ -634,8 +649,12 @@ On initial play and a seek outside the current presentation, the client MUST:
 `MediaSource` across presentation generations is intentionally unsupported;
 its complete reset contract is more complex and error-prone than recreation.
 Old SourceBuffer ranges with the same local timestamps MUST NOT survive a
-generation switch. Recovery exposes the new source-time mapping only after the
-old media timeline has been removed.
+generation switch. Only an explicit user command may authorize that switch
+after the first frame has been presented. Runtime recovery, playlist refresh,
+buffer underrun, decoder failure, worker loss, and cache enforcement MUST NOT
+destroy or replace the attached `MediaSource`, change its duration, or assign a
+different playhead. Such failures wait at the last presented source time or
+become visible terminal errors.
 
 Normal playback SHOULD prefetch only a small forward horizon. A later seek MAY
 cancel work that has not started. A bounded job that has already started MAY

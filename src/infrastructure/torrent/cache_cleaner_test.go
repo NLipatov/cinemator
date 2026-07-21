@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
@@ -64,7 +63,7 @@ func TestSharedCachePreservesHlsBeforeTorrentPieces(t *testing.T) {
 	}
 }
 
-func TestEnforceCacheLimitEvictsActiveGeneratedAssetsButProtectsManifestsAndWorkFiles(t *testing.T) {
+func TestEnforceCacheLimitPreservesEveryActivePresentationFile(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "400")
@@ -102,14 +101,14 @@ func TestEnforceCacheLimitEvictsActiveGeneratedAssetsButProtectsManifestsAndWork
 	}
 	assets, _ := newHlsAssetStore(root)
 	m.media = &mediaCache{budget: newCacheBudget(m.settings.MaxCacheBytes()), assets: assets}
-	m.enforceCacheLimit()
-
-	if _, err := os.Stat(filepath.Join(paths.outDir, "chunk_000000.ts")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("old generated segment was not evicted: %v", err)
+	err := m.media.enforce(root, m.hlsCacheProtection)
+	if err == nil {
+		t.Fatal("cache enforcement unexpectedly fit active presentation under target")
 	}
-	for _, path := range []string{paths.masterPlaylist, paths.videoPlaylist, filepath.Join(workDir, "chunk_000002.ts"), filepath.Join(paths.outDir, ".remuxing-test", "part_000000.ts")} {
+
+	for _, path := range files {
 		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("protected cache file %s was removed: %v", path, err)
+			t.Fatalf("active presentation file %s was removed: %v", path, err)
 		}
 	}
 }
@@ -159,47 +158,19 @@ func TestEstimatedHlsWindowBytesUsesSourceBitrate(t *testing.T) {
 	}
 }
 
-func TestHlsCacheProtectionPinsPublishedPresentation(t *testing.T) {
+func TestHlsCacheProtectionIncludesActivePresentationDirectory(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
 	paths := key.paths(t.TempDir())
 	stream := readyCacheTestStream(paths)
-	stream.directWindows[0] = []ffmpeg.HLSFragment{{Name: "direct_000000_0000.m4s", Init: "init_000000.mp4"}}
 	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, settings: settings.NewSettings()}
 
-	_, pinned := manager.hlsCacheProtection()
-	for _, name := range []string{"direct_000000_0000.m4s", "init_000000.mp4"} {
-		if _, ok := pinned[filepath.Join(paths.outDir, name)]; !ok {
-			t.Fatalf("published asset %q is not protected", name)
-		}
+	active := manager.hlsCacheProtection()
+	if _, ok := active[key.dirName()]; !ok {
+		t.Fatalf("active presentation directory %q is not protected", paths.outDir)
 	}
 }
 
-func TestHlsCacheProtectionLeavesDistantHistoryAndForwardDataEvictable(t *testing.T) {
-	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
-	paths := key.paths(t.TempDir())
-	stream := readyCacheTestStream(paths)
-	stream.playbackWindow = 30
-	for _, owner := range []int{0, 15, 30, 45, 60} {
-		stream.directWindows[owner] = []ffmpeg.HLSFragment{{Name: fmt.Sprintf("direct_%06d_0000.m4s", owner)}}
-	}
-	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, settings: settings.NewSettings()}
-
-	_, pinned := manager.hlsCacheProtection()
-	for _, owner := range []int{15, 30, 45} {
-		name := fmt.Sprintf("direct_%06d_0000.m4s", owner)
-		if _, ok := pinned[filepath.Join(paths.outDir, name)]; !ok {
-			t.Fatalf("playback-neighbor asset %q is not protected", name)
-		}
-	}
-	for _, owner := range []int{0, 60} {
-		name := fmt.Sprintf("direct_%06d_0000.m4s", owner)
-		if _, ok := pinned[filepath.Join(paths.outDir, name)]; ok {
-			t.Fatalf("distant cache asset %q is protected from LRU eviction", name)
-		}
-	}
-}
-
-func TestHlsCachePressureEvictsDistantMaterializedHistory(t *testing.T) {
+func TestHlsCachePressurePreservesActivePresentation(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
@@ -254,25 +225,27 @@ func TestHlsCachePressureEvictsDistantMaterializedHistory(t *testing.T) {
 	}
 	manager.media.budget = newCacheBudget(manager.settings.MaxCacheBytes())
 
-	manager.enforceCacheLimit()
+	err = manager.media.enforce(root, manager.hlsCacheProtection)
+	if err == nil {
+		t.Fatal("cache enforcement unexpectedly fit active presentation under target")
+	}
 
-	oldest := filepath.Join(paths.outDir, "direct_000000_0000.m4s")
-	if _, err := os.Stat(oldest); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("distant history was not evicted: %v", err)
+	for _, owner := range owners {
+		path := filepath.Join(paths.outDir, fmt.Sprintf("direct_%06d_0000.m4s", owner))
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("active presentation asset %d was removed: %v", owner, err)
+		}
 	}
 	stream.mtx.Lock()
 	defer stream.mtx.Unlock()
-	if _, ok := stream.directWindows[0]; ok {
-		t.Fatal("evicted history is still advertised")
-	}
-	for _, owner := range []int{15, 30, 45} {
+	for _, owner := range owners {
 		if _, ok := stream.directWindows[owner]; !ok {
-			t.Fatalf("protected playback window %d was evicted", owner)
+			t.Fatalf("active presentation window %d was unpublished", owner)
 		}
 	}
 }
 
-func TestCacheSkipsLeasedActiveSegmentAndContinuesEviction(t *testing.T) {
+func TestCacheNeverEvictsActiveSegments(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "1")
@@ -303,15 +276,15 @@ func TestCacheSkipsLeasedActiveSegmentAndContinuesEviction(t *testing.T) {
 	if _, err := os.Stat(segment); err != nil {
 		t.Fatalf("leased active segment was evicted: %v", err)
 	}
-	if _, err := os.Stat(reclaimable); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("eviction stopped behind leased segment: %v", err)
+	if _, err := os.Stat(reclaimable); err != nil {
+		t.Fatalf("another active segment was evicted: %v", err)
 	}
 	if err := asset.Close(); err != nil {
 		t.Fatal(err)
 	}
 	m.enforceCacheLimit()
-	if _, err := os.Stat(segment); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("released segment was not evicted: %v", err)
+	if _, err := os.Stat(segment); err != nil {
+		t.Fatalf("released active segment was evicted: %v", err)
 	}
 }
 
@@ -387,7 +360,7 @@ func readyCacheTestStream(paths streamPaths) *streamInfo {
 	}
 }
 
-func TestActiveAssetEvictionRotatesImmutableGeneration(t *testing.T) {
+func TestActiveAssetEvictionNeverRotatesPresentationGeneration(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "1")
@@ -421,31 +394,20 @@ func TestActiveAssetEvictionRotatesImmutableGeneration(t *testing.T) {
 	}
 	m := &manager{active: map[streamKey]*streamInfo{key: stream}, media: &mediaCache{assets: assets}, settings: settings.NewSettings()}
 	m.media.budget = newCacheBudget(m.settings.MaxCacheBytes())
-	m.enforceCacheLimit()
+	err = m.media.enforce(root, m.hlsCacheProtection)
+	if err == nil {
+		t.Fatal("cache enforcement unexpectedly fit active presentation under target")
+	}
 	for _, segment := range segments {
-		if _, err := os.Stat(segment); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("segment was not evicted: %v", err)
+		if _, err := os.Stat(segment); err != nil {
+			t.Fatalf("active segment was removed: %v", err)
 		}
 	}
 	stream.mtx.Lock()
 	version := stream.assetVersion
 	stream.mtx.Unlock()
-	if version == "old" || version == "" {
-		t.Fatalf("asset version was not rotated: %q", version)
-	}
-	playlist, err := os.ReadFile(paths.videoPlaylist)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(playlist), "chunk_") {
-		t.Fatalf("rotated playlist still advertises evicted media:\n%s", playlist)
-	}
-	master, err := os.ReadFile(paths.masterPlaylist)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(master), "index.m3u8?v="+version) {
-		t.Fatalf("rotated master does not use version %q:\n%s", version, master)
+	if version != "old" {
+		t.Fatalf("asset version changed under active playback: %q", version)
 	}
 }
 
