@@ -377,24 +377,13 @@ test('reduces 8K forward duration to respect the client byte ceiling', async ({ 
   await expect.poll(() => page.evaluate(() => window.__hlsConfigs[0]?.maxMaxBufferLength)).toBeCloseTo(8.39, 1);
 });
 
-test('builds a larger startup reserve when fragment delivery is marginal', async ({ page }) => {
+test('starts from the first buffered fragment when later delivery is marginal', async ({ page }) => {
   await openMovie(page, { fragmentLoadMs: 1900 });
   await page.getByRole('button', { name: 'Select tracks' }).click();
 
-  await expect(page.locator('#warn-title')).toContainText('Building a 6s playback reserve');
   await expect.poll(() => page.evaluate(() => window.__hlsConfigs[0]?.maxBufferLength)).toBe(60);
-  await expect.poll(() => page.evaluate(() => window.__videoPlayCalls)).toBe(0);
-
-  await page.evaluate(() => {
-    const hls = window.__hlsInstances[0];
-    const media = hls.media;
-    Object.defineProperty(media, 'buffered', {
-      configurable: true,
-      value: { length: 1, start: () => media.currentTime, end: () => media.currentTime + 6 },
-    });
-    hls.emit(window.Hls.Events.FRAG_BUFFERED, { frag: { type: 'main' } });
-  });
   await expect.poll(() => page.evaluate(() => window.__videoPlayCalls)).toBe(1);
+  await expect(page.locator('#warn-title')).not.toContainText('Building');
 });
 
 test('detects frozen video frames even while the player clock can advance', async ({ page }) => {

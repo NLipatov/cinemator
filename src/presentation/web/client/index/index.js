@@ -1944,21 +1944,7 @@
         playback.hls.on(Hls.Events.FRAG_BUFFERED, (evt, data) => {
           if (!data?.frag || data.frag.type === 'main') {
             if (!markStreamActive()) return;
-            const ranges = mediaBufferedRanges(video);
-            const currentRange = ranges.find(range => range.start <= video.currentTime + 0.05 && range.end > video.currentTime);
-            const bufferedAhead = currentRange ? currentRange.end - video.currentTime : 0;
-            const startupReserve = deliverySamples > 0 && deliveryRatio + deliveryJitter >= 0.75
-              ? Math.min(targetBuffer, 3 * segmentSeconds)
-              : Math.min(targetBuffer, segmentSeconds);
-            if (bufferedAhead + 0.25 >= startupReserve) {
-              requestPlaybackStart();
-            } else {
-              showWarning(
-                `Building a ${Math.ceil(startupReserve)}s playback reserve`,
-                'Recent fragment delivery is marginal, so playback will start with enough data to avoid an immediate pause.',
-                `${bufferedAhead.toFixed(1)}s buffered`,
-              );
-            }
+            requestPlaybackStart();
           }
         });
         playback.hls.on(Hls.Events.ERROR, (evt, data) => {
