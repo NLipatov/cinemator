@@ -14,7 +14,13 @@ import (
 	"time"
 )
 
-const maxCapturedOutput = 1 << 20
+const (
+	maxCapturedOutput      = 1 << 20
+	processShutdownTimeout = 3 * time.Second
+	processReapTimeout     = time.Second
+)
+
+var errProcessReapTimeout = errors.New("owned process did not exit after forced termination")
 
 type captureBuffer struct {
 	bytes.Buffer
@@ -126,6 +132,13 @@ func runOwnedProcess(ctx context.Context, cmd *exec.Cmd) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
+	owned, err := attachOwnedProcess(cmd)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("attach owned process tree: %w", err)
+	}
+	defer owned.close()
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	select {
@@ -133,23 +146,28 @@ func runOwnedProcess(ctx context.Context, cmd *exec.Cmd) error {
 		// A successful leader may still have left descendants in our process
 		// group. The job pin is released only after the whole owned group has
 		// been fenced.
-		_ = signalOwnedProcess(cmd, true)
-		return err
+		return errors.Join(err, owned.signal(true))
 	case <-ctx.Done():
-		_ = signalOwnedProcess(cmd, false)
+		_ = owned.signal(false)
 	}
 
-	timer := time.NewTimer(3 * time.Second)
+	timer := time.NewTimer(processShutdownTimeout)
 	defer timer.Stop()
 	select {
 	case err := <-waited:
 		// The parent can exit before a descendant. Kill the still-owned process
 		// group before cache job pins and temporary files are released.
-		_ = signalOwnedProcess(cmd, true)
-		return err
+		return errors.Join(err, owned.signal(true))
 	case <-timer.C:
-		_ = signalOwnedProcess(cmd, true)
-		return <-waited
+		forceErr := owned.signal(true)
+		reapTimer := time.NewTimer(processReapTimeout)
+		defer reapTimer.Stop()
+		select {
+		case err := <-waited:
+			return errors.Join(err, forceErr)
+		case <-reapTimer.C:
+			return errors.Join(forceErr, errProcessReapTimeout)
+		}
 	}
 }
 

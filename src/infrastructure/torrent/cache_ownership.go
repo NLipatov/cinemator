@@ -58,9 +58,13 @@ func openCacheOwnerLock(rootPath string) (*os.File, error) {
 	}
 	defer root.Close()
 
+	lockPath := filepath.Join(rootPath, cacheOwnerLockName)
 	before, err := root.Lstat(cacheOwnerLockName)
-	if err == nil && (!before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Sys() != nil && fileLinkCount(before) != 1) {
-		return nil, fmt.Errorf("cache owner lock is not a private regular file: %s", filepath.Join(rootPath, cacheOwnerLockName))
+	if err == nil {
+		linkCount, linkCountOK := fileLinkCount(lockPath, before)
+		if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || !linkCountOK || linkCount != 1 {
+			return nil, fmt.Errorf("cache owner lock is not a private regular file: %s", lockPath)
+		}
 	}
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -71,7 +75,12 @@ func openCacheOwnerLock(rootPath string) (*os.File, error) {
 		return nil, err
 	}
 	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Sys() != nil && fileLinkCount(info) != 1 {
+	var linkCount uint64
+	var linkCountOK bool
+	if err == nil {
+		linkCount, linkCountOK = fileLinkCount(lockPath, info)
+	}
+	if err != nil || !info.Mode().IsRegular() || !linkCountOK || linkCount != 1 {
 		_ = file.Close()
 		return nil, errors.Join(err, errors.New("cache owner lock has unexpected identity"))
 	}

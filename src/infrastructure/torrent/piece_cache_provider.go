@@ -343,7 +343,10 @@ func (p *pieceCacheProvider) removeLocked(location string) error {
 		}
 		return err
 	}
-	path := p.filePath(location)
+	path, err := p.filePath(location)
+	if err != nil {
+		return err
+	}
 	if err := os.Remove(path); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			delete(p.retiring, location)
@@ -361,21 +364,35 @@ func (p *pieceCacheProvider) removeLocked(location string) error {
 }
 
 func (p *pieceCacheProvider) statFileLocked(location string) (os.FileInfo, error) {
-	info, err := os.Lstat(p.filePath(location))
+	filePath, err := p.filePath(location)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(filePath)
 	if err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("torrent piece is not a regular file: %s", location)
 	}
-	if info.Sys() != nil && fileLinkCount(info) != 1 {
+	links, verified := fileLinkCount(filePath, info)
+	if !verified || links != 1 {
 		return nil, fmt.Errorf("torrent piece has unexpected link count: %s", location)
 	}
 	return info, nil
 }
 
-func (p *pieceCacheProvider) filePath(location string) string {
-	return filepath.Join(p.root, filepath.FromSlash(location))
+func (p *pieceCacheProvider) filePath(location string) (string, error) {
+	clean, err := cleanPieceLocation(location)
+	if err != nil {
+		return "", err
+	}
+	joined := filepath.Join(p.root, filepath.FromSlash(clean))
+	relative, err := filepath.Rel(p.root, joined)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) || filepath.IsAbs(relative) {
+		return "", errors.New("bad torrent piece cache path")
+	}
+	return joined, nil
 }
 
 func (p *pieceCacheProvider) trimToCapacity() error {
@@ -637,11 +654,23 @@ type sequentialPieceChunks struct {
 func (r *sequentialPieceChunks) Close() error { return r.close() }
 
 func cleanPieceLocation(location string) (string, error) {
-	clean := strings.TrimPrefix(path.Clean("/"+location), "/")
+	if location == "" || path.IsAbs(location) || filepath.IsAbs(location) || filepath.VolumeName(location) != "" || hasWindowsVolumePrefix(location) || strings.ContainsRune(location, '\\') || strings.ContainsRune(location, 0) {
+		return "", errors.New("bad torrent piece cache path")
+	}
+	for _, segment := range strings.Split(location, "/") {
+		if segment == ".." {
+			return "", errors.New("bad torrent piece cache path")
+		}
+	}
+	clean := path.Clean(location)
 	if clean == "" || clean == "." {
 		return "", errors.New("bad torrent piece cache path")
 	}
 	return clean, nil
+}
+
+func hasWindowsVolumePrefix(location string) bool {
+	return len(location) >= 2 && ((location[0] >= 'A' && location[0] <= 'Z') || (location[0] >= 'a' && location[0] <= 'z')) && location[1] == ':'
 }
 
 func readerSize(reader io.Reader) (int64, bool) {

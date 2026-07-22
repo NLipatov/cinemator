@@ -274,7 +274,8 @@ func validateHlsAsset(path string, info os.FileInfo) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("HLS asset is not a regular file: %s", path)
 	}
-	if info.Sys() != nil && fileLinkCount(info) != 1 {
+	links, verified := fileLinkCount(path, info)
+	if !verified || links != 1 {
 		return fmt.Errorf("HLS asset has unexpected link count: %s", path)
 	}
 	return nil
@@ -396,8 +397,8 @@ func (f *leasedHlsFile) Close() error {
 	return f.err
 }
 
-func fileLinkCount(info os.FileInfo) uint64 {
-	return platformFileLinkCount(info)
+func fileLinkCount(path string, info os.FileInfo) (uint64, bool) {
+	return platformFileLinkCount(path, info)
 }
 
 var _ application.ReadSeekCloser = (*leasedHlsFile)(nil)

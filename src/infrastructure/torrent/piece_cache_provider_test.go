@@ -18,6 +18,45 @@ import (
 	"github.com/anacrolix/torrent/storage"
 )
 
+func TestPieceCacheRejectsLocationsOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	cache, err := filecache.NewCache(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := newPieceCacheProvider(cache, root, newCacheBudget(16), nil)
+	invalid := []string{
+		"",
+		".",
+		"/outside",
+		"../outside",
+		"completed/../outside",
+		`..\outside`,
+		`completed\piece`,
+		`C:\outside`,
+		"C:/outside",
+		"//server/share",
+	}
+	for _, location := range invalid {
+		t.Run(location, func(t *testing.T) {
+			if _, err := provider.NewInstance(location); err == nil {
+				t.Fatalf("NewInstance(%q) succeeded", location)
+			}
+			if _, err := provider.filePath(location); err == nil {
+				t.Fatalf("filePath(%q) succeeded", location)
+			}
+		})
+	}
+
+	instance, err := provider.NewInstance("completed//./piece")
+	if err != nil {
+		t.Fatalf("valid normalized location: %v", err)
+	}
+	if got := instance.(*pieceCacheInstance).location; got != "completed/piece" {
+		t.Fatalf("normalized location = %q", got)
+	}
+}
+
 func TestPieceCacheTrimDoesNotUnlinkOpenPiece(t *testing.T) {
 	root := t.TempDir()
 	cache, err := filecache.NewCache(root)

@@ -1434,10 +1434,8 @@ func channelClosed(ch <-chan struct{}) bool {
 
 func directFragmentsCoverTime(windows map[int][]ffmpeg.HLSFragment, target float64) bool {
 	for _, fragments := range windows {
-		for _, fragment := range fragments {
-			if target >= fragment.Start-0.25 && target < fragment.Start+fragment.Duration-0.001 {
-				return true
-			}
+		if fragmentsCoverTime(fragments, target) {
+			return true
 		}
 	}
 	return false

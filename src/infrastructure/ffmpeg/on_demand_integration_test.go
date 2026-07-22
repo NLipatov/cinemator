@@ -1,8 +1,12 @@
 package ffmpeg
 
 import (
+	"bytes"
 	"cinemator/domain"
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +15,79 @@ import (
 	"testing"
 	"time"
 )
+
+func TestGenerateEmptySubtitleSegmentDoesNotReadUntilTheNextCue(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+
+	dir := t.TempDir()
+	srt := filepath.Join(dir, "sparse.srt")
+	if err := os.WriteFile(srt, []byte("1\n00:00:18,000 --> 00:00:19,000\nlate cue\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(dir, "sparse.mkv")
+	runMediaCommand(t, "ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=96x54:rate=5:duration=20",
+		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=8000:duration=20",
+		"-i", srt,
+		"-map", "0:v:0", "-map", "1:a:0", "-map", "2:s:0",
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", "10", "-pix_fmt", "yuv420p",
+		"-c:a", "aac", "-c:s", "srt", source,
+	)
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newPrefixOnlyRangeServer(data, len(data)*3/4)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	output := filepath.Join(dir, "subs_000000.vtt")
+	if err := GenerateSubtitleSegment(ctx, server.URL, output, 0, 0, 2*time.Second); err != nil {
+		t.Fatalf("generate empty subtitle segment without reading to the 18s cue: %v", err)
+	}
+	contents, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(contents), "X-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0") || strings.Contains(string(contents), "late cue") {
+		t.Fatalf("unexpected empty WebVTT segment:\n%s", contents)
+	}
+}
+
+func newPrefixOnlyRangeServer(data []byte, prefixEnd int) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		start := 0
+		rangeHeader := request.Header.Get("Range")
+		if value := rangeHeader; strings.HasPrefix(value, "bytes=") {
+			rangeStart := strings.TrimSuffix(strings.TrimPrefix(value, "bytes="), "-")
+			if parsed, err := strconv.Atoi(rangeStart); err == nil {
+				start = parsed
+			}
+		}
+		if start >= len(data)-4*1024 {
+			http.ServeContent(response, request, "sparse.mkv", time.Time{}, bytes.NewReader(data))
+			return
+		}
+
+		response.Header().Set("Accept-Ranges", "bytes")
+		response.Header().Set("Content-Type", "video/x-matroska")
+		if rangeHeader != "" {
+			response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(data)-1, len(data)))
+			response.Header().Set("Content-Length", strconv.Itoa(len(data)-start))
+			response.WriteHeader(http.StatusPartialContent)
+		} else {
+			response.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		}
+		if start < prefixEnd {
+			_, _ = response.Write(data[start:prefixEnd])
+		}
+		<-request.Context().Done()
+	}))
+}
 
 func TestGenerateVideoWindowUsesAbsoluteTimelineAndMappedWebVTT(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {

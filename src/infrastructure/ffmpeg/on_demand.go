@@ -882,14 +882,52 @@ func GenerateSubtitleSegment(
 	segmentStartTime := time.Duration(segmentIndex) * segmentDuration
 	segmentStart := formatDuration(segmentStartTime)
 	segmentEnd := formatDuration(segmentStartTime + segmentDuration)
+	// A subtitle-only FFmpeg output has no media clock when this interval has no
+	// cue. It then reads forward until the next cue, which can request distant
+	// torrent pieces forever. Consume the exact video interval first so all
+	// container packets needed to decide this subtitle segment are local.
+	clockArgs := []string{
+		"-hide_banner", "-loglevel", "error", "-nostats",
+		"-fflags", "+genpts",
+		"-analyzeduration", "0",
+		"-probesize", "32768",
+		"-max_probe_packets", "1",
+		"-fpsprobesize", "0",
+	}
+	if segmentIndex > 0 {
+		clockArgs = append(clockArgs, "-ss", segmentStart)
+	}
+	clockArgs = append(clockArgs,
+		"-an", "-sn", "-dn",
+		"-i", inputURL,
+		"-t", formatDuration(segmentDuration),
+		"-map", "0:v:0",
+		"-c:v", "copy",
+		"-f", "null", "-",
+	)
+	if _, err := cli.RunWithStdin(ctx, nil, "ffmpeg", clockArgs...); err != nil {
+		return err
+	}
+
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostats",
 		"-y",
 		"-fflags", "+genpts",
+		"-analyzeduration", "0",
+		"-probesize", "32768",
+		"-max_probe_packets", "1",
+		"-fpsprobesize", "0",
 		// Input seeking keeps distant subtitle requests cheap. Preserve source
 		// timestamps so a cue repeated across adjacent WebVTT segments retains
 		// the same timing and hls.js can identify it as the same cue.
-		"-ss", segmentStart,
+	}
+	if segmentIndex > 0 {
+		args = append(args, "-ss", segmentStart)
+	}
+	if strings.HasPrefix(inputURL, "http://") || strings.HasPrefix(inputURL, "https://") {
+		args = append(args, "-rw_timeout", "250000")
+	}
+	args = append(args,
 		"-copyts",
 		"-i", inputURL,
 		"-to", segmentEnd,
@@ -897,9 +935,39 @@ func GenerateSubtitleSegment(
 		"-c:s", "webvtt",
 		"-f", "webvtt",
 		tmp,
+	)
+	runCtx, stop := context.WithCancel(ctx)
+	runDone := make(chan error, 1)
+	go func() {
+		_, err := cli.RunWithStdin(runCtx, nil, "ffmpeg", args...)
+		runDone <- err
+	}()
+
+	// FFmpeg can still look beyond the warmed interval for the next subtitle
+	// packet. Stop that look-ahead after the cached packets have had time to be
+	// decoded; a valid partial WebVTT is either the complete cue set for this
+	// interval or an intentionally empty segment.
+	const cachedIntervalScanGrace = 500 * time.Millisecond
+	timer := time.NewTimer(cachedIntervalScanGrace)
+	defer timer.Stop()
+	scanExpired := false
+	var runErr error
+	select {
+	case runErr = <-runDone:
+	case <-timer.C:
+		scanExpired = true
+		stop()
+		runErr = <-runDone
+	case <-ctx.Done():
+		stop()
+		return errors.Join(ctx.Err(), <-runDone)
 	}
-	if _, err := cli.RunWithStdin(ctx, nil, "ffmpeg", args...); err != nil {
-		return err
+	stop()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(ctxErr, runErr)
+	}
+	if runErr != nil && !(scanExpired && errors.Is(runErr, context.Canceled)) {
+		return runErr
 	}
 	if err := addWebVTTTimestampMap(tmp, segmentStartTime); err != nil {
 		return err

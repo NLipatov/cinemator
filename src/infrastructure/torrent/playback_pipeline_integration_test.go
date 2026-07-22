@@ -109,16 +109,28 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 		t.Fatal(err)
 	}
 	streamDir := filepath.Base(filepath.Dir(playlist))
-	initial := waitForPlaybackTarget(t, m, streamDir, 0, 30*time.Second)
+	initialStarted := time.Now()
+	initial := waitForPlaybackTarget(t, m, streamDir, 0, 5*time.Second)
 	if initial.Duration < 13.5 || initial.PresentationOriginSeconds != 0 {
 		t.Fatalf("initial HLS status = %+v", initial)
+	}
+	if elapsed := time.Since(initialStarted); elapsed > 3*time.Second {
+		t.Fatalf("initial playback with a cue-free subtitle segment took %v", elapsed)
 	}
 
 	videoPlaylist := readPlaybackAsset(t, m, streamDir, "index.m3u8", initial.Generation)
 	probePublishedFragment(t, m, streamDir, initial.Generation, videoPlaylist)
 	subtitles := readPlaybackAsset(t, m, streamDir, subtitleSegmentName(0), initial.Generation)
-	if !strings.Contains(subtitles, "hello from torrent") {
-		t.Fatalf("subtitle segment does not contain fixture cue:\n%s", subtitles)
+	if !strings.Contains(subtitles, "WEBVTT") || strings.Contains(subtitles, "hello from torrent") {
+		t.Fatalf("initial cue-free subtitle segment is invalid:\n%s", subtitles)
+	}
+
+	if _, err := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 4, false); err != nil {
+		t.Fatal(err)
+	}
+	withCue := waitForPlaybackTarget(t, m, streamDir, 4, 5*time.Second)
+	if got := readPlaybackAsset(t, m, streamDir, subtitleSegmentName(2), withCue.Generation); !strings.Contains(got, "hello from torrent") {
+		t.Fatalf("selected subtitle cue was not retained after the cue-free start:\n%s", got)
 	}
 
 	distantPlaylist, err := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 10, false)
@@ -136,7 +148,7 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 		t.Fatalf("distant subtitle segment does not contain fixture cue:\n%s", got)
 	}
 
-	started := time.Now()
+	retainedStarted := time.Now()
 	retainedPlaylist, err := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
@@ -145,7 +157,7 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 	if retainedPlaylist != playlist || retained.TargetSeconds != 0 {
 		t.Fatalf("retained seek changed presentation: playlist=%q status=%+v", retainedPlaylist, retained)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	if elapsed := time.Since(retainedStarted); elapsed > time.Second {
 		t.Fatalf("retained seek took %v, want cached readiness within 1s", elapsed)
 	}
 }
@@ -153,7 +165,7 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 func makePlaybackFixture(t *testing.T, dir string) string {
 	t.Helper()
 	srt := filepath.Join(dir, "fixture.srt")
-	if err := os.WriteFile(srt, []byte("1\n00:00:00,200 --> 00:00:01,800\nhello from torrent\n\n2\n00:00:10,100 --> 00:00:11,800\ndistant subtitle\n"), 0644); err != nil {
+	if err := os.WriteFile(srt, []byte("1\n00:00:04,200 --> 00:00:05,800\nhello from torrent\n\n2\n00:00:10,100 --> 00:00:11,800\ndistant subtitle\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	source := filepath.Join(dir, "movie.mkv")

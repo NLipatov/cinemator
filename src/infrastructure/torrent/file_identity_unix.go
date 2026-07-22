@@ -7,10 +7,10 @@ import (
 	"syscall"
 )
 
-func platformFileLinkCount(info os.FileInfo) uint64 {
+func platformFileLinkCount(_ string, info os.FileInfo) (uint64, bool) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 1
+		return 0, false
 	}
-	return uint64(stat.Nlink)
+	return uint64(stat.Nlink), true
 }
