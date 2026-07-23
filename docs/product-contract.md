@@ -2,7 +2,7 @@
 
 Status: current release contract and implementation audit
 
-Last audited: 2026-07-21
+Last audited: 2026-07-23
 
 ## Purpose and authority
 
@@ -70,7 +70,7 @@ selected-subtitle fidelity remain hard constraints around those outcomes.
 | `PLAY-03` | Playlist refresh, buffer underrun, cache pressure, decoder error, and background recovery must not replace the video element, hls.js instance, source duration, or playhead. An unrecoverable failure is visible instead. | **Gated.** Playwright covers delayed and failed fragments, cold-seek preparation, and stable-presentation reuse. |
 | `PLAY-04` | Known source duration is independent of the currently materialized HLS range and remains visible during loading and seeking. Unknown duration remains progressive and is never guessed from bitrate. | **Gated.** Playwright covers full duration and unknown-duration playback; Go timeline and probe tests cover clamping and duration refinement. |
 | `PLAY-05` | A committed seek has one exact source target. Only the newest committed target may affect presentation state; scrub intermediates and superseded asynchronous work are cancelled or ignored. | **Gated.** Playwright covers seek storms, repeated events, zero, 22 minutes, latest-target wins, and capacity retry cancellation; Go session tests cover job ownership. |
-| `PLAY-06` | A retained seek reuses browser or current-presentation media. A cached seek reuses complete server assets. A cold seek prepares only the missing target and bounded forward horizon. | **Gated** for retained/current-presentation behavior and **covered** by the local torrent/FFmpeg pipeline for server-cache reuse. There is no production cache-hit SLI yet. |
+| `PLAY-06` | A retained seek reuses browser or current-presentation media. A cached seek reuses complete server assets. A cold seek prepares the missing target, then rebuilds the bounded backward and forward byte horizon around the new playhead. | **Gated** for retained/current-presentation behavior and two-sided plan arithmetic, and **covered** by the local torrent/FFmpeg pipeline for server-cache reuse. There is no production cache-hit SLI yet. |
 | `PLAY-07` | Temporary capacity pressure is waitable and preserves the player and target. It must not become an immediate fatal error or an unbounded retry loop. A newer seek cancels the old retries. | **Gated.** Playwright covers `429`/`503` recovery and cancellation. |
 | `PLAY-08` | Autoplay rejection is visible user state and does not count as infinite startup. Measurement restarts from the confirming Play command. | **Gated.** Playwright covers autoplay rejection and QoE attempt restart. |
 | `PLAY-09` | If selected video produces an advancing media clock without decoded frames, the client detects it and uses an explicit compatibility fallback or reports a terminal error. | **Gated.** Playwright covers frozen and suppressed decoded frames. |
@@ -94,27 +94,28 @@ timeout, retry, or cache event is not a user command.
 
 | ID | Invariant | Status and evidence |
 | --- | --- | --- |
-| `HLS-01` | A playlist advertises only complete, readable assets. Publication uses temporary output and atomic final paths; partial bytes never appear under a final asset URL. | **Gated.** FFmpeg publication, asset-store, HTTP lease, and real pipeline tests. |
+| `HLS-01` | A playlist advertises only complete, readable assets. Publication uses temporary output and atomic final paths; partial bytes never appear under a final asset URL. Direct and hybrid readiness is released when the complete fragment covering the requested source time is published; it does not wait for the unrelated tail of the admitted window. | **Gated.** FFmpeg publication, asset-store, HTTP lease, incremental-readiness, and real pipeline tests. |
 | `HLS-02` | One source-time model owns segment lookup, duration clamping, canonical windows, and presentation origin. The browser uses the server-reported origin and does not derive a competing mapping. | **Gated.** Pure timeline tests and Playwright origin/mapped-seek tests. |
 | `HLS-03` | Forward extension of a legal active playlist keeps its generation stable. A target before the current media sequence rotates to a new generation rather than moving sequence numbers backwards. | **Gated.** Go publication tests cover stable forward extension and backward rotation; Playwright covers stable attachment and seek-to-zero behavior. |
-| `HLS-04` | Playlist changes append complete media at the tail and do not rewrite immutable published segment identities. Client media-playlist responses are not cached. | **Covered.** Playlist/publication and API tests cover current transitions. Complete HLS conformance, discontinuity, persisted retention, and restart recovery remain **target**. |
+| `HLS-04` | Playlist changes append complete media at the tail and do not rewrite immutable published segment identities. A retry with the same head never truncates the already published tail. An overlapping direct prefix may be materialized, but it cannot replace the active playlist until a continuous presentation covers the committed target. The advertised playlist is bounded independently from the larger materialized disk horizon. Removed assets receive reload grace. Client media-playlist responses are not cached. | **Covered.** Playlist/publication tests gate append-only same-head updates, retry-safe tail retention, target coverage, immutable identity, bounded horizon, reload grace, and API behavior. Complete HLS conformance, persisted retention, and process-restart recovery remain **target**. |
 | `HLS-05` | Nominal work units default to two seconds, while direct-copy fragments may follow longer source GOPs. The actual presentation origin and fragment durations, not nominal arithmetic, determine playback mapping. | **Gated** for configuration, direct fragment coverage, and server-origin use. |
 | `HLS-06` | Unknown-duration media uses a bounded progressive presentation and does not advertise a fabricated full VOD timeline. | **Gated.** Probe, playlist, and browser tests cover the progressive path. |
 
 The current default configuration is a two-second nominal segment, a
-15-segment canonical window, a 12 GiB shared cache, one transcode, four global
-queued jobs, three jobs per stream, and sixteen active streams. These are
-defaults, not invariants; the bounded behavior is the invariant.
+15-segment canonical window, a 12 GiB shared cache, one encoder, one lightweight
+packager, four global queued jobs, three jobs per stream, and sixteen active
+streams. These are defaults, not invariants; the bounded behavior is the
+invariant.
 
 ### Scheduling and work ownership
 
 | ID | Invariant | Status and evidence |
 | --- | --- | --- |
-| `WORK-01` | Global work, transcodes, per-stream jobs, and active streams have explicit bounds. Duplicate canonical demand joins existing work instead of multiplying it. | **Gated.** Settings, scheduler, session admission, and stream-registry tests. |
-| `WORK-02` | Initial playback, the active playhead, the latest committed seek, and required target subtitles are foreground work. Foreground demand preempts obsolete background prefetch or subtitles before capacity is rejected. | **Gated** at scheduler/session boundaries. Long real-source fairness is not yet an SLO gate. |
-| `WORK-03` | Disconnecting one waiter does not cancel already admitted useful generation. Explicit superseding user demand does retire obsolete work, and retired work cannot publish over the winner. | **Gated.** Go job-lifecycle and publication tests. |
-| `WORK-04` | Source waiting is distinguished from CPU packaging. A source-blocked process remains bounded and exposes its actual stage rather than looking ready or silently occupying unlimited work. | **Covered** by status classification and resource monitoring. The full controlled slow-source deadline scenario in the QoE target is not yet a CI gate. |
-| `WORK-05` | Forward prefetch is demand-paced and bounded by low, target, and high watermarks plus byte and cache admission. Background work yields to the active horizon. | **Gated** for plan arithmetic and browser buffer ceilings; 30-minute continuity under controlled throughput remains **target**. |
+| `WORK-01` | Global work, encoders, lightweight packagers, per-stream jobs, and active streams have explicit bounds. Duplicate canonical demand joins existing work instead of multiplying it. Cache enforcement copies the active registry before taking per-stream snapshots, while publication snapshots its cache budget before locking the stream, so those paths cannot deadlock each other. | **Gated.** Settings, scheduler, session admission, stream-registry, cache-pressure, and real-pipeline tests. |
+| `WORK-02` | Initial playback, the active playhead, the latest committed seek, and required target subtitles are foreground work. Foreground admission preempts obsolete background work before capacity is rejected. A required target subtitle is an admission barrier before later media packaging, while unrelated encoder and packager lanes remain independent. | **Gated** at scheduler/session boundaries and by selected-subtitle and worker-lane independence tests. Long real-source fairness is not yet an SLO gate. |
+| `WORK-03` | Disconnecting one waiter does not cancel already admitted useful generation. Incremental readiness does not transfer continuation ownership or advance the playhead underneath the running job. Explicit superseding user demand does retire obsolete work, and retired work cannot publish over the winner. | **Gated.** Go job-lifecycle, incremental-readiness, real-pipeline, and publication tests. |
+| `WORK-04` | Source waiting is distinguished from media packaging. Once a requested byte range is known to contain missing pieces and neither source nor output advances, the live process is cancelled, its worker admission is released, and the job waits for that range outside the worker pool. A retry resumes from the first unpublished nominal segment and preserves the complete published prefix. | **Covered** by status classification, resource monitoring, retry-resume, monotonic-publication, and scheduler lane tests. The full controlled slow-source scenario in the QoE target is not yet a CI gate. |
+| `WORK-05` | Prefetch is demand-paced. Adaptive duration watermarks determine the urgent forward reserve; the actual materialized stopping point is a fair per-stream byte share divided equally behind and ahead of the playhead. Background work fills the backward half nearest-first, then the remaining forward half, and yields to foreground demand. | **Gated** for two-sided plan arithmetic and browser buffer ceilings; 30-minute continuity under controlled throughput remains **target**. |
 
 ### Cache, disk, and lifecycle
 
@@ -123,7 +124,7 @@ defaults, not invariants; the bounded behavior is the invariant.
 | `CACHE-01` | Verified torrent pieces and generated HLS assets spend one logical cache budget. Physical free-byte and inode floors are reserved atomically before generation. | **Gated.** Settings, shared-budget, disk-reservation, and cache-cleaner tests. |
 | `CACHE-02` | A managed HLS asset or piece is not unlinked while a reader, writer, publication, or active presentation owns it. An HTTP response holds its lease through response completion. | **Gated.** Asset-store, piece-cache, slow/open response, and cache-pressure tests. |
 | `CACHE-03` | Immediately playable HLS history has eviction priority over reproducible torrent pieces. Piece eviction invalidates torrent completion state so a later read downloads and verifies it again. | **Gated.** Shared-cache and piece-eviction integration tests. |
-| `CACHE-04` | Cache pressure never rotates or mutates an active presentation. If protected bytes consume capacity, new work fails visibly instead. | **Gated.** Active-presentation pressure and generation-stability tests. |
+| `CACHE-04` | Cache pressure never rotates, mutates, or blocks progress of an active presentation. Current presentation assets, active jobs, and reload-grace assets are protected; expired materialized assets, including orphans inside an active stream directory, are reclaimable without generation rotation. If protected bytes consume capacity, new work fails visibly instead. | **Gated.** Active-presentation pressure, orphan reclamation, reload-grace, generation-stability, and real-pipeline tests. |
 | `CACHE-05` | One process owns a cache root. Overlapping or symlinked roots and a second owner are rejected; shutdown waits for managed ownership to end within its deadline. | **Gated.** Ownership, child-fence, manager lifecycle, and registry shutdown tests. |
 | `CACHE-06` | Persisted protocol-retention deadlines, crash-consistent manifest transactions, quarantine accounting, and recovery of immutable VOD across process restart. | **Target.** These requirements are specified in `cache-asset-lifecycle.md` but are not current product guarantees. |
 

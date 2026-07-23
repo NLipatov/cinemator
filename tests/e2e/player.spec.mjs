@@ -311,8 +311,16 @@ async function openMovie(page, {
     }
     if (url.pathname.startsWith('/api/hls/status/')) {
       const targetSeconds = Number(url.searchParams.get('target'));
+      const stream = decodeURIComponent(url.pathname.slice('/api/hls/status/'.length));
       const generation = stableStream ? 'generation-stable' : `generation-${presentationGeneration}`;
-      const customStatus = getHlsStatus?.(targetSeconds);
+      const customStatus = await getHlsStatus?.(targetSeconds, { stream, generation });
+      if (customStatus?.httpStatus) {
+        await route.fulfill({
+          status: customStatus.httpStatus,
+          body: customStatus.body || `Status request failed (${customStatus.httpStatus})`,
+        });
+        return;
+      }
       await route.fulfill({
         json: customStatus ? { generation, ...customStatus } : {
           phase: 'ready',
@@ -384,6 +392,103 @@ test('starts from the first buffered fragment when later delivery is marginal', 
   await expect.poll(() => page.evaluate(() => window.__hlsConfigs[0]?.maxBufferLength)).toBe(60);
   await expect.poll(() => page.evaluate(() => window.__videoPlayCalls)).toBe(1);
   await expect(page.locator('#warn-title')).not.toContainText('Building');
+});
+
+test('keeps startup and the source timeline active across a nonfatal playlist reload error', async ({ page }) => {
+  await openMovie(page, { bufferInitialFragment: false, suppressVideoFrames: true });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsStartLoads.length)).toBe(1);
+
+  await page.locator('video').evaluate(video => {
+    const hls = window.__hlsInstances[0];
+    hls.emit(window.Hls.Events.ERROR, {
+      fatal: false,
+      details: 'levelParsingError',
+    });
+    Object.defineProperty(video, 'buffered', {
+      configurable: true,
+      value: { length: 1, start: () => 0.1, end: () => 2 },
+    });
+    hls.emit(window.Hls.Events.FRAG_BUFFERED, { frag: { type: 'main' } });
+  });
+
+  await expect.poll(() => page.evaluate(() => window.__videoPlayCalls)).toBe(1);
+  await expect.poll(() => page.locator('video').evaluate(video => video.duration)).toBe(duration);
+  await expect(page.locator('#playerMsg')).not.toContainText('Playback error');
+});
+
+test('reprepares a missing HLS session once and stops polling stale descriptors', async ({ page }) => {
+  const statusRequests = new Map();
+  const prepareStarts = await openMovie(page, {
+    bufferInitialFragment: false,
+    suppressVideoFrames: true,
+    getHlsStatus: (targetSeconds, { stream }) => {
+      const requests = (statusRequests.get(stream) || 0) + 1;
+      statusRequests.set(stream, requests);
+      if (requests > 1) {
+        return { httpStatus: 404, body: 'HLS stream not found' };
+      }
+      return {
+        phase: 'ready',
+        stage: 'ready',
+        targetSeconds,
+        presentationOriginSeconds: 0,
+      };
+    },
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+
+  await expect.poll(() => prepareStarts).toEqual([0, 0]);
+  await expect(page.locator('#playerMsg')).toContainText('Playback error: HLS stream not found');
+  await page.waitForTimeout(1500);
+  expect(prepareStarts).toEqual([0, 0]);
+  expect([...statusRequests.values()]).toEqual([2, 2]);
+});
+
+test('retries a temporary HLS status failure without rebuilding the stream', async ({ page }) => {
+  let statusRequests = 0;
+  const prepareStarts = await openMovie(page, {
+    getHlsStatus: targetSeconds => {
+      statusRequests++;
+      if (statusRequests === 1) {
+        return { httpStatus: 503, body: 'HLS is temporarily unavailable' };
+      }
+      return {
+        phase: 'ready',
+        stage: 'ready',
+        targetSeconds,
+        presentationOriginSeconds: 0,
+      };
+    },
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+  expect(prepareStarts).toEqual([0]);
+  expect(statusRequests).toBeGreaterThanOrEqual(2);
+  await expect(page.locator('#playerMsg')).not.toContainText('Playback error');
+});
+
+test('does not turn an attachment seek after a control click into a new presentation', async ({ page }) => {
+  const prepareStarts = await openMovie(page, {
+    bufferInitialFragment: false,
+    suppressVideoFrames: true,
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.dispatchEvent(new Event('play'));
+    video.currentTime = 0.1;
+    video.dispatchEvent(new Event('seeking'));
+    video.dispatchEvent(new PointerEvent('pointerup'));
+  });
+
+  await page.waitForTimeout(500);
+  expect(prepareStarts).toEqual([0]);
+  expect(await page.evaluate(() => window.__hlsStopLoads)).toBe(0);
+  await expect(page.locator('#playerMsg')).not.toContainText('Restoring stream');
 });
 
 test('detects frozen video frames even while the player clock can advance', async ({ page }) => {

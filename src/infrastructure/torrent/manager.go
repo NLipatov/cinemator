@@ -167,7 +167,7 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 		watcherStop: make(chan struct{}),
 		watcherDone: make(chan struct{}),
 		events:      newDownloadEventBroadcaster(),
-		scheduler:   newSegmentScheduler(settings.MaxQueuedJobs(), settings.MaxTranscodes()),
+		scheduler:   newSegmentScheduler(settings.MaxQueuedJobs(), settings.MaxTranscodes(), settings.MaxPackagers()),
 		demand:      newPieceDemand(),
 		settings:    settings,
 	}
@@ -422,21 +422,18 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 				StartedAt:     now,
 				LastProgress:  now,
 			},
-			statusSegment:         -1,
-			progressiveAdvertised: startIndex,
-			progressiveDemand:     startIndex,
-			progressiveTarget:     30 * time.Second,
-			progressiveSubtitles:  startIndex,
-			playbackWindow:        startIndex,
-			segmentErrors:         make(map[int]segmentFailure),
-			lastTorrentBytes: func() int64 {
-				stats := t.Stats()
-				return stats.BytesReadUsefulData.Int64()
-			}(),
-			videoJobs:     make(map[*segmentJob]struct{}),
-			subtitleJobs:  make(map[*segmentJob]struct{}),
-			directWindows: make(map[int][]ffmpeg.HLSFragment),
-			cleanupDone:   make(chan struct{}),
+			statusSegment:        -1,
+			materializedEnd:      startIndex,
+			playheadSegment:      startIndex,
+			urgentAhead:          30 * time.Second,
+			progressiveSubtitles: startIndex,
+			segmentErrors:        make(map[int]segmentFailure),
+			videoJobs:            make(map[*segmentJob]struct{}),
+			subtitleJobs:         make(map[*segmentJob]struct{}),
+			materializedWindows:  make(map[int][]ffmpeg.HLSFragment),
+			materializedBytes:    make(map[int]int64),
+			retainedAssets:       make(map[string]time.Time),
+			cleanupDone:          make(chan struct{}),
 		}
 
 		// Keep stream publication atomic with the cache cleaner's active-stream
@@ -482,6 +479,8 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 			m.requestVideoTarget(s, target)
 			return paths.masterPlaylist, nil
 		}
+		m.rebalancePlaybackCacheWindows()
+		m.enforceCacheLimit()
 		go m.initializeOnDemandStream(key, s)
 		m.notifyDownloadsChanged()
 		log.Printf("Stream registered: key=%v, playlist=%s", key, paths.masterPlaylist)

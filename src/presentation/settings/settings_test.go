@@ -17,6 +17,7 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	t.Setenv("CINEMATOR_HLS_SEGMENT_SECONDS", "12")
 	t.Setenv("CINEMATOR_HLS_WINDOW_SEGMENTS", "7")
 	t.Setenv("CINEMATOR_MAX_TRANSCODES", "3")
+	t.Setenv("CINEMATOR_MAX_PACKAGERS", "2")
 	t.Setenv("CINEMATOR_MAX_QUEUED_JOBS", "12")
 	t.Setenv("CINEMATOR_MAX_JOBS_PER_STREAM", "5")
 	t.Setenv("CINEMATOR_MAX_ACTIVE_STREAMS", "9")
@@ -53,6 +54,9 @@ func TestNewSettingsReadsEnvironmentOverrides(t *testing.T) {
 	}
 	if settings.MaxTranscodes() != 3 {
 		t.Fatalf("MaxTranscodes() = %d", settings.MaxTranscodes())
+	}
+	if settings.MaxPackagers() != 2 {
+		t.Fatalf("MaxPackagers() = %d", settings.MaxPackagers())
 	}
 	if settings.MaxQueuedJobs() != 12 || settings.MaxJobsPerStream() != 5 || settings.MaxActiveStreams() != 9 {
 		t.Fatalf("job limits = queued %d per-stream %d streams %d", settings.MaxQueuedJobs(), settings.MaxJobsPerStream(), settings.MaxActiveStreams())
@@ -92,6 +96,7 @@ func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	t.Setenv("CINEMATOR_HLS_SEGMENT_SECONDS", "bad")
 	t.Setenv("CINEMATOR_HLS_WINDOW_SEGMENTS", "bad")
 	t.Setenv("CINEMATOR_MAX_TRANSCODES", "bad")
+	t.Setenv("CINEMATOR_MAX_PACKAGERS", "bad")
 	t.Setenv("CINEMATOR_MAX_QUEUED_JOBS", "bad")
 	t.Setenv("CINEMATOR_MAX_JOBS_PER_STREAM", "bad")
 	t.Setenv("CINEMATOR_MAX_ACTIVE_STREAMS", "bad")
@@ -120,6 +125,9 @@ func TestNewSettingsFallsBackForBadNumericEnvironment(t *testing.T) {
 	}
 	if settings.MaxTranscodes() != defaultMaxTranscodes {
 		t.Fatalf("MaxTranscodes() = %d, want %d", settings.MaxTranscodes(), defaultMaxTranscodes)
+	}
+	if settings.MaxPackagers() != defaultMaxPackagers {
+		t.Fatalf("MaxPackagers() = %d, want %d", settings.MaxPackagers(), defaultMaxPackagers)
 	}
 	if settings.MaxQueuedJobs() != defaultMaxQueuedJobs || settings.MaxJobsPerStream() != defaultMaxJobsPerStream || settings.MaxActiveStreams() != defaultMaxActiveStreams {
 		t.Fatalf("bad numeric job limits did not fall back")

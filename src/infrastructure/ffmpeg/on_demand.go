@@ -173,6 +173,17 @@ type HLSFragment struct {
 	Discontinuity bool
 }
 
+// HLSDiscontinuityBetween reports whether current starts a new continuity
+// region after previous. Playlist publication and playlist-window advancement
+// must use the same rule or a fragment retained across two playlist reloads
+// can receive a different continuity counter.
+func HLSDiscontinuityBetween(previous, current HLSFragment) bool {
+	previousEnd := previous.Start + previous.Duration
+	return current.Discontinuity ||
+		current.Start > previousEnd+0.25 ||
+		current.Init != "" && previous.Init != "" && current.Init != previous.Init
+}
+
 type DirectWindowResult struct {
 	Fragments  []HLSFragment
 	ReachedEnd bool
@@ -276,9 +287,10 @@ func buildMaterializedPlaylist(
 		b.WriteString(fmt.Sprintf("#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", offset))
 	}
 	currentInit := ""
-	previousEnd := math.Inf(-1)
+	var previous HLSFragment
+	hasPrevious := false
 	for _, fragment := range prepared {
-		if !math.IsInf(previousEnd, -1) && (fragment.Discontinuity || fragment.Start > previousEnd+0.25 || fragment.Init != "" && currentInit != "" && fragment.Init != currentInit) {
+		if hasPrevious && HLSDiscontinuityBetween(previous, fragment) {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
 		}
 		if fragment.Init != "" && fragment.Init != currentInit {
@@ -287,7 +299,8 @@ func buildMaterializedPlaylist(
 		}
 		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", fragment.Duration))
 		b.WriteString(versionedAsset(fragment.Name, assetVersion) + "\n")
-		previousEnd = fragment.Start + fragment.Duration
+		previous = fragment
+		hasPrevious = true
 	}
 	if ended {
 		b.WriteString("#EXT-X-ENDLIST\n")
@@ -312,17 +325,17 @@ func GenerateDirectWindow(
 	inputURL, outDir string,
 	info domain.MediaInfo,
 	selection StreamSelection,
-	firstSegment, segmentCount int,
+	sourceSegment, assetOwner, segmentCount int,
 	segmentDuration, prerollBudget time.Duration,
 	onPublished func(HLSFragment) error,
 ) (DirectWindowResult, error) {
 	if !CanRemuxHLS(info, selection) {
 		return DirectWindowResult{}, ErrRemuxNeedsTranscode
 	}
-	if firstSegment < 0 || segmentCount <= 0 || segmentDuration <= 0 || prerollBudget < 0 {
+	if sourceSegment < 0 || assetOwner < 0 || segmentCount <= 0 || segmentDuration <= 0 || prerollBudget < 0 {
 		return DirectWindowResult{}, fmt.Errorf("invalid direct HLS window")
 	}
-	start := time.Duration(firstSegment) * segmentDuration
+	start := time.Duration(sourceSegment) * segmentDuration
 	wantedEnd := start + time.Duration(segmentCount)*segmentDuration
 	if info.Duration > 0 {
 		if remaining := time.Duration(info.Duration*float64(time.Second)) - start; remaining <= 0 {
@@ -391,7 +404,7 @@ func GenerateDirectWindow(
 			monitorCtx,
 			workDir,
 			outDir,
-			firstSegment,
+			assetOwner,
 			start.Seconds(),
 			wantedEnd.Seconds(),
 			prerollBudget,
@@ -485,7 +498,7 @@ func GenerateDirectWindow(
 	}
 	initName := ""
 	if fmp4 {
-		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, firstSegment)
+		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, assetOwner)
 		if len(result.Fragments) == 0 {
 			if err := publishFileWithoutReplacement(filepath.Join(workDir, "init.mp4"), filepath.Join(outDir, initName)); err != nil {
 				return DirectWindowResult{}, fmt.Errorf("publish direct HLS init segment: %w", err)
@@ -499,7 +512,7 @@ func GenerateDirectWindow(
 			cursor += duration
 			continue
 		}
-		name := fmt.Sprintf("%s%0*d_%04d%s", directSegmentPrefix, segmentNumberWidth, firstSegment, index, segmentExtension)
+		name := fmt.Sprintf("%s%0*d_%04d%s", directSegmentPrefix, segmentNumberWidth, assetOwner, index, segmentExtension)
 		if err := publishFileWithoutReplacement(filepath.Join(workDir, fmt.Sprintf("part_%06d%s", index, segmentExtension)), filepath.Join(outDir, name)); err != nil {
 			return DirectWindowResult{}, fmt.Errorf("publish direct HLS segment: %w", err)
 		}
@@ -523,7 +536,7 @@ func GenerateDirectWindow(
 func publishDirectCoverage(
 	ctx context.Context,
 	workDir, outDir string,
-	firstSegment int,
+	assetOwner int,
 	start, wantedEnd float64,
 	prerollBudget time.Duration,
 	fmp4 bool,
@@ -536,7 +549,7 @@ func publishDirectCoverage(
 	initName := ""
 	if fmp4 {
 		segmentExtension = ".m4s"
-		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, firstSegment)
+		initName = fmt.Sprintf("init_%0*d.mp4", segmentNumberWidth, assetOwner)
 	}
 	cursor := 0.0
 	for {
@@ -575,7 +588,7 @@ func publishDirectCoverage(
 					outcome.err = err
 					return outcome
 				}
-				name := fmt.Sprintf("%s%0*d_%04d%s", directSegmentPrefix, segmentNumberWidth, firstSegment, index, segmentExtension)
+				name := fmt.Sprintf("%s%0*d_%04d%s", directSegmentPrefix, segmentNumberWidth, assetOwner, index, segmentExtension)
 				if err := publishFileWithoutReplacement(source, filepath.Join(outDir, name)); err != nil {
 					outcome.err = fmt.Errorf("publish direct HLS segment: %w", err)
 					return outcome
@@ -917,9 +930,6 @@ func GenerateSubtitleSegment(
 		"-probesize", "32768",
 		"-max_probe_packets", "1",
 		"-fpsprobesize", "0",
-		// Input seeking keeps distant subtitle requests cheap. Preserve source
-		// timestamps so a cue repeated across adjacent WebVTT segments retains
-		// the same timing and hls.js can identify it as the same cue.
 	}
 	if segmentIndex > 0 {
 		args = append(args, "-ss", segmentStart)
@@ -928,6 +938,8 @@ func GenerateSubtitleSegment(
 		args = append(args, "-rw_timeout", "250000")
 	}
 	args = append(args,
+		// Preserve source timestamps so a cue repeated across adjacent WebVTT
+		// segments retains identical timing for hls.js deduplication.
 		"-copyts",
 		"-i", inputURL,
 		"-to", segmentEnd,

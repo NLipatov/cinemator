@@ -280,10 +280,11 @@ playlist. It omits `EXT-X-PLAYLIST-TYPE` so that legal head removal is possible.
   reordered;
 - old entries are removed only from the head;
 - generation is demand-paced and bounded: fetching an init file alone MUST NOT
-  advance the tail; after a managed client requests media, the server MAY admit
-  canonical intervals needed to restore the low and target watermarks, but
-  sequential prefetch MUST NOT exceed the high watermark defined by
-  [`playback-qoe.md`](playback-qoe.md);
+  advance the tail; after a managed client requests media, the server restores
+  the adaptive urgent forward reserve, then fills equal backward and forward
+  byte shares around the committed playhead as described by
+  [`playback-qoe.md`](playback-qoe.md); duration watermarks control priority,
+  while byte admission controls the materialized stopping point;
 - the managed client continues already buffered media when the LIVE window
   advances and MUST NOT chase the HLS live edge;
 - the initial version MAY contain one complete fragment for a client that can
@@ -301,6 +302,8 @@ playlist. It omits `EXT-X-PLAYLIST-TYPE` so that legal head removal is possible.
 - publication begins with a staged forward reserve and an admitted generation
   cadence capable of producing the next legal playlist version;
 - removed assets remain available through the retention deadline defined below;
+- the advertised playlist remains short and independently bounded even when a
+  larger two-sided materialized disk horizon is retained for seeks;
 - updates are published atomically;
 - `EXT-X-ENDLIST` is added only when no more segments will be appended to that
   presentation generation, whether because of source EOF or bounded
@@ -359,6 +362,13 @@ uncertain.
 Direct segment groups begin and end at validated safe access points. GOPs MAY be
 grouped to approach the configured target duration, but a GOP MUST NOT be
 cropped or duplicated across adjacent segment identities.
+
+The source read boundary and the materialized-window identity are distinct.
+An adjacent direct job MAY read from the preceding nominal segment to obtain
+decode preroll, but that read MUST NOT reuse the preceding job's asset
+namespace or republish its head fragment. Media first emitted by a new
+packager job begins a new discontinuity region after overlapping preroll has
+been removed.
 
 For a seek between access points, the initial segment includes the required
 preceding decode preroll. The presentation mapping identifies the requested
@@ -628,9 +638,11 @@ When a text subtitle track is selected, the cue segment covering the requested
 source position is a required presentation asset. The target MUST NOT become
 `ready` and the client MUST NOT attach its HLS presentation until both the video
 fragment and that subtitle segment are complete. Required subtitle extraction
-runs after the target video fragment and before speculative video or subtitle
-prefetch. Capacity pressure waits and retries this work; it MUST NOT silently
-drop the selected track or attach video-only playback.
+runs after the target video fragment and receives foreground admission. Its
+potentially slow source read does not serialize or cancel useful video-cache
+materialization. Capacity pressure waits and retries the required subtitle
+work; it MUST NOT silently drop the selected track or attach video-only
+playback.
 
 The managed player uses an application-owned full-duration timeline and seek
 control. Browser media time is presentation-local and MUST be translated through
@@ -643,7 +655,7 @@ On initial play and a seek outside currently readable media, the client MUST:
 1. pause or stop hls.js loading;
 2. preserve the requested playback position;
 3. display preparation state and progress;
-4. prepare the target and a bounded forward horizon;
+4. prepare the target and rebuild the bounded two-sided byte horizon around it;
 5. preserve the existing hls.js instance and `MediaSource` when the server
    keeps the presentation generation stable;
 6. only when the server returns a different generation, destroy the old hls.js

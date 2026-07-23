@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"cinemator/infrastructure/ffmpeg"
 )
 
 type hlsCacheItem struct {
@@ -53,7 +55,7 @@ func (m *manager) reserveHlsGeneration(duration time.Duration, bitrate int64) (f
 	)
 }
 
-type hlsCacheProtection func() map[string]struct{}
+type hlsCacheProtection func() (active map[string]struct{}, pinned map[string]struct{})
 
 func (c *mediaCache) enforce(root string, protection hlsCacheProtection) error {
 	if c.budget == nil || c.budget.limit <= 0 {
@@ -202,7 +204,7 @@ func estimatedHlsWindowInodes(duration, segmentDuration time.Duration) uint64 {
 }
 
 func (c *mediaCache) trimHlsCache(target int64, root string, protection hlsCacheProtection) (int64, error) {
-	active := protection()
+	active, pinned := protection()
 	var total int64
 	var candidates []hlsCacheItem
 	walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
@@ -227,13 +229,18 @@ func (c *mediaCache) trimHlsCache(target int64, root string, protection hlsCache
 		}
 		size := allocatedFileSize(info)
 		total += size
+		if _, protected := pinned[path]; protected {
+			return nil
+		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			return nil
 		}
 		dir := strings.SplitN(filepath.ToSlash(rel), "/", 2)[0]
 		if _, isActive := active[dir]; isActive {
-			return nil
+			if isHlsGenerationTemporary(rel) || !isGeneratedHlsAsset(filepath.Base(path)) {
+				return nil
+			}
 		}
 		candidates = append(candidates, hlsCacheItem{path: path, size: size, last: info.ModTime()})
 		return nil
@@ -342,12 +349,76 @@ func (c *mediaCache) checkHlsLimit(root string) error {
 	return nil
 }
 
-func (m *manager) hlsCacheProtection() map[string]struct{} {
-	active := make(map[string]struct{})
+func isHlsGenerationTemporary(rel string) bool {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	return len(parts) > 1 && (strings.HasPrefix(parts[1], ".generating-") || strings.HasPrefix(parts[1], ".remuxing-"))
+}
+
+func isGeneratedHlsAsset(name string) bool {
+	return strings.HasSuffix(name, ".ts") ||
+		strings.HasSuffix(name, ".m4s") ||
+		strings.HasSuffix(name, ".mp4") ||
+		strings.HasSuffix(name, ".vtt") ||
+		strings.HasSuffix(name, ".tmp") ||
+		(strings.HasPrefix(name, "window_") && strings.HasSuffix(name, ".m3u8"))
+}
+
+func (m *manager) hlsCacheProtection() (active map[string]struct{}, pinned map[string]struct{}) {
+	active = make(map[string]struct{})
+	pinned = make(map[string]struct{})
+	now := time.Now()
+
+	// Never hold the registry lock while taking a stream lock. Publication
+	// snapshots the shared cache budget before locking its stream; keeping the
+	// inverse order here would deadlock cache trimming against publication.
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for key := range m.active {
-		active[key.dirName()] = struct{}{}
+	streams := make(map[streamKey]*streamInfo, len(m.active))
+	for key, stream := range m.active {
+		streams[key] = stream
 	}
-	return active
+	m.mu.Unlock()
+
+	for key, stream := range streams {
+		active[key.dirName()] = struct{}{}
+		snapshot := stream.cacheSnapshot(now)
+		for _, path := range []string{snapshot.paths.masterPlaylist, snapshot.paths.videoPlaylist, snapshot.paths.subtitlePlaylist} {
+			pinned[path] = struct{}{}
+			pinned[path+".tmp"] = struct{}{}
+		}
+		pinFragments := func(fragments []ffmpeg.HLSFragment) {
+			for name := range fragmentAssets(fragments) {
+				pinned[filepath.Join(snapshot.paths.outDir, name)] = struct{}{}
+			}
+		}
+		for _, fragments := range snapshot.materializedWindows {
+			pinFragments(fragments)
+		}
+		pinFragments(snapshot.publishedFragments)
+		for name := range snapshot.retainedAssets {
+			pinned[filepath.Join(snapshot.paths.outDir, name)] = struct{}{}
+		}
+		for _, job := range snapshot.videoJobs {
+			pinSegmentJob(pinned, snapshot.paths.outDir, job, videoSegmentName)
+		}
+		for _, job := range snapshot.subtitleJobs {
+			pinSegmentJob(pinned, snapshot.paths.outDir, job, subtitleSegmentName)
+		}
+		window := max(3, m.settings.HlsWindowSegments())
+		first := max(0, snapshot.progressiveSubtitles-window)
+		for index := first; index < snapshot.progressiveSubtitles; index++ {
+			pinned[filepath.Join(snapshot.paths.outDir, subtitleSegmentName(index))] = struct{}{}
+		}
+	}
+	return active, pinned
+}
+
+func pinSegmentJob(pinned map[string]struct{}, outDir string, job segmentJobCacheSnapshot, name func(int) string) {
+	for index := job.begin; index < job.end; index++ {
+		path := filepath.Join(outDir, name(index))
+		pinned[path] = struct{}{}
+		pinned[path+".tmp"] = struct{}{}
+	}
+	for _, asset := range job.publishedAssets {
+		pinned[filepath.Join(outDir, asset)] = struct{}{}
+	}
 }

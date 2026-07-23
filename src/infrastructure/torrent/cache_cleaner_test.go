@@ -63,7 +63,7 @@ func TestSharedCachePreservesHlsBeforeTorrentPieces(t *testing.T) {
 	}
 }
 
-func TestEnforceCacheLimitPreservesEveryActivePresentationFile(t *testing.T) {
+func TestEnforceCacheLimitEvictsOnlyOrphansFromActivePresentation(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "400")
@@ -95,8 +95,11 @@ func TestEnforceCacheLimitPreservesEveryActivePresentationFile(t *testing.T) {
 		}
 	}
 
+	stream := readyCacheTestStream(paths)
+	stream.materializedWindows[0] = []ffmpeg.HLSFragment{{Start: 0, Duration: 2, Name: "chunk_000000.ts"}}
+	stream.publishedFragments = append([]ffmpeg.HLSFragment(nil), stream.materializedWindows[0]...)
 	m := &manager{
-		active:   map[streamKey]*streamInfo{key: readyCacheTestStream(paths)},
+		active:   map[streamKey]*streamInfo{key: stream},
 		settings: settings.NewSettings(),
 	}
 	assets, _ := newHlsAssetStore(root)
@@ -106,10 +109,13 @@ func TestEnforceCacheLimitPreservesEveryActivePresentationFile(t *testing.T) {
 		t.Fatal("cache enforcement unexpectedly fit active presentation under target")
 	}
 
-	for _, path := range files {
+	for _, path := range []string{files[0], files[1], files[2], files[4], files[5]} {
 		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("active presentation file %s was removed: %v", path, err)
+			t.Fatalf("protected active presentation file %s was removed: %v", path, err)
 		}
+	}
+	if _, err := os.Stat(files[3]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned active asset was not evicted: %v", err)
 	}
 }
 
@@ -164,7 +170,7 @@ func TestHlsCacheProtectionIncludesActivePresentationDirectory(t *testing.T) {
 	stream := readyCacheTestStream(paths)
 	manager := &manager{active: map[streamKey]*streamInfo{key: stream}, settings: settings.NewSettings()}
 
-	active := manager.hlsCacheProtection()
+	active, _ := manager.hlsCacheProtection()
 	if _, ok := active[key.dirName()]; !ok {
 		t.Fatalf("active presentation directory %q is not protected", paths.outDir)
 	}
@@ -180,7 +186,6 @@ func TestHlsCachePressurePreservesActivePresentation(t *testing.T) {
 	}
 	stream := readyCacheTestStream(paths)
 	stream.directPlay = true
-	stream.playbackWindow = 30
 	stream.mediaInfo = domain.MediaInfo{Duration: 120, VideoCodec: "h264"}
 	stream.videoJobs = map[*segmentJob]struct{}{
 		{begin: 60, end: 75, done: make(chan struct{})}: {},
@@ -207,7 +212,7 @@ func TestHlsCachePressurePreservesActivePresentation(t *testing.T) {
 		if index == 0 {
 			oldestSize = size
 		}
-		stream.directWindows[owner] = []ffmpeg.HLSFragment{{
+		stream.materializedWindows[owner] = []ffmpeg.HLSFragment{{
 			Start:    float64(owner * 2),
 			Duration: 30,
 			Name:     name,
@@ -239,13 +244,13 @@ func TestHlsCachePressurePreservesActivePresentation(t *testing.T) {
 	stream.mtx.Lock()
 	defer stream.mtx.Unlock()
 	for _, owner := range owners {
-		if _, ok := stream.directWindows[owner]; !ok {
+		if _, ok := stream.materializedWindows[owner]; !ok {
 			t.Fatalf("active presentation window %d was unpublished", owner)
 		}
 	}
 }
 
-func TestCacheNeverEvictsActiveSegments(t *testing.T) {
+func TestCachePreservesPublishedAndLeasedActiveSegments(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CINEMATOR_HLS_PATH", root)
 	t.Setenv("CINEMATOR_TOTAL_CACHE_BYTES", "1")
@@ -270,14 +275,17 @@ func TestCacheNeverEvictsActiveSegments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &manager{active: map[streamKey]*streamInfo{key: readyCacheTestStream(paths)}, media: &mediaCache{assets: assets}, settings: settings.NewSettings()}
+	stream := readyCacheTestStream(paths)
+	stream.materializedWindows[0] = []ffmpeg.HLSFragment{{Start: 0, Duration: 2, Name: filepath.Base(segment)}}
+	stream.publishedFragments = append([]ffmpeg.HLSFragment(nil), stream.materializedWindows[0]...)
+	m := &manager{active: map[streamKey]*streamInfo{key: stream}, media: &mediaCache{assets: assets}, settings: settings.NewSettings()}
 	m.media.budget = newCacheBudget(m.settings.MaxCacheBytes())
 	m.enforceCacheLimit()
 	if _, err := os.Stat(segment); err != nil {
 		t.Fatalf("leased active segment was evicted: %v", err)
 	}
-	if _, err := os.Stat(reclaimable); err != nil {
-		t.Fatalf("another active segment was evicted: %v", err)
+	if _, err := os.Stat(reclaimable); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned active segment was not evicted: %v", err)
 	}
 	if err := asset.Close(); err != nil {
 		t.Fatal(err)
@@ -351,12 +359,35 @@ func readyCacheTestStream(paths streamPaths) *streamInfo {
 	ready := make(chan struct{})
 	close(ready)
 	return &streamInfo{
-		paths:         paths,
-		ready:         ready,
-		assetVersion:  "old",
-		mediaInfo:     domain.MediaInfo{Duration: 12},
-		selection:     ffmpeg.StreamSelection{SubtitleTrackIndex: -1},
-		directWindows: make(map[int][]ffmpeg.HLSFragment),
+		paths:               paths,
+		ready:               ready,
+		assetVersion:        "old",
+		mediaInfo:           domain.MediaInfo{Duration: 12},
+		selection:           ffmpeg.StreamSelection{SubtitleTrackIndex: -1},
+		materializedWindows: make(map[int][]ffmpeg.HLSFragment),
+	}
+}
+
+func TestHlsCacheProtectionExpiresRetiredPlaylistAssets(t *testing.T) {
+	root := t.TempDir()
+	key := streamKey{InfoHash: "hash", Index: 0, Audio: 0, Subtitle: -1}
+	paths := key.paths(root)
+	stream := readyCacheTestStream(paths)
+	stream.retainedAssets = map[string]time.Time{
+		"future.ts":  time.Now().Add(time.Hour),
+		"expired.ts": time.Now().Add(-time.Hour),
+	}
+	manager := &manager{
+		active:   map[streamKey]*streamInfo{key: stream},
+		settings: settings.NewSettings(),
+	}
+
+	_, pinned := manager.hlsCacheProtection()
+	if _, ok := pinned[filepath.Join(paths.outDir, "future.ts")]; !ok {
+		t.Fatal("retired playlist asset was not pinned during reload grace")
+	}
+	if _, ok := pinned[filepath.Join(paths.outDir, "expired.ts")]; ok {
+		t.Fatal("expired playlist asset remained pinned")
 	}
 }
 
@@ -381,12 +412,15 @@ func TestActiveAssetEvictionNeverRotatesPresentationGeneration(t *testing.T) {
 	ready := make(chan struct{})
 	close(ready)
 	stream := &streamInfo{
-		paths:         paths,
-		ready:         ready,
-		assetVersion:  "old",
-		mediaInfo:     domain.MediaInfo{Duration: 12},
-		selection:     ffmpeg.StreamSelection{SubtitleTrackIndex: -1},
-		directWindows: make(map[int][]ffmpeg.HLSFragment),
+		paths:        paths,
+		ready:        ready,
+		assetVersion: "old",
+		mediaInfo:    domain.MediaInfo{Duration: 12},
+		selection:    ffmpeg.StreamSelection{SubtitleTrackIndex: -1},
+		materializedWindows: map[int][]ffmpeg.HLSFragment{
+			0: {{Start: 0, Duration: 2, Name: filepath.Base(segments[0])}},
+		},
+		publishedFragments: []ffmpeg.HLSFragment{{Start: 0, Duration: 2, Name: filepath.Base(segments[0])}},
 	}
 	assets, err := newHlsAssetStore(root)
 	if err != nil {
@@ -398,10 +432,11 @@ func TestActiveAssetEvictionNeverRotatesPresentationGeneration(t *testing.T) {
 	if err == nil {
 		t.Fatal("cache enforcement unexpectedly fit active presentation under target")
 	}
-	for _, segment := range segments {
-		if _, err := os.Stat(segment); err != nil {
-			t.Fatalf("active segment was removed: %v", err)
-		}
+	if _, err := os.Stat(segments[0]); err != nil {
+		t.Fatalf("published active segment was removed: %v", err)
+	}
+	if _, err := os.Stat(segments[1]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphaned active segment was not removed: %v", err)
 	}
 	stream.mtx.Lock()
 	version := stream.assetVersion
@@ -442,6 +477,8 @@ func TestCacheContinuesPastFailedActiveBatch(t *testing.T) {
 	}
 	stream := readyCacheTestStream(paths)
 	stream.selection.SubtitleTrackIndex = 0
+	stream.materializedWindows[0] = []ffmpeg.HLSFragment{{Start: 0, Duration: 2, Name: filepath.Base(active)}}
+	stream.publishedFragments = append([]ffmpeg.HLSFragment(nil), stream.materializedWindows[0]...)
 	m := &manager{active: map[streamKey]*streamInfo{key: stream}, media: &mediaCache{assets: assets}, settings: settings.NewSettings()}
 	m.media.budget = newCacheBudget(m.settings.MaxCacheBytes())
 	m.enforceCacheLimit()

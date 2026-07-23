@@ -347,8 +347,10 @@ func (s *HttpServer) handleGetHlsStatus(w http.ResponseWriter, r *http.Request) 
 	}
 	status, err := s.mgr.GetHlsStatus(r.Context(), streamDir, targetSeconds)
 	if err != nil {
-		log.Printf("get HLS status: %v", err)
 		code := hlsErrorStatus(err)
+		if code >= http.StatusInternalServerError && code != http.StatusServiceUnavailable {
+			log.Printf("get HLS status: %v", err)
+		}
 		http.Error(w, hlsErrorMessage(code), code)
 		return
 	}

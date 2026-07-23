@@ -222,10 +222,9 @@ The controlled source provides `C < Rsource`, has no peers, or lacks required
 pieces.
 
 - The UI MUST expose the current waiting reason and observed progress.
-- Waiting for source data before FFmpeg starts MUST NOT consume a scarce
-  transcode slot. A live FFmpeg process remains under a hard process limit and
-  retains CPU admission until it exits or is cancelled; it MUST NOT resume
-  outside that limit.
+- Waiting for source data before FFmpeg starts MUST NOT consume a scarce media
+  worker. A live FFmpeg process remains under its encoder or packager limit
+  until it exits or is cancelled; it MUST NOT resume outside that limit.
 - A job with no source, FFmpeg, or publication progress MUST leave or be
   preempted from the active CPU stage by its stage-specific no-progress
   deadline.
@@ -240,17 +239,17 @@ the deterministic SLO fixtures.
 
 ### Stage-aware preparation
 
-Each video job MUST expose one current stage. Source underflow may move a live
-packager between `packaging` and `source_blocked`; the lifecycle is not assumed
-to be a one-way pipeline:
+Each media job MUST expose one current stage. Source underflow moves a live
+process briefly to `source_blocked`, cancels that attempt, and returns the job
+to `waiting_source` outside worker admission:
 
 ```text
-queued -> waiting_source -> waiting_cpu -> packaging <-> source_blocked
-                                             |
-                                             v
-                                        publishing -> ready
-                                             |
-                                      cancelled | error
+queued -> waiting_source -> waiting_cpu -> packaging -> publishing -> ready
+              ^                               |
+              |                               v
+              +----------------------- source_blocked
+                                              |
+                                       cancelled | error
 ```
 
 Stage transitions, last progress, active/known peers, generation mode, and
@@ -272,32 +271,31 @@ The existing overall preparation deadline remains a final safety bound. It is
 not a substitute for stage-specific no-progress handling:
 
 - `waiting_source` remains waitable while useful delivery advances and does not
-  hold CPU/transcode admission before a packager starts;
-- a live `source_blocked` packager remains within both process and transcode
-  limits during a grace period of `max(10 seconds, 3D)`; if neither critical
-  source bytes nor HLS output advances during that period, the process is
-  terminated, CPU admission is released, and the job returns to
-  `waiting_source` until its missing pieces become available. Before closing
-  its range reader, the manager transfers the last blocked byte-range demand to
-  a bounded, manager-owned piece-priority lease. The lease remains only until
-  that range is fully verified, the attempt is cancelled, or the overall
-  preparation deadline expires, and is then released;
+  hold encoder or packager admission;
+- when the range reader has identified a bounded byte range with missing pieces
+  and neither source bytes nor HLS output advances during the 500-millisecond
+  observation interval, the attempt enters `source_blocked` and is cancelled.
+  Worker admission is released before the job waits for that range. The source
+  owns the bounded piece-priority lease until the range is fully verified, the
+  job is cancelled, or the overall preparation deadline expires;
 - a packaging process that receives input but creates neither output nor a
   diagnostic within `max(10 seconds, 3D, 2 * Tpackage)` is terminated and
   reported. The deadline may be renewed only by verified input progress,
   published output progress, or a new bounded diagnostic identifying a
   different required range; repeated reads of the same bytes are not progress;
-- retries reuse verified pieces and complete immutable assets rather than
-  restarting successful work.
+- retries reuse verified pieces and complete immutable assets, resume from the
+  first unpublished nominal segment, and never truncate the already advertised
+  tail of the same presentation.
 
 ### Foreground scheduling
 
 Initial playback, the fragment at the active playhead, recovery from an actual
-buffer underrun, the latest committed seek, and every missing interval up to the
-low watermark are foreground work. Forward reserve generation between the low
-and target watermarks and subtitle preparation outside the immediate playback
-horizon are preemptible background work. Work beyond the high watermark is not
-admitted.
+buffer underrun, the latest committed seek, required target subtitles, and the
+missing forward interval needed to restore the adaptive urgent reserve are
+foreground work. Once that reserve is healthy, preemptible background work
+fills the stream's backward byte half nearest-first and then its remaining
+forward byte half. The byte horizon, not a duration watermark, stops normal
+materialization.
 
 - Foreground work MUST have priority over background work globally, not only
   within one stream.
@@ -308,16 +306,19 @@ admitted.
 - A foreground request MAY cancel obsolete background work. Admission held by
   the cancelled job MUST be released before the replacement can be rejected as
   capacity-exhausted.
+- A required target-subtitle job receives foreground packager admission and is
+  a readiness barrier before later media packaging. It does not consume the
+  encoder lane, and confirmed source waiting releases the packager lane.
 - Requests for the same canonical asset MUST still join one operation, and
   multiple viewers of the same representation MUST share its materialized
   horizon.
 
-CPU admission, live-process admission, and source-I/O waiting are separate
-resources. Where bounded access metadata is available, hybrid playback SHOULD
-materialize its first critical source extent before starting FFmpeg. Otherwise a
-source-blocked FFmpeg remains bounded during its grace period and is terminated
-before its CPU admission is released; it MUST NOT leave an unlimited encoder
-outside admission control.
+Encoder admission, lightweight-packager admission, and source-I/O waiting are
+separate resources. Where bounded access metadata is available, hybrid
+playback SHOULD materialize its first critical source extent before starting
+FFmpeg. Otherwise a source-blocked FFmpeg is cancelled promptly before its
+worker admission is released; it MUST NOT leave an unlimited process outside
+admission control.
 
 ### Fast startup path
 
@@ -339,17 +340,20 @@ fragment and keep its successor on the foreground path.
   converted, but audio conversion MUST NOT force video transcoding.
 - The first fragment is published atomically as soon as it is complete; the
   remainder of the admitted window does not delay its playlist visibility.
+  The target waiter is released from that publication, while the running job
+  retains ownership of the tail and starts the next prefetch only after it
+  completes.
 
 The normal target duration remains two seconds by default. Direct-copy output
 may require more source time because of GOP boundaries; the status model MUST
 report that preroll instead of implying that a two-second request always reads
 only two seconds of source.
 
-### Adaptive forward reserve
+### Adaptive reserve and byte-bounded server horizon
 
 The current rule that waits for a request for the final advertised fragment
-before starting the next window is replaced by bounded low/high-watermark
-control.
+before starting the next window is replaced by an adaptive urgent reserve
+inside a larger byte-bounded materialized horizon.
 
 The client controls its own MSE buffer using:
 
@@ -370,16 +374,20 @@ telemetry. An init request alone does not authorize forward generation. With
 multiple viewers, the server serves the most urgent admitted requested horizon
 without requiring a mutable per-viewer playhead.
 
-It maintains:
+The client maintains duration watermarks for browser buffering. The server
+uses the same delivery observations to choose urgency, but not to define the
+disk-cache stopping point. It maintains:
 
 - a low watermark below which the next missing canonical interval becomes
   foreground work;
-- a target watermark at which normal prefetch stops;
-- a high watermark that generation MUST NOT exceed solely because of
-  sequential prefetch.
+- target and high watermarks that adapt the urgent forward reserve;
+- a per-stream byte share divided equally behind and ahead of the latest
+  committed playhead, including estimated source and generated-output bytes.
 
-The client applies these watermarks to buffered media. The server applies them
-to the materialized horizon relative to the most urgent admitted media demand.
+The client applies the duration watermarks to buffered media. The server fills
+the urgent forward reserve first, the backward byte half second, and the
+remaining forward byte half last. Normal generation stops when the applicable
+side budget is full or shared-cache admission rejects the next window.
 
 Initial defaults SHOULD target approximately 15 seconds low, 30 seconds target,
 and 60 seconds high for ordinary sources, then adapt within byte and duration
@@ -388,10 +396,11 @@ and decreases it when the configured client byte ceiling would be exceeded.
 These are implementation defaults, not new environment variables until field
 data demonstrates an operational need.
 
-A seek immediately changes the foreground horizon. It MUST NOT evict or cancel
-already playable history merely to prepare the new target. Returning to a
-retained target resumes from browser or HLS cache without redundant torrent
-reads.
+A seek immediately recenters both byte halves and changes the foreground
+horizon. It MUST NOT evict or cancel already playable history merely to prepare
+the new target. Returning to a retained target resumes from browser or HLS
+cache without redundant torrent reads; a cold distant seek progressively
+rebuilds both halves around its new playhead.
 
 ### Client buffer policy
 
@@ -442,12 +451,13 @@ before running Go tests.
 | Contract | Gating coverage |
 | --- | --- |
 | Full source duration remains visible while only part of the stream is materialized | Playwright: `exposes the complete source duration before the full torrent is available` |
-| Delayed or failed forward fragments never replace the player, erase duration, or move source time | Playwright: `never replaces or rewinds active playback when the next HLS fragment is delayed`, `restores the last presented position after an unsolicited media seek`, and `keeps source time monotonic while the HLS presentation advances across five windows` |
+| Delayed, overlapping, or failed forward fragments never replace the player, erase duration, truncate an already advertised same-head playlist, or move source time before a continuous presentation covers the committed target | Go: `TestContiguousTranscodedFragmentsResumeAfterPublishedPrefix`, `TestDirectPrerollDoesNotRepublishPreviousWindowHead`, `TestLegalForwardPlaylistNeverShrinksPublishedTail`, and `TestLegalForwardPlaylistNeverRewritesPublishedIdentity`; Playwright: `never replaces or rewinds active playback when the next HLS fragment is delayed`, `restores the last presented position after an unsolicited media seek`, and `keeps source time monotonic while the HLS presentation advances across five windows` |
+| Direct and hybrid startup returns after the first complete target-covering fragment while the admitted window continues under one owner | Go: `TestWaitForDirectTargetReturnsBeforeTheWindowJobCompletes` and integration `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` |
 | A committed seek owns its exact target; older work cannot snap it back, jump to a live edge, or win a seek storm | Playwright seek tests covering 0 seconds, 22 minutes, retained history, delayed preparation, repeated events, and latest-target wins |
 | Temporary `429`/`503` admission pressure remains waitable and a newer seek cancels the old retries | Playwright: `retries transient streaming capacity without replacing the player or losing the seek target` and `cancels capacity retries when the user commits a newer seek` |
-| A selected text subtitle is part of readiness at startup and after a cold seek; fatal subtitle loss stops playback visibly | Playwright selected-subtitle tests plus Go scheduler/status tests `TestPlaybackStatusWaitsForSelectedSubtitleTarget`, `TestRequestedSubtitleWaitsForTargetVideoThenPreemptsItsRemainder`, and `TestSelectedSubtitleJobFailureFailsItsPlaybackTarget` |
+| A selected text subtitle is part of readiness at startup and after a cold seek; fatal subtitle loss stops playback visibly | Playwright selected-subtitle tests plus Go scheduler/status tests `TestPlaybackStatusWaitsForSelectedSubtitleTarget`, `TestRequestedSubtitleWaitsForTargetVideoWithoutStoppingItsRemainder`, and `TestSelectedSubtitleJobFailureFailsItsPlaybackTarget` |
 | Advancing media time without new decoded video frames is detected as a playback stall | Playwright: `detects frozen video frames even while the player clock can advance` |
-| The real backend path produces decodable video and audio, selected WebVTT at the initial and distant targets, one reusable presentation, and a fast cached return | Go integration: `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` using a local BitTorrent seeder and real FFmpeg/ffprobe |
+| The real backend path produces decodable video and audio, selected WebVTT at the initial and distant targets, one reusable presentation, a fast cached return, and continued publication while cache enforcement snapshots active assets | Go integration: `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` using a local BitTorrent seeder and real FFmpeg/ffprobe; streaming changes additionally stress this scenario with repeated runs |
 | Capped torrent storage cannot recurse until goroutine stack overflow | Go integration: `TestForkReaderBoundsCappedStorageRetriesUntilCancellation` against the selected torrent fork |
 | Unsupported tracker schemes cannot panic request handlers | Go: `TestAddMagnetIgnoresUnsupportedTrackerSchemes`; HTTP error behavior is covered by Playwright |
 | Cache pressure preserves leased and active HLS assets and synchronizes evicted torrent-piece completion | Go cache, asset-store, and `TestPieceEvictionUpdatesTorrentCompletion` integration tests |

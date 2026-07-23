@@ -19,6 +19,7 @@ const (
 	defaultHlsSegmentDuration = 2 * time.Second
 	defaultHlsWindowSegments  = 15
 	defaultMaxTranscodes      = 1
+	defaultMaxPackagers       = 1
 	defaultMaxQueuedJobs      = 4
 	defaultMaxJobsPerStream   = 3
 	defaultMaxActiveStreams   = 16
@@ -37,6 +38,7 @@ type Settings struct {
 	hlsSegmentDuration time.Duration
 	hlsWindowSegments  int
 	maxTranscodes      int
+	maxPackagers       int
 	maxQueuedJobs      int
 	maxJobsPerStream   int
 	maxActiveStreams   int
@@ -66,6 +68,7 @@ func NewSettings() Settings {
 		hlsSegmentDuration: time.Duration(intEnv("CINEMATOR_HLS_SEGMENT_SECONDS", int(defaultHlsSegmentDuration/time.Second))) * time.Second,
 		hlsWindowSegments:  intEnv("CINEMATOR_HLS_WINDOW_SEGMENTS", defaultHlsWindowSegments),
 		maxTranscodes:      intEnv("CINEMATOR_MAX_TRANSCODES", defaultMaxTranscodes),
+		maxPackagers:       intEnv("CINEMATOR_MAX_PACKAGERS", defaultMaxPackagers),
 		maxQueuedJobs:      intEnv("CINEMATOR_MAX_QUEUED_JOBS", defaultMaxQueuedJobs),
 		maxJobsPerStream:   intEnv("CINEMATOR_MAX_JOBS_PER_STREAM", defaultMaxJobsPerStream),
 		maxActiveStreams:   intEnv("CINEMATOR_MAX_ACTIVE_STREAMS", defaultMaxActiveStreams),
@@ -136,6 +139,13 @@ func (s Settings) MaxTranscodes() int {
 		return defaultMaxTranscodes
 	}
 	return s.maxTranscodes
+}
+
+func (s Settings) MaxPackagers() int {
+	if s.maxPackagers <= 0 {
+		return defaultMaxPackagers
+	}
+	return s.maxPackagers
 }
 
 func (s Settings) MaxQueuedJobs() int {

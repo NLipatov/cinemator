@@ -42,7 +42,7 @@ func TestPlaybackStatusPublishesCurrentAssetGeneration(t *testing.T) {
 		status:       domain.HlsStatus{Phase: domain.HlsPhaseWaiting},
 	}
 
-	status := stream.playbackStatus(-1, playbackTimeline{}, time.Now(), 0, 0, 0, true)
+	status := stream.playbackStatus(-1, playbackTimeline{}, time.Now(), 0, 0, true)
 	if status.Generation != "generation-2" {
 		t.Fatalf("generation = %q, want generation-2", status.Generation)
 	}
@@ -57,7 +57,7 @@ func TestPlaybackStatusWaitsForSelectedSubtitleTarget(t *testing.T) {
 			Duration: 120,
 			Seekable: true,
 		},
-		directWindows: map[int][]ffmpeg.HLSFragment{
+		materializedWindows: map[int][]ffmpeg.HLSFragment{
 			0: {{Start: 0, Duration: 2, Name: videoSegmentName(0)}},
 		},
 		status:       domain.HlsStatus{Phase: domain.HlsPhasePreparing},
@@ -66,11 +66,11 @@ func TestPlaybackStatusWaitsForSelectedSubtitleTarget(t *testing.T) {
 	}
 	timeline := newPlaybackTimeline(2*time.Second, 15, 120)
 
-	waiting := stream.playbackStatus(0, timeline, time.Now(), 0, 1, 1, false)
+	waiting := stream.playbackStatus(0, timeline, time.Now(), 1, 1, false)
 	if waiting.Phase != domain.HlsPhasePreparing || waiting.Message != "Preparing selected subtitles" {
 		t.Fatalf("status before subtitle = %+v", waiting)
 	}
-	readyStatus := stream.playbackStatus(0, timeline, time.Now(), 0, 1, 1, true)
+	readyStatus := stream.playbackStatus(0, timeline, time.Now(), 1, 1, true)
 	if readyStatus.Phase != domain.HlsPhaseReady {
 		t.Fatalf("status after subtitle = %+v", readyStatus)
 	}
@@ -135,7 +135,7 @@ func TestSessionAdmissionDeduplicatesOneTarget(t *testing.T) {
 		videoJobs:    make(map[*segmentJob]struct{}),
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
-	scheduler := newSegmentScheduler(2, 1)
+	scheduler := newSegmentScheduler(2, 1, 1)
 
 	stream.mtx.Lock()
 	first, _, created, err := stream.acquireJobLocked(videoSegmentJob, 12, 10, 15, false, scheduler, 2)
@@ -161,7 +161,7 @@ func TestSessionAdmissionExplicitTargetCancelsSupersededUnobservedTarget(t *test
 		videoJobs:    make(map[*segmentJob]struct{}),
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
-	scheduler := newSegmentScheduler(2, 1)
+	scheduler := newSegmentScheduler(2, 1, 1)
 
 	stream.mtx.Lock()
 	first, firstCtx, _, err := stream.acquireJobLocked(videoSegmentJob, 0, 0, 5, false, scheduler, 2)
@@ -192,7 +192,7 @@ func TestSessionAdmissionReplacesOverlappingBackgroundWorkForAViewer(t *testing.
 		videoJobs:    make(map[*segmentJob]struct{}),
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
-	scheduler := newSegmentScheduler(2, 1)
+	scheduler := newSegmentScheduler(2, 1, 1)
 
 	stream.mtx.Lock()
 	background, backgroundCtx, _, err := stream.acquireJobLocked(videoSegmentJob, 10, 10, 25, true, scheduler, 2)
@@ -222,7 +222,7 @@ func TestSessionAdmissionRequiredSubtitleReplacesBackgroundSubtitle(t *testing.T
 		videoJobs:    make(map[*segmentJob]struct{}),
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
-	scheduler := newSegmentScheduler(2, 1)
+	scheduler := newSegmentScheduler(2, 1, 1)
 
 	stream.mtx.Lock()
 	background, backgroundCtx, _, err := stream.acquireJobLocked(subtitleSegmentJob, 12, 12, 13, true, scheduler, 2)
@@ -252,7 +252,7 @@ func TestSessionAdmissionForegroundPreemptsFullBackgroundBacklog(t *testing.T) {
 		videoJobs:    make(map[*segmentJob]struct{}),
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
-	scheduler := newSegmentScheduler(3, 1)
+	scheduler := newSegmentScheduler(3, 1, 1)
 
 	stream.mtx.Lock()
 	observed, _, _, err := stream.acquireJobLocked(videoSegmentJob, 0, 0, 1, false, scheduler, 3)
@@ -297,7 +297,7 @@ func TestExplicitTargetRetiresObservedPreviousWindow(t *testing.T) {
 		videoJobs:    make(map[*segmentJob]struct{}),
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
-	scheduler := newSegmentScheduler(1, 1)
+	scheduler := newSegmentScheduler(1, 1, 1)
 
 	stream.mtx.Lock()
 	previous, previousCtx, _, err := stream.acquireJobLocked(videoSegmentJob, 0, 0, 1, false, scheduler, 1)
@@ -335,7 +335,7 @@ func TestFragmentDemandCannotSupersedeExplicitTarget(t *testing.T) {
 		videoJobs:    make(map[*segmentJob]struct{}),
 		subtitleJobs: make(map[*segmentJob]struct{}),
 	}
-	scheduler := newSegmentScheduler(1, 1)
+	scheduler := newSegmentScheduler(1, 1, 1)
 
 	stream.mtx.Lock()
 	target, targetCtx, _, err := stream.acquireJobLocked(videoSegmentJob, 100, 100, 101, false, scheduler, 1)

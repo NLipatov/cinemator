@@ -178,6 +178,7 @@
         this.statusController = null;
         this.statusSeq = 0;
         this.statusTarget = null;
+        this.missingStreamRecoveryAttempted = false;
         this.frameCallback = null;
         this.frameTimer = null;
         this.lastPresentedFrameAt = 0;
@@ -476,6 +477,50 @@
       );
     }
 
+    function hlsStatusError(response, message) {
+      const error = new Error(message || `Status request failed (${response.status})`);
+      error.status = response.status;
+      return error;
+    }
+
+    function retryableHlsStatusError(error) {
+      const status = Number(error?.status || 0);
+      return status === 0 || status === 408 || status === 429 || status >= 500;
+    }
+
+    async function fetchHlsStatus(streamDir, targetSeconds, signal) {
+      const statusURL = `/api/hls/status/${encodeURIComponent(streamDir)}?target=${encodeURIComponent(targetSeconds)}`;
+      const response = await apiFetch(statusURL, {
+        cache: 'no-store',
+        signal,
+      }, 10000);
+      if (!response.ok) {
+        throw hlsStatusError(response, (await response.text()).trim());
+      }
+      return response.json();
+    }
+
+    function recoverMissingHlsStream(streamDir, targetSeconds, statusSeq, error) {
+      if (statusSeq !== playback.statusSeq || playback.streamDir !== streamDir) return;
+      playback.stopStatusPolling();
+      if (playback.missingStreamRecoveryAttempted) {
+        showPlaybackError(error.message || 'HLS stream not found');
+        return;
+      }
+      playback.missingStreamRecoveryAttempted = true;
+      playback.streamDir = null;
+      playback.generation = '';
+      const requestSeq = playback.requestSeq;
+      queueMicrotask(() => {
+        if (playback.requestSeq !== requestSeq || playback.streamDir !== null) return;
+        startPlayback(targetSeconds, {
+          keepPlayerVisible: true,
+          attemptKind: 'stream_recovery',
+          missingStreamRecovery: true,
+        });
+      });
+    }
+
     function beginHlsStatusPolling(targetSeconds, replace = false) {
       if (!playback.streamDir) return;
       targetSeconds = Number.isFinite(targetSeconds) ? Math.max(0, targetSeconds) : 0;
@@ -483,6 +528,7 @@
       playback.stopStatusPolling();
       playback.statusTarget = targetSeconds;
       const seq = playback.statusSeq;
+      const streamDir = playback.streamDir;
       showWarning(
         `Preparing ${formatPlaybackTime(targetSeconds)}`,
         'Checking the cache and requesting the required torrent pieces.',
@@ -490,28 +536,26 @@
       );
       let consecutiveFailures = 0;
       const poll = async () => {
-        if (seq !== playback.statusSeq || !playback.streamDir) return;
+        if (seq !== playback.statusSeq || playback.streamDir !== streamDir) return;
         const controller = new AbortController();
         playback.statusController = controller;
         try {
-          const statusURL = `/api/hls/status/${encodeURIComponent(playback.streamDir)}?target=${encodeURIComponent(targetSeconds)}`;
-          const response = await apiFetch(statusURL, {
-            cache: 'no-store',
-            signal: controller.signal,
-          }, 10000);
+          const status = await fetchHlsStatus(streamDir, targetSeconds, controller.signal);
           if (seq !== playback.statusSeq) return;
-          if (!response.ok) {
-            const error = new Error((await response.text()).trim() || `Status request failed (${response.status})`);
-            error.status = response.status;
-            throw error;
-          }
           consecutiveFailures = 0;
-          const status = await response.json();
-          if (seq !== playback.statusSeq) return;
           classifyPendingSeek(status);
           renderHlsStatus(status, targetSeconds);
         } catch (error) {
           if (error.name !== 'AbortError' && seq === playback.statusSeq) {
+            if (error.status === 404) {
+              recoverMissingHlsStream(streamDir, targetSeconds, seq, error);
+              return;
+            }
+            if (!retryableHlsStatusError(error)) {
+              playback.stopStatusPolling();
+              showPlaybackError(error.message);
+              return;
+            }
             consecutiveFailures++;
             if (consecutiveFailures >= 3) {
               showWarning(
@@ -525,7 +569,7 @@
           }
         } finally {
           if (playback.statusController === controller) playback.statusController = null;
-          if (seq === playback.statusSeq) {
+          if (seq === playback.statusSeq && playback.streamDir === streamDir) {
             playback.statusTimer = setTimeout(poll, 1000);
           }
         }
@@ -541,15 +585,14 @@
 
     async function waitForHlsReady(streamDir, targetSeconds, signal) {
       for (;;) {
-        const statusURL = `/api/hls/status/${encodeURIComponent(streamDir)}?target=${encodeURIComponent(targetSeconds)}`;
-        const response = await apiFetch(statusURL, {
-          cache: 'no-store',
-          signal,
-        }, 10000);
-        if (!response.ok) {
-          throw new Error((await response.text()).trim() || `Status request failed (${response.status})`);
+        let status;
+        try {
+          status = await fetchHlsStatus(streamDir, targetSeconds, signal);
+        } catch (error) {
+          if (error.name === 'AbortError' || !retryableHlsStatusError(error)) throw error;
+          await waitForRetry(signal, 500);
+          continue;
         }
-        const status = await response.json();
         classifyPendingSeek(status);
         renderHlsStatus(status, targetSeconds);
         if (status.phase === 'ready') return status;
@@ -1242,7 +1285,11 @@
       }
     };
 
-    async function startPlayback(resumeTime = 0, { keepPlayerVisible = false, attemptKind = '' } = {}) {
+    async function startPlayback(resumeTime = 0, {
+      keepPlayerVisible = false,
+      attemptKind = '',
+      missingStreamRecovery = false,
+    } = {}) {
       playback.cancelSeekCommit();
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
@@ -1254,8 +1301,13 @@
         return;
       }
       const start = playback.mediaSeekable && Number.isFinite(resumeTime) && resumeTime > 0 ? resumeTime : 0;
+      if (!missingStreamRecovery) playback.missingStreamRecoveryAttempted = false;
       const request = playback.beginRequest(start);
       playback.stopStatusPolling();
+      // A gesture belongs to the presentation on which it happened. Carrying
+      // it into the next attach can turn hls.js's internal positioning seek
+      // into another application-level seek and recursively rebuild at 0:00.
+      playback.userSeekIntentUntil = 0;
       const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
       const retainedHls = keepPlayerVisible ? playback.hls : null;
@@ -1641,6 +1693,10 @@
         }
       };
       video.addEventListener('play', () => {
+        // A pointer/key gesture that resolves to a transport action did not
+        // request a timeline change. Do not let a later hls.js positioning
+        // seek inherit that gesture.
+        playback.userSeekIntentUntil = 0;
         playback.playIntent = true;
         if (playback.autoplayBlocked) {
           playback.autoplayBlocked = false;
@@ -1649,6 +1705,7 @@
         updateQoePlayingTime();
       }, options);
       video.addEventListener('pause', () => {
+        playback.userSeekIntentUntil = 0;
         finishPlaybackStall();
         playback.playIntent = false;
         publishQoeSummary();
@@ -1668,6 +1725,9 @@
       video.addEventListener('pointercancel', finishPointerSeek, options);
       video.addEventListener('keydown', () => {
         playback.userSeekIntentUntil = Date.now() + 1500;
+      }, options);
+      video.addEventListener('volumechange', () => {
+        playback.userSeekIntentUntil = 0;
       }, options);
       video.addEventListener('seeking', () => {
         finishPlaybackStall();
@@ -1805,6 +1865,7 @@
         playback.userSeekIntentUntil = 0;
         playback.timeline.anchor(video.currentTime);
         playback.nativeRetries = 0;
+        playback.missingStreamRecoveryAttempted = false;
         playback.lastActivityAt = Date.now();
         showPlaybackNotice();
         removeWarning();
@@ -1950,14 +2011,15 @@
         playback.hls.on(Hls.Events.ERROR, (evt, data) => {
           if (enableSubtitles && data?.frag?.type === 'subtitle') {
             if (data.fatal) {
+              playback.attaching = false;
               video.pause();
               showPlaybackError('The selected subtitles could not be loaded');
             }
             return;
           }
-          playback.attaching = false;
           const responseCode = Number(data?.response?.code || data?.response?.status || 0);
           if (responseCode === 409) {
+            playback.attaching = false;
             showPlaybackError('The stream presentation changed before the player loaded it');
             return;
           }
@@ -1967,6 +2029,7 @@
             return;
           }
           if (data.fatal) {
+            playback.attaching = false;
             const mediaFailure = data.type === Hls.ErrorTypes?.MEDIA_ERROR || /codec|buffer|media/i.test(data.details || '');
             if (mediaFailure) {
               if (retryStartupWithCompatibilityFallback('The browser rejected the original stream; using the compatibility fallback.')) return;
