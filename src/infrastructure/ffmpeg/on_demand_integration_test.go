@@ -40,7 +40,7 @@ func TestGenerateEmptySubtitleSegmentDoesNotReadUntilTheNextCue(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := newPrefixOnlyRangeServer(data, len(data)*3/4)
+	server := newPrefixOnlyRangeServer(data, len(data)/16)
 	defer server.Close()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

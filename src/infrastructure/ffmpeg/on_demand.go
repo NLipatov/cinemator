@@ -895,33 +895,6 @@ func GenerateSubtitleSegment(
 	segmentStartTime := time.Duration(segmentIndex) * segmentDuration
 	segmentStart := formatDuration(segmentStartTime)
 	segmentEnd := formatDuration(segmentStartTime + segmentDuration)
-	// A subtitle-only FFmpeg output has no media clock when this interval has no
-	// cue. It then reads forward until the next cue, which can request distant
-	// torrent pieces forever. Consume the exact video interval first so all
-	// container packets needed to decide this subtitle segment are local.
-	clockArgs := []string{
-		"-hide_banner", "-loglevel", "error", "-nostats",
-		"-fflags", "+genpts",
-		"-analyzeduration", "0",
-		"-probesize", "32768",
-		"-max_probe_packets", "1",
-		"-fpsprobesize", "0",
-	}
-	if segmentIndex > 0 {
-		clockArgs = append(clockArgs, "-ss", segmentStart)
-	}
-	clockArgs = append(clockArgs,
-		"-an", "-sn", "-dn",
-		"-i", inputURL,
-		"-t", formatDuration(segmentDuration),
-		"-map", "0:v:0",
-		"-c:v", "copy",
-		"-f", "null", "-",
-	)
-	if _, err := cli.RunWithStdin(ctx, nil, "ffmpeg", clockArgs...); err != nil {
-		return err
-	}
-
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostats",
 		"-y",
@@ -930,9 +903,10 @@ func GenerateSubtitleSegment(
 		"-probesize", "32768",
 		"-max_probe_packets", "1",
 		"-fpsprobesize", "0",
-	}
-	if segmentIndex > 0 {
-		args = append(args, "-ss", segmentStart)
+		// The target video interval is materialized before its selected
+		// subtitle becomes a readiness barrier. Use the same indexed seek path
+		// for every segment, including the first.
+		"-ss", segmentStart,
 	}
 	if strings.HasPrefix(inputURL, "http://") || strings.HasPrefix(inputURL, "https://") {
 		args = append(args, "-rw_timeout", "250000")
@@ -955,10 +929,10 @@ func GenerateSubtitleSegment(
 		runDone <- err
 	}()
 
-	// FFmpeg can still look beyond the warmed interval for the next subtitle
-	// packet. Stop that look-ahead after the cached packets have had time to be
-	// decoded; a valid partial WebVTT is either the complete cue set for this
-	// interval or an intentionally empty segment.
+	// A subtitle-only output can still look beyond the target interval for the
+	// next subtitle packet. Stop that look-ahead after the materialized packets
+	// have had time to be decoded; the result is either the complete cue set for
+	// this interval or an intentionally empty segment.
 	const cachedIntervalScanGrace = 500 * time.Millisecond
 	timer := time.NewTimer(cachedIntervalScanGrace)
 	defer timer.Stop()
