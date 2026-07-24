@@ -149,6 +149,7 @@
         return time >= first.start - 0.25 && time < last.start + last.duration + 0.25;
       }
     }
+    const decodedSeekFrameToleranceSeconds = 0.5;
     class PlaybackSession {
       constructor() {
         this.timeline = new PlaybackTimeline();
@@ -166,6 +167,7 @@
         this.userSeekIntentAvailable = false;
         this.userSeekIntentUntil = 0;
         this.protectedMediaTime = null;
+        this.committedSeekMediaTime = null;
         this.restoringPlayhead = false;
         this.mediaSeekable = true;
         this.mediaInfo = null;
@@ -282,6 +284,24 @@
         this.userSeekIntentUntil = 0;
         return true;
       }
+      commitSeekPosition(mediaTime) {
+        if (Number.isFinite(mediaTime)) this.committedSeekMediaTime = mediaTime;
+      }
+      restorationMediaTime() {
+        return Number.isFinite(this.committedSeekMediaTime)
+          ? this.committedSeekMediaTime
+          : this.protectedMediaTime;
+      }
+      acceptPresentedMediaTime(mediaTime) {
+        if (!Number.isFinite(mediaTime)) return false;
+        if (Number.isFinite(this.committedSeekMediaTime) &&
+          Math.abs(mediaTime - this.committedSeekMediaTime) > decodedSeekFrameToleranceSeconds) {
+          return false;
+        }
+        this.protectedMediaTime = mediaTime;
+        this.committedSeekMediaTime = null;
+        return true;
+      }
       stopStatusPolling() {
         this.statusSeq++;
         this.statusTarget = null;
@@ -321,6 +341,7 @@
       playback.attaching = false;
       playback.clearUserSeekIntent();
       playback.protectedMediaTime = null;
+      playback.committedSeekMediaTime = null;
       playback.restoringPlayhead = false;
       playback.timeline.reset();
       const mediaDialog = $('mediaInfoDialog');
@@ -1625,12 +1646,12 @@
     }
 
     function observePresentedFrame(now, mediaTime) {
+      if (!playback.acceptPresentedMediaTime(mediaTime)) return;
       playback.lastPresentedFrameAt = now;
       playback.lastActivityAt = Date.now();
       playback.hasPresentedFrame = true;
       playback.presentationRecoveryAttempted = false;
       playback.presentedFrameCount++;
-      if (Number.isFinite(mediaTime)) playback.protectedMediaTime = mediaTime;
       const video = $('video');
       if (playback.presentationAttempt && qoePresentationEligible(video)) {
         finishPresentationAttempt('presented', now);
@@ -1795,7 +1816,7 @@
         // live playlist, or recovering a decoder. Those events never grant the
         // application permission to prepare or attach another presentation.
         if (!userInitiated) {
-          const protectedTime = playback.protectedMediaTime;
+          const protectedTime = playback.restorationMediaTime();
           const nextTime = Number(video.currentTime);
           if (!playback.attaching && !playback.restoringPlayhead &&
             Number.isFinite(protectedTime) && Number.isFinite(nextTime) &&
@@ -1808,7 +1829,7 @@
         }
         playback.attaching = false;
         const target = playback.timeline.sourceTime(video.currentTime);
-        playback.protectedMediaTime = Number(video.currentTime);
+        playback.commitSeekPosition(Number(video.currentTime));
         const retained = playback.timeline.contains(
           target,
           mediaBufferedRanges(video),

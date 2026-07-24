@@ -56,8 +56,9 @@ const fakeHls = String.raw`
           if (window.__cancelledVideoFrameCallbacks.has(id)) return;
           window.__presentedFrameCallbacks++;
           if (window.__freezeVideoFrames && window.__presentedFrameCallbacks > 1) return;
+          const queuedMediaTime = window.__queuedVideoFrameMediaTimes.shift();
           callback(performance.now(), {
-            mediaTime: Number(media.currentTime) || 0,
+            mediaTime: Number.isFinite(queuedMediaTime) ? queuedMediaTime : Number(media.currentTime) || 0,
             presentedFrames: window.__presentedFrameCallbacks,
           });
         }, 100);
@@ -183,6 +184,7 @@ async function openMovie(page, {
     window.__autoplayRejected = false;
     window.__videoFrameCallbackID = 0;
     window.__presentedFrameCallbacks = 0;
+    window.__queuedVideoFrameMediaTimes = [];
     window.__cancelledVideoFrameCallbacks = new Set();
     window.__videoFrameTimers = new Map();
     window.__qoeSummaries = [];
@@ -201,8 +203,9 @@ async function openMovie(page, {
           if (window.__suppressVideoFrames) return;
           window.__presentedFrameCallbacks++;
           if (window.__freezeVideoFrames && window.__presentedFrameCallbacks > 1) return;
+          const queuedMediaTime = window.__queuedVideoFrameMediaTimes.shift();
           callback(performance.now(), {
-            mediaTime: Number(media.currentTime) || 0,
+            mediaTime: Number.isFinite(queuedMediaTime) ? queuedMediaTime : Number(media.currentTime) || 0,
             presentedFrames: window.__presentedFrameCallbacks,
           });
         }, 100);
@@ -351,6 +354,7 @@ async function openHourlyMovieWithPendingMiddle(page) {
   let middleReady = false;
   const prepareStarts = await openMovie(page, {
     mediaInfo: { duration: 60 * 60 },
+    initialBufferSeconds: 18,
     getHlsStatus: targetSeconds => ({
       phase: targetSeconds === middle && !middleReady ? 'preparing' : 'ready',
       targetSeconds,
@@ -1044,6 +1048,63 @@ test('keeps an unbuffered seek committed when media snaps back after the gesture
   pending.finishPreparation();
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
   await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(pending.middle);
+});
+
+test('keeps a committed seek authoritative over a late frame from the old position', async ({ page }) => {
+  const pending = await openHourlyMovieWithPendingMiddle(page);
+  const video = page.locator('video');
+
+  const initialFrames = await page.evaluate(() => window.__presentedFrameCallbacks);
+  await video.evaluate(element => { element.currentTime = 16; });
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThan(initialFrames);
+
+  const framesBeforeSeek = await page.evaluate(() => window.__presentedFrameCallbacks);
+  await video.evaluate((element, middle) => {
+    window.__queuedVideoFrameMediaTimes.push(16);
+    element.dispatchEvent(new PointerEvent('pointerdown'));
+    element.currentTime = middle;
+    element.dispatchEvent(new Event('seeking'));
+    element.dispatchEvent(new PointerEvent('pointerup'));
+  }, pending.middle);
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThan(framesBeforeSeek);
+
+  await video.evaluate(element => {
+    element.currentTime = 16;
+    element.dispatchEvent(new Event('seeking'));
+  });
+
+  await expect.poll(() => pending.prepareStarts).toEqual([0, pending.middle]);
+  await expect.poll(() => video.evaluate(element => element.currentTime)).toBe(pending.middle);
+});
+
+test('returns playhead ownership to presented frames after a committed seek', async ({ page }) => {
+  const pending = await openHourlyMovieWithPendingMiddle(page);
+  const video = page.locator('video');
+
+  await video.evaluate((element, middle) => {
+    element.dispatchEvent(new PointerEvent('pointerdown'));
+    element.currentTime = middle;
+    element.dispatchEvent(new Event('seeking'));
+    element.dispatchEvent(new PointerEvent('pointerup'));
+  }, pending.middle);
+  await expect.poll(() => pending.prepareStarts).toEqual([0, pending.middle]);
+
+  pending.finishPreparation();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
+  await expect.poll(() => video.evaluate(element => element.currentTime)).toBe(pending.middle);
+
+  const framesAtTarget = await page.evaluate(() => window.__presentedFrameCallbacks);
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThan(framesAtTarget);
+
+  const framesBeforeProgress = await page.evaluate(() => window.__presentedFrameCallbacks);
+  await video.evaluate((element, nextTime) => { element.currentTime = nextTime; }, pending.middle + 2);
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThan(framesBeforeProgress);
+
+  await video.evaluate((element, oldTime) => {
+    element.currentTime = oldTime;
+    element.dispatchEvent(new Event('seeking'));
+  }, pending.middle);
+  await expect.poll(() => video.evaluate(element => element.currentTime)).toBe(pending.middle + 2);
 });
 
 test('accepts one native seek emitted after pointerup without accepting its snapback', async ({ page }) => {
