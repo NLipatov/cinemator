@@ -70,6 +70,12 @@ playlist errors, empty forward buffers, and unsolicited media `seeking` events.
 They verify that the video element, hls.js instance, duration, and last
 presented position remain stable until the user issues a command.
 
+Before the first presented frame, the client MAY discard one attachment whose
+playlist generation became stale between readiness and loading. It MUST prepare
+the same source target again at most once. A repeated generation conflict is a
+visible terminal error, and this recovery is disabled as soon as a frame has
+been presented.
+
 The same ownership rule applies to server work. A committed cold seek MUST
 retire superseded video jobs and preempt subtitle extraction or forward
 prefetch when admission is full. A late request for a fragment from the old
@@ -347,7 +353,10 @@ fragment and keep its successor on the foreground path.
 The normal target duration remains two seconds by default. Direct-copy output
 may require more source time because of GOP boundaries; the status model MUST
 report that preroll instead of implying that a two-second request always reads
-only two seconds of source.
+only two seconds of source. Prefetch coverage is the continuous union of
+materialized fragments. A complete GOP that overlaps the previous window but
+extends its frontier is retained as the bridge to the next window; a fully
+covered GOP is discarded.
 
 ### Adaptive reserve and byte-bounded server horizon
 
@@ -452,12 +461,14 @@ before running Go tests.
 | --- | --- |
 | Full source duration remains visible while only part of the stream is materialized | Playwright: `exposes the complete source duration before the full torrent is available` |
 | Delayed, overlapping, or failed forward fragments never replace the player, erase duration, truncate an already advertised same-head playlist, or move source time before a continuous presentation covers the committed target | Go: `TestContiguousTranscodedFragmentsResumeAfterPublishedPrefix`, `TestDirectPrerollDoesNotRepublishPreviousWindowHead`, `TestLegalForwardPlaylistNeverShrinksPublishedTail`, and `TestLegalForwardPlaylistNeverRewritesPublishedIdentity`; Playwright: `never replaces or rewinds active playback when the next HLS fragment is delayed`, `restores the last presented position after an unsolicited media seek`, and `keeps source time monotonic while the HLS presentation advances across five windows` |
+| Readiness never exposes materialized cache outside the published generation during a presentation change; a pre-frame `409` is recovered once without an attach loop | Go: `TestPlaybackStatusUsesOnlyThePublishedPresentationForReadiness`; Playwright: `reprepares once when the presentation changes before the first frame` and `never replaces or rewinds active playback when the next HLS fragment is delayed` |
 | Direct and hybrid startup returns after the first complete target-covering fragment while the admitted window continues under one owner | Go: `TestWaitForDirectTargetReturnsBeforeTheWindowJobCompletes` and integration `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` |
+| GOP-aligned fragments that continuously cover a nominal interval, including a partially overlapping bridge between independently generated windows, terminate prefetch instead of re-enqueuing the same interval | Go: `TestNextUncoveredDirectSegmentAcceptsContiguousFragmentCoverage` and `TestDirectOverlapBridgeAdvancesMaterializedCoverage` |
 | A committed seek owns its exact target; older work cannot snap it back, jump to a live edge, or win a seek storm | Playwright seek tests covering 0 seconds, 22 minutes, retained history, delayed preparation, repeated events, and latest-target wins |
 | Temporary `429`/`503` admission pressure remains waitable and a newer seek cancels the old retries | Playwright: `retries transient streaming capacity without replacing the player or losing the seek target` and `cancels capacity retries when the user commits a newer seek` |
 | A selected text subtitle is part of readiness at startup and after a cold seek; fatal subtitle loss stops playback visibly | Playwright selected-subtitle tests plus Go scheduler/status tests `TestPlaybackStatusWaitsForSelectedSubtitleTarget`, `TestRequestedSubtitleWaitsForTargetVideoWithoutStoppingItsRemainder`, and `TestSelectedSubtitleJobFailureFailsItsPlaybackTarget` |
 | Advancing media time without new decoded video frames is detected as a playback stall | Playwright: `detects frozen video frames even while the player clock can advance` |
-| The real backend path produces decodable video and audio, selected WebVTT at the initial and distant targets, one reusable presentation, a fast cached return, and continued publication while cache enforcement snapshots active assets | Go integration: `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` using a local BitTorrent seeder and real FFmpeg/ffprobe; streaming changes additionally stress this scenario with repeated runs |
+| The real backend path produces decodable video and audio, selected WebVTT at the initial and distant targets, one reusable presentation, a fast cached return, generation-readable playlists for concurrent prepare calls, and continued publication while cache enforcement snapshots active assets | Go integration: `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` using a local BitTorrent seeder and real FFmpeg/ffprobe; streaming changes additionally stress this scenario with repeated runs |
 | Capped torrent storage cannot recurse until goroutine stack overflow | Go integration: `TestForkReaderBoundsCappedStorageRetriesUntilCancellation` against the selected torrent fork |
 | Unsupported tracker schemes cannot panic request handlers | Go: `TestAddMagnetIgnoresUnsupportedTrackerSchemes`; HTTP error behavior is covered by Playwright |
 | Cache pressure preserves leased and active HLS assets and synchronizes evicted torrent-piece completion | Go cache, asset-store, and `TestPieceEvictionUpdatesTorrentCompletion` integration tests |

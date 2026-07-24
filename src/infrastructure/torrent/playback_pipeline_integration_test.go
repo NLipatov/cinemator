@@ -149,17 +149,37 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 	}
 
 	retainedStarted := time.Now()
-	retainedPlaylist, err := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 0, false)
-	if err != nil {
-		t.Fatal(err)
+	type prepareResult struct {
+		playlist string
+		err      error
+	}
+	prepareResults := make(chan prepareResult, 2)
+	for range 2 {
+		go func() {
+			retainedPlaylist, prepareErr := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 0, false)
+			prepareResults <- prepareResult{playlist: retainedPlaylist, err: prepareErr}
+		}()
+	}
+	for range 2 {
+		result := <-prepareResults
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.playlist != playlist {
+			t.Fatalf("concurrent retained seek changed presentation: %q != %q", result.playlist, playlist)
+		}
 	}
 	retained := waitForPlaybackTarget(t, m, streamDir, 0, 2*time.Second)
-	if retainedPlaylist != playlist || retained.TargetSeconds != 0 {
-		t.Fatalf("retained seek changed presentation: playlist=%q status=%+v", retainedPlaylist, retained)
+	if retained.TargetSeconds != 0 {
+		t.Fatalf("concurrent retained seek status = %+v", retained)
 	}
 	if elapsed := time.Since(retainedStarted); elapsed > time.Second {
 		t.Fatalf("retained seek took %v, want cached readiness within 1s", elapsed)
 	}
+	if got := readPlaybackAsset(t, m, streamDir, "master.m3u8", retained.Generation); !strings.Contains(got, "index.m3u8") {
+		t.Fatalf("master playlist for ready generation is invalid:\n%s", got)
+	}
+	readPlaybackAsset(t, m, streamDir, "index.m3u8", retained.Generation)
 }
 
 func makePlaybackFixture(t *testing.T, dir string) string {

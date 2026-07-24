@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"math"
 	"path/filepath"
 	"sort"
@@ -427,11 +426,6 @@ func (s *streamInfo) markJobStage(job *segmentJob, stage domain.HlsStage) {
 		s.status.LastProgress = now
 	}
 	s.mtx.Unlock()
-	workClass := "foreground"
-	if job.background {
-		workClass = "background"
-	}
-	log.Printf("HLS job stage: dir=%s job=%s segments=[%d,%d) stage=%s class=%s", filepath.Base(s.paths.outDir), job.id, job.begin, job.end, stage, workClass)
 }
 
 func (s *streamInfo) packagerProgress(job *segmentJob) (source, output, diagnostic time.Time, rangeStart, rangeEnd int64) {
@@ -659,6 +653,7 @@ func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTime
 	targetIndex := -1
 	hasTarget := targetSeconds >= 0 && !math.IsNaN(targetSeconds) && !math.IsInf(targetSeconds, 0)
 
+	s.playlistMtx.RLock()
 	s.mtx.Lock()
 	if hasTarget {
 		target := timeline.locate(targetSeconds)
@@ -679,7 +674,7 @@ func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTime
 		if origin, ok := materializedPresentationOrigin(s.materializedWindows, s.presentationTarget); ok {
 			status.PresentationOriginSeconds = origin
 		}
-		publishedReady = directFragmentsCoverTime(s.materializedWindows, targetSeconds)
+		publishedReady = fragmentsCoverTime(s.publishedFragments, targetSeconds)
 		if s.fatalErr != nil {
 			status.Phase = domain.HlsPhaseError
 			status.Stage = domain.HlsStageError
@@ -712,6 +707,7 @@ func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTime
 		}
 	}
 	s.mtx.Unlock()
+	s.playlistMtx.RUnlock()
 	if s.source != nil && len(jobSnapshot.pieces) > 0 {
 		status.CacheBytes, status.PeerBytes = s.source.requestedPieceBytes(jobSnapshot.pieces)
 		status.MissingPieces, status.RangePieces = s.source.rangePieceCounts(jobSnapshot.rangeStart, jobSnapshot.rangeEnd-jobSnapshot.rangeStart)

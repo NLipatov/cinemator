@@ -445,6 +445,41 @@ test('reprepares a missing HLS session once and stops polling stale descriptors'
   expect([...statusRequests.values()]).toEqual([2, 2]);
 });
 
+test('reprepares once when the presentation changes before the first frame', async ({ page }) => {
+  const prepareStarts = await openMovie(page, {
+    stableStream: true,
+    bufferInitialFragment: false,
+    suppressVideoFrames: true,
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  await page.evaluate(() => {
+    window.__hlsInstances[0].emit(window.Hls.Events.ERROR, {
+      fatal: true,
+      details: 'levelLoadError',
+      response: { code: 409 },
+    });
+  });
+
+  await expect.poll(() => prepareStarts).toEqual([0, 0]);
+  await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(1);
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
+
+  await page.evaluate(() => {
+    window.__hlsInstances[1].emit(window.Hls.Events.ERROR, {
+      fatal: true,
+      details: 'levelLoadError',
+      response: { code: 409 },
+    });
+  });
+  await page.waitForTimeout(500);
+
+  expect(prepareStarts).toEqual([0, 0]);
+  expect(await page.evaluate(() => window.__hlsDestroyCount)).toBe(1);
+  await expect(page.locator('#playerMsg')).toContainText('The stream presentation changed before the player loaded it');
+});
+
 test('retries a temporary HLS status failure without rebuilding the stream', async ({ page }) => {
   let statusRequests = 0;
   const prepareStarts = await openMovie(page, {

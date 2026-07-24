@@ -179,6 +179,7 @@
         this.statusSeq = 0;
         this.statusTarget = null;
         this.missingStreamRecoveryAttempted = false;
+        this.presentationRecoveryAttempted = false;
         this.frameCallback = null;
         this.frameTimer = null;
         this.lastPresentedFrameAt = 0;
@@ -519,6 +520,24 @@
           missingStreamRecovery: true,
         });
       });
+    }
+
+    function recoverChangedHlsPresentation(targetSeconds) {
+      if (!playback.attaching || playback.hasPresentedFrame || playback.presentationRecoveryAttempted) {
+        return false;
+      }
+      playback.presentationRecoveryAttempted = true;
+      const requestSeq = playback.requestSeq;
+      destroyVideoAndHls({ resetLayout: false });
+      queueMicrotask(() => {
+        if (playback.requestSeq !== requestSeq || playback.hls !== null) return;
+        startPlayback(targetSeconds, {
+          keepPlayerVisible: true,
+          attemptKind: 'presentation_recovery',
+          presentationRecovery: true,
+        });
+      });
+      return true;
     }
 
     function beginHlsStatusPolling(targetSeconds, replace = false) {
@@ -1289,6 +1308,7 @@
       keepPlayerVisible = false,
       attemptKind = '',
       missingStreamRecovery = false,
+      presentationRecovery = false,
     } = {}) {
       playback.cancelSeekCommit();
       const magnet = $('magnet').value.trim();
@@ -1302,6 +1322,7 @@
       }
       const start = playback.mediaSeekable && Number.isFinite(resumeTime) && resumeTime > 0 ? resumeTime : 0;
       if (!missingStreamRecovery) playback.missingStreamRecoveryAttempted = false;
+      if (!presentationRecovery) playback.presentationRecoveryAttempted = false;
       const request = playback.beginRequest(start);
       playback.stopStatusPolling();
       // A gesture belongs to the presentation on which it happened. Carrying
@@ -1568,6 +1589,7 @@
       playback.lastPresentedFrameAt = now;
       playback.lastActivityAt = Date.now();
       playback.hasPresentedFrame = true;
+      playback.presentationRecoveryAttempted = false;
       playback.presentedFrameCount++;
       if (Number.isFinite(mediaTime)) playback.protectedMediaTime = mediaTime;
       const video = $('video');
@@ -2019,6 +2041,7 @@
           }
           const responseCode = Number(data?.response?.code || data?.response?.status || 0);
           if (responseCode === 409) {
+            if (recoverChangedHlsPresentation(sourceStart)) return;
             playback.attaching = false;
             showPlaybackError('The stream presentation changed before the player loaded it');
             return;

@@ -638,6 +638,13 @@ func TestPublishCachedTargetRebuildsOnlyItsContinuousPresentation(t *testing.T) 
 	if stream.presentationTarget != 220 || stream.playheadSegment != target.segment || stream.playlistSequence != target.segment || stream.assetVersion == "old" {
 		t.Fatalf("cached target state = target %.1f playhead %d sequence %d version %q", stream.presentationTarget, stream.playheadSegment, stream.playlistSequence, stream.assetVersion)
 	}
+	generation := stream.assetVersion
+	if err := manager.publishCachedTarget(stream, target); err != nil {
+		t.Fatal(err)
+	}
+	if stream.assetVersion != generation {
+		t.Fatalf("idempotent cached target changed generation: %q != %q", stream.assetVersion, generation)
+	}
 }
 
 func TestParseDirectSegmentOwner(t *testing.T) {
@@ -1114,6 +1121,30 @@ func TestDirectFragmentsCanBeAddedBeforeExistingHistory(t *testing.T) {
 	}
 }
 
+func TestDirectOverlapBridgeAdvancesMaterializedCoverage(t *testing.T) {
+	timeline := newPlaybackTimeline(2*time.Second, 15, 120)
+	windows := map[int][]ffmpeg.HLSFragment{
+		16: {
+			{Start: 57.84, Duration: 2.035, Name: "previous-17.ts"},
+			{Start: 59.802667, Duration: 2.072333, Name: "previous-18.ts"},
+		},
+	}
+	incoming := []ffmpeg.HLSFragment{
+		{Start: 59.375, Duration: 1.958333, Name: "preroll.ts"},
+		{Start: 61.258667, Duration: 2.116333, Name: "bridge.ts"},
+		{Start: 63.306667, Duration: 2.068333, Name: "continuation.ts"},
+	}
+
+	added := appendableDirectFragments(windows, incoming)
+	if len(added) != 2 || added[0].Name != "bridge.ts" || added[1].Name != "continuation.ts" {
+		t.Fatalf("appendable overlap bridge = %#v", added)
+	}
+	windows[31] = added
+	if begin := nextUncoveredDirectSegment(windows, timeline, 31, 46); begin != 32 {
+		t.Fatalf("next uncovered segment = %d, want 32", begin)
+	}
+}
+
 func TestContiguousTranscodedFragmentsResumeAfterPublishedPrefix(t *testing.T) {
 	fragments := []ffmpeg.HLSFragment{
 		{Start: 16, Duration: 2, Name: videoSegmentName(8)},
@@ -1175,6 +1206,24 @@ func TestNextUncoveredDirectSegmentRequiresTheWholeSegment(t *testing.T) {
 	windows[0][0].Duration = 4
 	if begin := nextUncoveredDirectSegment(windows, timeline, 0, 15); begin != 2 {
 		t.Fatalf("next uncovered segment = %d, want 2", begin)
+	}
+}
+
+func TestNextUncoveredDirectSegmentAcceptsContiguousFragmentCoverage(t *testing.T) {
+	timeline := newPlaybackTimeline(2*time.Second, 15, 120)
+	windows := map[int][]ffmpeg.HLSFragment{
+		0: {
+			{Start: 0, Duration: 0.9, Name: "first.m4s"},
+			{Start: 0.9, Duration: 1.2, Name: "second.m4s"},
+		},
+	}
+	if begin := nextUncoveredDirectSegment(windows, timeline, 0, 15); begin != 1 {
+		t.Fatalf("next uncovered segment = %d, want 1", begin)
+	}
+
+	windows[0][1].Start = 1.3
+	if begin := nextUncoveredDirectSegment(windows, timeline, 0, 15); begin != 0 {
+		t.Fatalf("next uncovered segment with a gap = %d, want 0", begin)
 	}
 }
 

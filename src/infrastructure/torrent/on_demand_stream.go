@@ -360,13 +360,14 @@ func (m *manager) requestVideoTarget(s *streamInfo, target playbackTarget) {
 	}
 
 	s.markPreparing(target.segment, target.sourceSeconds)
+	s.playlistMtx.RLock()
 	s.mtx.Lock()
 	if s.closing || s.fatalErr != nil {
 		s.mtx.Unlock()
+		s.playlistMtx.RUnlock()
 		return
 	}
-	currentPresentation := materializedFragmentsForTarget(s.materializedWindows, s.presentationTarget)
-	current := fragmentsCoverTime(currentPresentation, target.sourceSeconds)
+	current := fragmentsCoverTime(s.publishedFragments, target.sourceSeconds)
 	cached := !current && directFragmentsCoverTime(s.materializedWindows, target.sourceSeconds)
 	if current || cached {
 		if current {
@@ -376,6 +377,7 @@ func (m *manager) requestVideoTarget(s *streamInfo, target playbackTarget) {
 		}
 		setPlaybackTargetLocked(s, target)
 		s.mtx.Unlock()
+		s.playlistMtx.RUnlock()
 		if cached {
 			if err := m.publishCachedTarget(s, target); err != nil {
 				s.markSegmentError(target.segment, err)
@@ -390,6 +392,7 @@ func (m *manager) requestVideoTarget(s *streamInfo, target playbackTarget) {
 	timeline := m.timeline(s.mediaInfo.Duration)
 	if !timeline.containsSegment(target.segment) {
 		s.mtx.Unlock()
+		s.playlistMtx.RUnlock()
 		s.markSegmentError(target.segment, errors.New("video segment out of range"))
 		return
 	}
@@ -405,12 +408,14 @@ func (m *manager) requestVideoTarget(s *streamInfo, target playbackTarget) {
 	job, jobCtx, created, err := s.acquireJobLocked(videoSegmentJob, target.segment, begin, end, false, m.scheduler, m.settings.MaxJobsPerStream())
 	if err != nil {
 		s.mtx.Unlock()
+		s.playlistMtx.RUnlock()
 		s.markSegmentError(target.segment, err)
 		return
 	}
 	setPlaybackTargetLocked(s, target)
 	job.targetSeconds = target.sourceSeconds
 	s.mtx.Unlock()
+	s.playlistMtx.RUnlock()
 	if created {
 		go m.runVideoJob(s, jobCtx, job)
 	}
@@ -1176,8 +1181,17 @@ func (m *manager) publishCachedPresentation(s *streamInfo, target playbackTarget
 	defer s.playlistMtx.Unlock()
 
 	s.mtx.Lock()
+	if s.closing {
+		s.mtx.Unlock()
+		return nil
+	}
+	if rotate && fragmentsCoverTime(s.publishedFragments, target.sourceSeconds) {
+		setPlaybackTargetLocked(s, target)
+		s.mtx.Unlock()
+		return nil
+	}
 	if !rotate {
-		if s.closing || target.segment <= s.playlistAnchor {
+		if target.segment <= s.playlistAnchor {
 			s.mtx.Unlock()
 			return nil
 		}
@@ -1373,13 +1387,10 @@ func appendableDirectFragments(windows map[int][]ffmpeg.HLSFragment, incoming []
 	})
 	result := incoming[:0]
 	for _, fragment := range incoming {
-		var ok bool
-		fragment, ok = trimMaterializedOverlap(fragment, existing)
-		if !ok {
-			continue
-		}
-		fragment, ok = trimMaterializedOverlap(fragment, result)
-		if !ok {
+		coverage := make([]ffmpeg.HLSFragment, 0, len(existing)+len(result))
+		coverage = append(coverage, existing...)
+		coverage = append(coverage, result...)
+		if !fragmentExtendsCoverage(fragment, coverage) {
 			continue
 		}
 		result = append(result, fragment)
@@ -1417,27 +1428,31 @@ func transcodedWindowResult(fragments []ffmpeg.HLSFragment, reachedEnd bool) ffm
 	}
 }
 
-func trimMaterializedOverlap(candidate ffmpeg.HLSFragment, fragments []ffmpeg.HLSFragment) (ffmpeg.HLSFragment, bool) {
+func fragmentExtendsCoverage(candidate ffmpeg.HLSFragment, fragments []ffmpeg.HLSFragment) bool {
 	const tolerance = 0.001
-	for _, fragment := range fragments {
-		start := candidate.Start
-		end := start + candidate.Duration
-		otherStart := fragment.Start
-		otherEnd := otherStart + fragment.Duration
-		if start >= otherEnd-tolerance || otherStart >= end-tolerance {
-			continue
-		}
-		if overlap := otherEnd - start; start >= otherStart && overlap <= 0.25 {
-			candidate.Start = otherEnd
-			continue
-		}
-		if overlap := end - otherStart; end <= otherEnd && overlap <= 0.25 {
-			candidate.Duration -= overlap
-			continue
-		}
-		return ffmpeg.HLSFragment{}, false
+	if candidate.Duration <= tolerance {
+		return false
 	}
-	return candidate, candidate.Duration > tolerance
+	coverage := append([]ffmpeg.HLSFragment(nil), fragments...)
+	sort.Slice(coverage, func(i, j int) bool {
+		return coverage[i].Start < coverage[j].Start
+	})
+	cursor := candidate.Start
+	end := candidate.Start + candidate.Duration
+	for _, fragment := range coverage {
+		fragmentEnd := fragment.Start + fragment.Duration
+		if fragmentEnd <= cursor+tolerance {
+			continue
+		}
+		if fragment.Start > cursor+tolerance {
+			return true
+		}
+		cursor = max(cursor, fragmentEnd)
+		if cursor >= end-tolerance {
+			return false
+		}
+	}
+	return cursor < end-tolerance
 }
 
 func nextUncoveredDirectSegment(windows map[int][]ffmpeg.HLSFragment, timeline playbackTimeline, begin, end int) int {
@@ -1456,17 +1471,21 @@ func materializedSegmentCovered(windows map[int][]ffmpeg.HLSFragment, timeline p
 	}
 	start := timeline.segmentStart(index)
 	end := timeline.segmentEnd(index)
-	for _, fragments := range windows {
-		for _, fragment := range fragments {
-			if fragment.Start <= start+0.25 && fragment.Start+fragment.Duration >= end-0.25 {
-				return true
-			}
-		}
+	fragments := materializedFragmentsForTarget(windows, start+0.001)
+	if len(fragments) == 0 || fragments[0].Start > start+0.25 {
+		return false
 	}
-	return false
+	coveredEnd := fragments[0].Start + fragments[0].Duration
+	for _, fragment := range fragments[1:] {
+		coveredEnd = max(coveredEnd, fragment.Start+fragment.Duration)
+	}
+	return coveredEnd >= end-0.25
 }
 
 func (m *manager) switchToTranscode(s *streamInfo, current *segmentJob) error {
+	s.playlistMtx.Lock()
+	defer s.playlistMtx.Unlock()
+
 	s.mtx.Lock()
 	if !s.directPlay {
 		s.mtx.Unlock()
@@ -1499,8 +1518,6 @@ func (m *manager) switchToTranscode(s *streamInfo, current *segmentJob) error {
 	sourceEnded := s.sourceEnded
 	s.mtx.Unlock()
 
-	s.playlistMtx.Lock()
-	defer s.playlistMtx.Unlock()
 	err := ffmpeg.PrepareOnDemandHLS(
 		s.paths.outDir,
 		s.paths.videoPlaylist,

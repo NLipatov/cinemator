@@ -60,6 +60,9 @@ func TestPlaybackStatusWaitsForSelectedSubtitleTarget(t *testing.T) {
 		materializedWindows: map[int][]ffmpeg.HLSFragment{
 			0: {{Start: 0, Duration: 2, Name: videoSegmentName(0)}},
 		},
+		publishedFragments: []ffmpeg.HLSFragment{
+			{Start: 0, Duration: 2, Name: videoSegmentName(0)},
+		},
 		status:       domain.HlsStatus{Phase: domain.HlsPhasePreparing},
 		videoJobs:    make(map[*segmentJob]struct{}),
 		subtitleJobs: make(map[*segmentJob]struct{}),
@@ -73,6 +76,43 @@ func TestPlaybackStatusWaitsForSelectedSubtitleTarget(t *testing.T) {
 	readyStatus := stream.playbackStatus(0, timeline, time.Now(), 1, 1, true)
 	if readyStatus.Phase != domain.HlsPhaseReady {
 		t.Fatalf("status after subtitle = %+v", readyStatus)
+	}
+}
+
+func TestPlaybackStatusUsesOnlyThePublishedPresentationForReadiness(t *testing.T) {
+	ready := make(chan struct{})
+	close(ready)
+	now := time.Now()
+	job := &segmentJob{
+		begin:        0,
+		end:          1,
+		stage:        domain.HlsStagePackaging,
+		startedAt:    now,
+		lastProgress: now,
+	}
+	stream := &streamInfo{
+		ready: ready,
+		mediaInfo: domain.MediaInfo{
+			Duration: 120,
+			Seekable: true,
+		},
+		materializedWindows: map[int][]ffmpeg.HLSFragment{
+			0: {{Start: 0, Duration: 2, Name: videoSegmentName(0)}},
+		},
+		status:    domain.HlsStatus{Phase: domain.HlsPhasePreparing},
+		videoJobs: map[*segmentJob]struct{}{job: {}},
+	}
+	timeline := newPlaybackTimeline(2*time.Second, 15, 120)
+
+	changing := stream.playbackStatus(0, timeline, now, 1, 1, true)
+	if changing.Phase != domain.HlsPhasePreparing {
+		t.Fatalf("status during foreground presentation change = %+v", changing)
+	}
+
+	stream.publishedFragments = append([]ffmpeg.HLSFragment(nil), stream.materializedWindows[0]...)
+	published := stream.playbackStatus(0, timeline, now, 1, 1, true)
+	if published.Phase != domain.HlsPhaseReady {
+		t.Fatalf("status after target publication = %+v", published)
 	}
 }
 
