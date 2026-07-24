@@ -2,7 +2,7 @@
 
 Status: current release contract and implementation audit
 
-Last audited: 2026-07-23
+Last audited: 2026-07-24
 
 ## Purpose and authority
 
@@ -69,15 +69,17 @@ selected-subtitle fidelity remain hard constraints around those outcomes.
 | `PLAY-02` | Without an explicit user command, presented source time only advances monotonically. It may pause during a stall but must not jump, rewind, restart at zero, or chase the LIVE edge. | **Gated.** Playwright covers delayed fragments, unsolicited media seeks, live-edge events, and five advancing windows. |
 | `PLAY-03` | After the first presented frame, playlist refresh, buffer underrun, cache pressure, decoder error, and background recovery must not replace the video element, hls.js instance, source duration, or playhead. Before the first frame, a stale presentation may be prepared and attached one additional time; a second conflict is visible instead of looping. | **Gated.** Playwright covers delayed and failed fragments, cold-seek preparation, stable-presentation reuse, and bounded stale-generation recovery. |
 | `PLAY-04` | Known source duration is independent of the currently materialized HLS range and remains visible during loading and seeking. Unknown duration remains progressive and is never guessed from bitrate. | **Gated.** Playwright covers full duration and unknown-duration playback; Go timeline and probe tests cover clamping and duration refinement. |
-| `PLAY-05` | A committed seek has one exact source target. Only a newer explicit user gesture may replace it; scrub intermediates, late decoded frames from the old position, a trailing media/HLS snap-back after the completed gesture, and superseded asynchronous work are cancelled or ignored. | **Gated.** Playwright covers pointer and keyboard gesture boundaries, late-frame ownership, cancelled gestures, seek storms, repeated events, unbuffered snap-back, zero, 22 minutes, latest-target wins, and capacity retry cancellation; Go session tests cover job ownership. |
+| `PLAY-05` | A committed seek has one exact source target. The application-owned timeline is the sole browser boundary that may create or replace that target; media-element and hls.js seek events are internal effects. Scrub intermediates, late decoded frames from the old position, a trailing media/HLS snap-back, and superseded asynchronous work are cancelled or ignored. | **Gated.** Playwright clicks and drives the public timeline with pointer and keyboard input, then covers late-frame ownership, cancelled gestures, seek storms, repeated events, unbuffered snap-back, zero, 22 minutes, latest-target wins, and capacity retry cancellation; Go session tests cover job ownership. |
 | `PLAY-06` | A retained seek reuses browser or current-presentation media. A cached seek reuses complete server assets. A cold seek prepares the missing target, then rebuilds the bounded backward and forward byte horizon around the new playhead. | **Gated** for retained/current-presentation behavior and two-sided plan arithmetic, and **covered** by the local torrent/FFmpeg pipeline for server-cache reuse. There is no production cache-hit SLI yet. |
 | `PLAY-07` | Temporary capacity pressure is waitable and preserves the player and target. It must not become an immediate fatal error or an unbounded retry loop. A newer seek cancels the old retries. | **Gated.** Playwright covers `429`/`503` recovery and cancellation. |
 | `PLAY-08` | Autoplay rejection is visible user state and does not count as infinite startup. Measurement restarts from the confirming Play command. | **Gated.** Playwright covers autoplay rejection and QoE attempt restart. |
 | `PLAY-09` | If selected video produces an advancing media clock without decoded frames, the client detects it and uses an explicit compatibility fallback or reports a terminal error. | **Gated.** Playwright covers frozen and suppressed decoded frames. |
+| `PLAY-10` | Explicit Pause and Resume intent belongs to the playback session, not to one hls.js attachment. Controls remain actionable during startup, seek, recovery, and track preparation; replacing a presentation never starts paused playback or cancels a requested resume. | **Gated.** Playwright pauses before the first presentation is ready and during a cold seek, verifies the replacement stays paused, then resumes it explicitly. |
 
-Explicit user commands are Play on another file, a committed seek, and an
-audio or subtitle selection change. A library callback, playlist update,
-timeout, retry, or cache event is not a user command.
+Explicit user commands are Play on another file, a command through the
+application-owned seek timeline, and an audio or subtitle selection change. A
+media-element seek event, library callback, playlist update, timeout, retry, or
+cache event is not a user command.
 
 ### Selected tracks and media fidelity
 

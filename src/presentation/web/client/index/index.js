@@ -163,9 +163,6 @@
         this.streamDir = null;
         this.generation = '';
         this.attaching = false;
-        this.userSeekPointerActive = false;
-        this.userSeekIntentAvailable = false;
-        this.userSeekIntentUntil = 0;
         this.protectedMediaTime = null;
         this.committedSeekMediaTime = null;
         this.restoringPlayhead = false;
@@ -247,43 +244,6 @@
           commit(target);
         }, seekCommitDelayMs);
       }
-      clearUserSeekIntent() {
-        this.userSeekPointerActive = false;
-        this.userSeekIntentAvailable = false;
-        this.userSeekIntentUntil = 0;
-      }
-      beginPointerSeekIntent() {
-        this.userSeekPointerActive = true;
-        this.userSeekIntentAvailable = true;
-        this.userSeekIntentUntil = Date.now() + 5000;
-      }
-      endPointerSeekIntent() {
-        this.userSeekPointerActive = false;
-        // Some native controls apply their one seek only after pointerup. Keep
-        // that unconsumed event, but close a gesture that already chose a target.
-        this.userSeekIntentUntil = this.userSeekIntentAvailable ? Date.now() + 500 : 0;
-      }
-      beginKeyboardSeekIntent() {
-        this.userSeekPointerActive = false;
-        this.userSeekIntentAvailable = true;
-        this.userSeekIntentUntil = Date.now() + 1500;
-      }
-      acceptUserSeekEvent() {
-        if (Date.now() > this.userSeekIntentUntil) {
-          this.clearUserSeekIntent();
-          return false;
-        }
-        // Active scrubbing may emit many positions. Outside the active pointer
-        // gesture, one pending event is consumed so media/HLS cannot inherit it.
-        if (this.userSeekPointerActive) {
-          this.userSeekIntentAvailable = false;
-          return true;
-        }
-        if (!this.userSeekIntentAvailable) return false;
-        this.userSeekIntentAvailable = false;
-        this.userSeekIntentUntil = 0;
-        return true;
-      }
       commitSeekPosition(mediaTime) {
         if (Number.isFinite(mediaTime)) this.committedSeekMediaTime = mediaTime;
       }
@@ -320,7 +280,10 @@
       { days: 7, label: '7 days' },
       { days: 30, label: '30 days' },
     ];
-    function destroyVideoAndHls({ resetLayout = true } = {}) {
+    function destroyVideoAndHls({
+      resetLayout = true,
+      preserveTransport = false,
+    } = {}) {
       if (playback.events) { playback.events.abort(); playback.events = null; }
       if (playback.frameCallback !== null && $('video')?.cancelVideoFrameCallback) {
         $('video').cancelVideoFrameCallback(playback.frameCallback);
@@ -329,8 +292,10 @@
       if (playback.frameTimer) clearInterval(playback.frameTimer);
       playback.frameTimer = null;
       finishPlaybackStall(performance.now());
-      playback.playIntent = false;
-      playback.autoplayBlocked = false;
+      if (!preserveTransport) {
+        playback.playIntent = false;
+        playback.autoplayBlocked = false;
+      }
       playback.cancelSeekCommit();
       if (hasQoeData()) publishQoeSummary();
       playback.stallStartedAt = 0;
@@ -339,7 +304,6 @@
       playback.streamDir = null;
       playback.generation = '';
       playback.attaching = false;
-      playback.clearUserSeekIntent();
       playback.protectedMediaTime = null;
       playback.committedSeekMediaTime = null;
       playback.restoringPlayhead = false;
@@ -588,7 +552,7 @@
       }
       playback.presentationRecoveryAttempted = true;
       const requestSeq = playback.requestSeq;
-      destroyVideoAndHls({ resetLayout: false });
+      destroyVideoAndHls({ resetLayout: false, preserveTransport: true });
       queueMicrotask(() => {
         if (playback.requestSeq !== requestSeq || playback.hls !== null) return;
         startPlayback(targetSeconds, {
@@ -1385,17 +1349,13 @@
       if (!presentationRecovery) playback.presentationRecoveryAttempted = false;
       const request = playback.beginRequest(start);
       playback.stopStatusPolling();
-      // A gesture belongs to the presentation on which it happened. Carrying
-      // it into the next attach can turn hls.js's internal positioning seek
-      // into another application-level seek and recursively rebuild at 0:00.
-      playback.clearUserSeekIntent();
       const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
       const retainedHls = keepPlayerVisible ? playback.hls : null;
       if (retainedHls?.stopLoad) {
         retainedHls.stopLoad();
       } else {
-        destroyVideoAndHls({ resetLayout: !wasPlaying });
+        destroyVideoAndHls({ resetLayout: !wasPlaying, preserveTransport: true });
       }
       const kind = attemptKind || (wasPlaying ? 'seek' : 'startup');
       beginPresentationAttempt(kind, start, kind === 'seek' ? 'pending' : '');
@@ -1442,7 +1402,7 @@
           prepared.stream === playback.streamDir &&
           readyStatus.generation && readyStatus.generation === playback.generation;
         if (retainedHls && playback.hls === retainedHls && !reusesPresentation) {
-          destroyVideoAndHls({ resetLayout: false });
+          destroyVideoAndHls({ resetLayout: false, preserveTransport: true });
         }
         playback.streamDir = prepared.stream;
         playback.generation = readyStatus.generation || '';
@@ -1486,6 +1446,8 @@
     $('play').onclick = () => {
       playback.forceTranscode = false;
       playback.nativeRetries = 0;
+      playback.playIntent = true;
+      syncPlaybackControls();
       startPlayback(0);
     };
     ['audioSelect', 'subtitleSelect'].forEach(id => {
@@ -1653,6 +1615,7 @@
       playback.presentationRecoveryAttempted = false;
       playback.presentedFrameCount++;
       const video = $('video');
+      syncPlaybackControls(video);
       if (playback.presentationAttempt && qoePresentationEligible(video)) {
         finishPresentationAttempt('presented', now);
       }
@@ -1764,100 +1727,192 @@
       }, { once: true });
     }
 
+    function playbackControlTime(video) {
+      const committed = playback.restorationMediaTime();
+      return Number.isFinite(committed) ? committed : Math.max(0, Number(video?.currentTime) || 0);
+    }
+
+    function syncPlaybackControls(video = $('video')) {
+      if (!video) return;
+      const duration = Math.max(0, Number(playback.mediaInfo?.duration) || Number(video.duration) || 0);
+      const currentTime = Math.min(duration || Number.MAX_SAFE_INTEGER, playbackControlTime(video));
+      const timeline = $('seekTimeline');
+      if (timeline) {
+        timeline.max = String(duration);
+        timeline.value = String(currentTime);
+        timeline.disabled = duration <= 0 || !playback.mediaSeekable;
+        timeline.setAttribute(
+          'aria-valuetext',
+          `${formatPlaybackTime(currentTime)} of ${formatPlaybackTime(duration)}`,
+        );
+      }
+      if ($('currentTimeLabel')) $('currentTimeLabel').value = formatPlaybackTime(currentTime);
+      if ($('durationLabel')) $('durationLabel').value = formatPlaybackTime(duration);
+      if ($('playPauseBtn')) {
+        $('playPauseBtn').textContent = playback.playIntent ? 'Pause' : 'Resume';
+        $('playPauseBtn').setAttribute('aria-label', playback.playIntent ? 'Pause playback' : 'Resume playback');
+      }
+      if ($('muteBtn')) {
+        const muted = video.muted || video.volume === 0;
+        $('muteBtn').textContent = muted ? 'Unmute' : 'Mute';
+        $('muteBtn').setAttribute('aria-label', muted ? 'Unmute' : 'Mute');
+      }
+      if ($('volumeControl')) $('volumeControl').value = String(video.volume);
+    }
+
+    function syncFullscreenControl() {
+      const button = $('fullscreenBtn');
+      if (!button) return;
+      const active = Boolean(document.fullscreenElement);
+      button.textContent = active ? 'Exit full screen' : 'Full screen';
+      button.setAttribute('aria-label', active ? 'Exit full screen' : 'Enter full screen');
+    }
+
+    function commitColdSeek(target) {
+      const duration = Number(playback.mediaInfo?.duration);
+      if (duration > 0) {
+        startPlayback(Math.min(target, Math.max(0, duration - 0.001)), { keepPlayerVisible: true });
+      } else {
+        beginHlsStatusPolling(target, true);
+      }
+    }
+
+    function requestUserSeek(mediaTime, video = $('video')) {
+      const duration = Number(playback.mediaInfo?.duration);
+      const upperBound = duration > 0 ? Math.max(0, duration - 0.001) : Number.MAX_SAFE_INTEGER;
+      const nextMediaTime = Math.min(upperBound, Math.max(0, Number(mediaTime) || 0));
+      const target = playback.timeline.sourceTime(nextMediaTime);
+      playback.attaching = false;
+      playback.commitSeekPosition(nextMediaTime);
+      video.currentTime = nextMediaTime;
+      syncPlaybackControls(video);
+      const retained = playback.timeline.contains(
+        target,
+        mediaBufferedRanges(video),
+        playback.hls?.latestLevelDetails?.fragments,
+      );
+      if (playback.requestController) {
+        if (playback.isRequesting(target)) return;
+        playback.cancelRequest();
+        if (retained) {
+          playback.cancelSeekCommit();
+          beginPresentationAttempt('seek', target, 'retained');
+          if (playback.hls?.startLoad) playback.hls.startLoad(playback.timeline.hlsTime(target));
+          playback.lastActivityAt = Date.now();
+          removeWarning();
+          showPlaybackNotice();
+          beginHlsStatusPolling(target);
+        } else {
+          playback.scheduleSeekCommit(target, commitColdSeek);
+        }
+        return;
+      }
+      if (retained) {
+        playback.cancelSeekCommit();
+        beginPresentationAttempt('seek', target, 'retained');
+        beginHlsStatusPolling(target, true);
+        return;
+      }
+      playback.scheduleSeekCommit(target, commitColdSeek);
+    }
+
+    function attachPlaybackControls() {
+      $('seekTimeline')?.addEventListener('input', event => {
+        requestUserSeek(Number(event.currentTarget.value));
+      });
+      $('playPauseBtn')?.addEventListener('click', () => {
+        const video = $('video');
+        if (playback.playIntent) {
+          playback.playIntent = false;
+          if (!video.paused) {
+            video.pause();
+          } else {
+            finishPlaybackStall();
+            publishQoeSummary();
+            syncPlaybackControls(video);
+          }
+          return;
+        }
+        playback.playIntent = true;
+        syncPlaybackControls(video);
+        if (!playback.hls || !video.paused) return;
+        video.play().catch(error => {
+          if (error?.name !== 'NotAllowedError') return;
+          playback.playIntent = false;
+          playback.autoplayBlocked = true;
+          syncPlaybackControls(video);
+          showMsg('playerMsg', 'Video is ready. Press Play to begin.', false, true);
+        });
+      });
+      $('muteBtn')?.addEventListener('click', () => {
+        const video = $('video');
+        video.muted = !video.muted;
+        syncPlaybackControls(video);
+      });
+      $('volumeControl')?.addEventListener('input', event => {
+        const video = $('video');
+        video.volume = Number(event.currentTarget.value);
+        if (video.volume > 0) video.muted = false;
+        syncPlaybackControls(video);
+      });
+      $('fullscreenBtn')?.addEventListener('click', async () => {
+        try {
+          if (document.fullscreenElement) {
+            await document.exitFullscreen?.();
+          } else {
+            await $('player-block')?.requestFullscreen?.();
+          }
+        } catch (_) {
+          showMsg('playerMsg', 'Full-screen mode is unavailable in this browser.', true);
+        }
+      });
+      document.addEventListener('fullscreenchange', syncFullscreenControl);
+    }
+
+    attachPlaybackControls();
+
     function attachPlaybackRecovery(video, signal) {
       const options = { signal };
-      const commitColdSeek = target => {
-        const duration = Number(playback.mediaInfo?.duration);
-        if (duration > 0) {
-          startPlayback(Math.min(target, Math.max(0, duration - 0.001)), { keepPlayerVisible: true });
-        } else {
-          beginHlsStatusPolling(target, true);
-        }
-      };
       video.addEventListener('play', () => {
-        // A pointer/key gesture that resolves to a transport action did not
-        // request a timeline change. Do not let a later hls.js positioning
-        // seek inherit that gesture.
-        playback.clearUserSeekIntent();
         playback.playIntent = true;
         if (playback.autoplayBlocked) {
           playback.autoplayBlocked = false;
           beginPresentationAttempt('autoplay_resume', playback.timeline.sourceTime(video.currentTime));
         }
         updateQoePlayingTime();
+        syncPlaybackControls(video);
       }, options);
       video.addEventListener('pause', () => {
-        playback.clearUserSeekIntent();
         finishPlaybackStall();
         playback.playIntent = false;
         publishQoeSummary();
+        syncPlaybackControls(video);
       }, options);
       video.addEventListener('playing', () => {
         playback.timeline.anchor(video.currentTime);
         showPlaybackNotice();
         removeWarning();
+        syncPlaybackControls(video);
       }, options);
-      video.addEventListener('pointerdown', () => {
-        playback.beginPointerSeekIntent();
-      }, options);
-      video.addEventListener('pointerup', () => playback.endPointerSeekIntent(), options);
-      video.addEventListener('pointercancel', () => playback.clearUserSeekIntent(), options);
-      video.addEventListener('keydown', () => {
-        playback.beginKeyboardSeekIntent();
-      }, options);
-      video.addEventListener('volumechange', () => {
-        playback.clearUserSeekIntent();
-      }, options);
+      video.addEventListener('timeupdate', () => syncPlaybackControls(video), options);
+      video.addEventListener('durationchange', () => syncPlaybackControls(video), options);
+      video.addEventListener('volumechange', () => syncPlaybackControls(video), options);
       video.addEventListener('seeking', () => {
         finishPlaybackStall();
         updateQoePlayingTime();
-        const userInitiated = playback.acceptUserSeekEvent();
-        // Browser and hls.js may emit seeking while attaching, refreshing a
-        // live playlist, or recovering a decoder. Those events never grant the
-        // application permission to prepare or attach another presentation.
-        if (!userInitiated) {
-          const protectedTime = playback.restorationMediaTime();
-          const nextTime = Number(video.currentTime);
-          if (!playback.attaching && !playback.restoringPlayhead &&
-            Number.isFinite(protectedTime) && Number.isFinite(nextTime) &&
-            Math.abs(nextTime - protectedTime) > 0.05) {
-            playback.restoringPlayhead = true;
-            video.currentTime = protectedTime;
-            queueMicrotask(() => { playback.restoringPlayhead = false; });
-          }
-          return;
+        // User seeks enter through the application-owned timeline. Any other
+        // media seek belongs to attachment, playlist refresh, or decoder
+        // recovery and cannot replace the committed application position.
+        const protectedTime = playback.restorationMediaTime();
+        const nextTime = Number(video.currentTime);
+        if (!playback.attaching && !playback.restoringPlayhead &&
+          Number.isFinite(protectedTime) && Number.isFinite(nextTime) &&
+          Math.abs(nextTime - protectedTime) > 0.05) {
+          playback.restoringPlayhead = true;
+          video.currentTime = protectedTime;
+          queueMicrotask(() => { playback.restoringPlayhead = false; });
         }
-        playback.attaching = false;
-        const target = playback.timeline.sourceTime(video.currentTime);
-        playback.commitSeekPosition(Number(video.currentTime));
-        const retained = playback.timeline.contains(
-          target,
-          mediaBufferedRanges(video),
-          playback.hls?.latestLevelDetails?.fragments,
-        );
-        if (playback.requestController) {
-          if (playback.isRequesting(target)) return;
-          playback.cancelRequest();
-          if (retained) {
-            playback.cancelSeekCommit();
-            beginPresentationAttempt('seek', target, 'retained');
-            if (playback.hls?.startLoad) playback.hls.startLoad(playback.timeline.hlsTime(target));
-            playback.lastActivityAt = Date.now();
-            removeWarning();
-            showPlaybackNotice();
-            beginHlsStatusPolling(target);
-          } else {
-            playback.scheduleSeekCommit(target, commitColdSeek);
-          }
-          return;
-        }
-        if (retained) {
-          playback.cancelSeekCommit();
-          beginPresentationAttempt('seek', target, 'retained');
-          beginHlsStatusPolling(target, true);
-          return;
-        }
-        playback.scheduleSeekCommit(target, commitColdSeek);
+        syncPlaybackControls(video);
       }, options);
       video.addEventListener('seeked', () => {
         updateQoePlayingTime();
@@ -1889,6 +1944,8 @@
         }
         showPlaybackError('Native media error');
       }, options);
+      syncPlaybackControls(video);
+      syncFullscreenControl();
     }
 
     function hlsPlaylistLoadPolicy() {
@@ -1941,7 +1998,6 @@
         mainFragBuffered = currentPositionBuffered();
         if (!mainFragBuffered) return false;
         playback.attaching = false;
-        playback.clearUserSeekIntent();
         playback.timeline.anchor(video.currentTime);
         playback.nativeRetries = 0;
         playback.missingStreamRecoveryAttempted = false;
@@ -1954,13 +2010,13 @@
         playback.lastActivityAt = Date.now();
       }
       function requestPlaybackStart() {
-        if (playbackStartRequested || !video.paused) return;
+        if (!playback.playIntent || playbackStartRequested || !video.paused) return;
         playbackStartRequested = true;
-        playback.playIntent = true;
         video.play().catch(error => {
           if (error?.name === 'NotAllowedError') {
             playback.playIntent = false;
             playback.autoplayBlocked = true;
+            syncPlaybackControls(video);
             const now = performance.now();
             if (finishPresentationAttempt('autoplay_blocked', now)) {
               publishQoeSummary(now);

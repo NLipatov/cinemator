@@ -92,7 +92,20 @@
       </div>
 
       <div id="player-block" class="player-stage step" style="display:none">
-        <video id="video" controls autoplay playsinline></video>
+        <video id="video" autoplay playsinline></video>
+        <div class="player-controls" role="group" aria-label="Playback controls">
+          <button id="playPauseBtn" class="player-control-button" type="button"
+                  aria-label="Resume playback">Resume</button>
+          <output id="currentTimeLabel" class="player-time" for="seekTimeline">0:00</output>
+          <input id="seekTimeline" class="player-timeline" type="range"
+                 min="0" max="0" step="0.001" value="0" aria-label="Seek">
+          <output id="durationLabel" class="player-time" for="seekTimeline">0:00</output>
+          <button id="muteBtn" class="player-control-button" type="button" aria-label="Mute">Mute</button>
+          <input id="volumeControl" class="player-volume" type="range"
+                 min="0" max="1" step="0.05" value="1" aria-label="Volume">
+          <button id="fullscreenBtn" class="player-control-button" type="button"
+                  aria-label="Enter full screen">Full screen</button>
+        </div>
         <div class="player-toolbar">
           <button id="mediaInfoBtn" class="media-info-button" type="button" hidden>Media info</button>
         </div>
