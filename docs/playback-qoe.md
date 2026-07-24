@@ -70,6 +70,11 @@ playlist errors, empty forward buffers, and unsolicited media `seeking` events.
 They verify that the video element, hls.js instance, duration, and last
 presented position remain stable until the user issues a command.
 
+A seek gesture may emit multiple scrub positions while it is active. Once that
+gesture has committed a target and ended, a trailing `seeking` event from the
+media element or hls.js is not a new user command. It MUST NOT replace the
+committed target or cancel preparation of its missing presentation.
+
 Before the first presented frame, the client MAY discard one attachment whose
 playlist generation became stale between readiness and loading. It MUST prepare
 the same source target again at most once. A repeated generation conflict is a
@@ -464,7 +469,7 @@ before running Go tests.
 | Readiness never exposes materialized cache outside the published generation during a presentation change; a pre-frame `409` is recovered once without an attach loop | Go: `TestPlaybackStatusUsesOnlyThePublishedPresentationForReadiness`; Playwright: `reprepares once when the presentation changes before the first frame` and `never replaces or rewinds active playback when the next HLS fragment is delayed` |
 | Direct and hybrid startup returns after the first complete target-covering fragment while the admitted window continues under one owner | Go: `TestWaitForDirectTargetReturnsBeforeTheWindowJobCompletes` and integration `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` |
 | GOP-aligned fragments that continuously cover a nominal interval, including a partially overlapping bridge between independently generated windows, terminate prefetch instead of re-enqueuing the same interval | Go: `TestNextUncoveredDirectSegmentAcceptsContiguousFragmentCoverage` and `TestDirectOverlapBridgeAdvancesMaterializedCoverage` |
-| A committed seek owns its exact target; older work cannot snap it back, jump to a live edge, or win a seek storm | Playwright seek tests covering 0 seconds, 22 minutes, retained history, delayed preparation, repeated events, and latest-target wins |
+| A committed seek owns its exact target; older work or a trailing media/HLS seek after the gesture cannot snap it back, jump to a live edge, or win a seek storm | Playwright: `keeps an unbuffered seek committed when media snaps back after the gesture`, `accepts one native seek emitted after pointerup without accepting its snapback`, `keeps a keyboard seek committed when media snaps back`, `revokes seek intent when a pointer gesture is cancelled`, plus seek tests covering 0 seconds, 22 minutes, retained history, delayed preparation, repeated events, and latest-target wins |
 | Temporary `429`/`503` admission pressure remains waitable and a newer seek cancels the old retries | Playwright: `retries transient streaming capacity without replacing the player or losing the seek target` and `cancels capacity retries when the user commits a newer seek` |
 | A selected text subtitle is part of readiness at startup and after a cold seek; fatal subtitle loss stops playback visibly | Playwright selected-subtitle tests plus Go scheduler/status tests `TestPlaybackStatusWaitsForSelectedSubtitleTarget`, `TestRequestedSubtitleWaitsForTargetVideoWithoutStoppingItsRemainder`, and `TestSelectedSubtitleJobFailureFailsItsPlaybackTarget` |
 | Advancing media time without new decoded video frames is detected as a playback stall | Playwright: `detects frozen video frames even while the player clock can advance` |

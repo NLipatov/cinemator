@@ -346,6 +346,31 @@ async function openMovie(page, {
   return prepareStarts;
 }
 
+async function openHourlyMovieWithPendingMiddle(page) {
+  const middle = 30 * 60;
+  let middleReady = false;
+  const prepareStarts = await openMovie(page, {
+    mediaInfo: { duration: 60 * 60 },
+    getHlsStatus: targetSeconds => ({
+      phase: targetSeconds === middle && !middleReady ? 'preparing' : 'ready',
+      targetSeconds,
+      presentationOriginSeconds: Math.floor(Math.floor(targetSeconds / 2) / 15) * 30,
+      bytesRead: 1024,
+      activePeers: 1,
+      totalPeers: 1,
+    }),
+  });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+  return {
+    middle,
+    prepareStarts,
+    finishPreparation() {
+      middleReady = true;
+    },
+  };
+}
+
 test('exposes the complete source duration before the full torrent is available', async ({ page }) => {
   await openMovie(page);
   await page.getByRole('button', { name: 'Select tracks' }).click();
@@ -994,6 +1019,97 @@ test('does not snap back or replace the player while a clicked position is loadi
   await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
   await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(1);
   await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(7199);
+});
+
+test('keeps an unbuffered seek committed when media snaps back after the gesture', async ({ page }) => {
+  const pending = await openHourlyMovieWithPendingMiddle(page);
+
+  await page.locator('video').evaluate((video, middle) => {
+    video.currentTime = 1;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.currentTime = middle;
+    video.dispatchEvent(new Event('seeking'));
+    video.dispatchEvent(new PointerEvent('pointerup'));
+
+    // A browser or hls.js can briefly restore the last buffered playhead
+    // before the distant presentation is ready. This is not a second user seek.
+    video.currentTime = 1;
+    video.dispatchEvent(new Event('seeking'));
+  }, pending.middle);
+
+  await expect.poll(() => pending.prepareStarts).toEqual([0, pending.middle]);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(pending.middle);
+  expect(await page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  pending.finishPreparation();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(pending.middle);
+});
+
+test('accepts one native seek emitted after pointerup without accepting its snapback', async ({ page }) => {
+  const pending = await openHourlyMovieWithPendingMiddle(page);
+
+  await page.locator('video').evaluate((video, middle) => {
+    video.currentTime = 1;
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.dispatchEvent(new PointerEvent('pointerup'));
+
+    // Some native controls commit their selected position only after pointerup.
+    video.currentTime = middle;
+    video.dispatchEvent(new Event('seeking'));
+    video.currentTime = 1;
+    video.dispatchEvent(new Event('seeking'));
+  }, pending.middle);
+
+  await expect.poll(() => pending.prepareStarts).toEqual([0, pending.middle]);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(pending.middle);
+  expect(await page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  pending.finishPreparation();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(pending.middle);
+});
+
+test('keeps a keyboard seek committed when media snaps back', async ({ page }) => {
+  const pending = await openHourlyMovieWithPendingMiddle(page);
+
+  await page.locator('video').evaluate((video, middle) => {
+    video.currentTime = 1;
+    video.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight' }));
+    video.currentTime = middle;
+    video.dispatchEvent(new Event('seeking'));
+    video.currentTime = 1;
+    video.dispatchEvent(new Event('seeking'));
+  }, pending.middle);
+
+  await expect.poll(() => pending.prepareStarts).toEqual([0, pending.middle]);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(pending.middle);
+  expect(await page.evaluate(() => window.__hlsAttachments.length)).toBe(1);
+
+  pending.finishPreparation();
+  await expect.poll(() => page.evaluate(() => window.__hlsAttachments.length)).toBe(2);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(pending.middle);
+});
+
+test('revokes seek intent when a pointer gesture is cancelled', async ({ page }) => {
+  const prepareStarts = await openMovie(page, { initialBufferSeconds: 18 });
+  await page.getByRole('button', { name: 'Select tracks' }).click();
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThanOrEqual(1);
+
+  const presentedFrames = await page.evaluate(() => window.__presentedFrameCallbacks);
+  await page.locator('video').evaluate(video => { video.currentTime = 16; });
+  await expect.poll(() => page.evaluate(() => window.__presentedFrameCallbacks)).toBeGreaterThan(presentedFrames);
+
+  await page.locator('video').evaluate(video => {
+    video.dispatchEvent(new PointerEvent('pointerdown'));
+    video.dispatchEvent(new PointerEvent('pointercancel'));
+    video.currentTime = 30 * 60;
+    video.dispatchEvent(new Event('seeking'));
+  });
+
+  expect(prepareStarts).toEqual([0]);
+  await expect.poll(() => page.locator('video').evaluate(video => video.currentTime)).toBe(16);
+  await expect.poll(() => page.evaluate(() => window.__hlsDestroyCount)).toBe(0);
 });
 
 test('retries transient streaming capacity without replacing the player or losing the seek target', async ({ page }) => {

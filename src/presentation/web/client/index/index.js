@@ -162,6 +162,8 @@
         this.streamDir = null;
         this.generation = '';
         this.attaching = false;
+        this.userSeekPointerActive = false;
+        this.userSeekIntentAvailable = false;
         this.userSeekIntentUntil = 0;
         this.protectedMediaTime = null;
         this.restoringPlayhead = false;
@@ -243,6 +245,43 @@
           commit(target);
         }, seekCommitDelayMs);
       }
+      clearUserSeekIntent() {
+        this.userSeekPointerActive = false;
+        this.userSeekIntentAvailable = false;
+        this.userSeekIntentUntil = 0;
+      }
+      beginPointerSeekIntent() {
+        this.userSeekPointerActive = true;
+        this.userSeekIntentAvailable = true;
+        this.userSeekIntentUntil = Date.now() + 5000;
+      }
+      endPointerSeekIntent() {
+        this.userSeekPointerActive = false;
+        // Some native controls apply their one seek only after pointerup. Keep
+        // that unconsumed event, but close a gesture that already chose a target.
+        this.userSeekIntentUntil = this.userSeekIntentAvailable ? Date.now() + 500 : 0;
+      }
+      beginKeyboardSeekIntent() {
+        this.userSeekPointerActive = false;
+        this.userSeekIntentAvailable = true;
+        this.userSeekIntentUntil = Date.now() + 1500;
+      }
+      acceptUserSeekEvent() {
+        if (Date.now() > this.userSeekIntentUntil) {
+          this.clearUserSeekIntent();
+          return false;
+        }
+        // Active scrubbing may emit many positions. Outside the active pointer
+        // gesture, one pending event is consumed so media/HLS cannot inherit it.
+        if (this.userSeekPointerActive) {
+          this.userSeekIntentAvailable = false;
+          return true;
+        }
+        if (!this.userSeekIntentAvailable) return false;
+        this.userSeekIntentAvailable = false;
+        this.userSeekIntentUntil = 0;
+        return true;
+      }
       stopStatusPolling() {
         this.statusSeq++;
         this.statusTarget = null;
@@ -280,7 +319,7 @@
       playback.streamDir = null;
       playback.generation = '';
       playback.attaching = false;
-      playback.userSeekIntentUntil = 0;
+      playback.clearUserSeekIntent();
       playback.protectedMediaTime = null;
       playback.restoringPlayhead = false;
       playback.timeline.reset();
@@ -1328,7 +1367,7 @@
       // A gesture belongs to the presentation on which it happened. Carrying
       // it into the next attach can turn hls.js's internal positioning seek
       // into another application-level seek and recursively rebuild at 0:00.
-      playback.userSeekIntentUntil = 0;
+      playback.clearUserSeekIntent();
       const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
       const retainedHls = keepPlayerVisible ? playback.hls : null;
@@ -1718,7 +1757,7 @@
         // A pointer/key gesture that resolves to a transport action did not
         // request a timeline change. Do not let a later hls.js positioning
         // seek inherit that gesture.
-        playback.userSeekIntentUntil = 0;
+        playback.clearUserSeekIntent();
         playback.playIntent = true;
         if (playback.autoplayBlocked) {
           playback.autoplayBlocked = false;
@@ -1727,7 +1766,7 @@
         updateQoePlayingTime();
       }, options);
       video.addEventListener('pause', () => {
-        playback.userSeekIntentUntil = 0;
+        playback.clearUserSeekIntent();
         finishPlaybackStall();
         playback.playIntent = false;
         publishQoeSummary();
@@ -1738,23 +1777,20 @@
         removeWarning();
       }, options);
       video.addEventListener('pointerdown', () => {
-        playback.userSeekIntentUntil = Date.now() + 5000;
+        playback.beginPointerSeekIntent();
       }, options);
-      const finishPointerSeek = () => {
-        playback.userSeekIntentUntil = Date.now() + 500;
-      };
-      video.addEventListener('pointerup', finishPointerSeek, options);
-      video.addEventListener('pointercancel', finishPointerSeek, options);
+      video.addEventListener('pointerup', () => playback.endPointerSeekIntent(), options);
+      video.addEventListener('pointercancel', () => playback.clearUserSeekIntent(), options);
       video.addEventListener('keydown', () => {
-        playback.userSeekIntentUntil = Date.now() + 1500;
+        playback.beginKeyboardSeekIntent();
       }, options);
       video.addEventListener('volumechange', () => {
-        playback.userSeekIntentUntil = 0;
+        playback.clearUserSeekIntent();
       }, options);
       video.addEventListener('seeking', () => {
         finishPlaybackStall();
         updateQoePlayingTime();
-        const userInitiated = Date.now() <= playback.userSeekIntentUntil;
+        const userInitiated = playback.acceptUserSeekEvent();
         // Browser and hls.js may emit seeking while attaching, refreshing a
         // live playlist, or recovering a decoder. Those events never grant the
         // application permission to prepare or attach another presentation.
@@ -1884,7 +1920,7 @@
         mainFragBuffered = currentPositionBuffered();
         if (!mainFragBuffered) return false;
         playback.attaching = false;
-        playback.userSeekIntentUntil = 0;
+        playback.clearUserSeekIntent();
         playback.timeline.anchor(video.currentTime);
         playback.nativeRetries = 0;
         playback.missingStreamRecoveryAttempted = false;
