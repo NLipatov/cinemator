@@ -386,6 +386,48 @@ func TestGenerateDirectWindowCoalescesFrequentKeyframes(t *testing.T) {
 	}
 }
 
+func TestGenerateDirectWindowPublishesOnlyIndependentFragments(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+	if _, err := exec.LookPath("ffprobe"); err != nil {
+		t.Skip("ffprobe is not installed")
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "long-gop.mp4")
+	runMediaCommand(t, "ffmpeg",
+		"-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=25:duration=8",
+		"-c:v", "libx264", "-g", "100", "-keyint_min", "100", "-sc_threshold", "0",
+		"-pix_fmt", "yuv420p", source,
+	)
+
+	result, err := GenerateDirectWindow(
+		context.Background(), source, dir,
+		domain.MediaInfo{Duration: 8, VideoCodec: "h264", Width: 160, Height: 90},
+		StreamSelection{SubtitleTrackIndex: -1},
+		0, 0, 4, 2*time.Second, 30*time.Second, nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Fragments) < 2 {
+		t.Fatalf("direct window = %+v, want multiple fragments", result)
+	}
+	for _, fragment := range result.Fragments {
+		probe := runMediaCommand(t, "ffprobe",
+			"-v", "error", "-select_streams", "v:0",
+			"-read_intervals", "%+0.05",
+			"-show_entries", "packet=flags", "-of", "default=nw=1:nk=1",
+			filepath.Join(dir, fragment.Name),
+		)
+		flags := strings.TrimSpace(strings.Split(string(probe), "\n")[0])
+		if !strings.Contains(flags, "K") {
+			t.Fatalf("direct fragment %s starts with flags %q, want a keyframe", fragment.Name, flags)
+		}
+	}
+}
+
 func TestGenerateDirectWindowPreservesFMP4Video(t *testing.T) {
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
 		t.Skip("ffmpeg is not installed")
@@ -502,8 +544,9 @@ func TestAnalyzeTailDurationBeyondSeekWindow(t *testing.T) {
 		"-c:v", "libx264", "-preset", "ultrafast", "-g", "100", "-keyint_min", "100", "-sc_threshold", "0",
 		"-pix_fmt", "yuv420p", longGOP,
 	)
+	tailDir := t.TempDir()
 	tail, err := GenerateDirectWindow(
-		context.Background(), longGOP, t.TempDir(),
+		context.Background(), longGOP, tailDir,
 		domain.MediaInfo{Duration: 40, VideoCodec: "h264", Width: 64, Height: 64},
 		StreamSelection{SubtitleTrackIndex: -1},
 		5, 5, 1, 6*time.Second, 40*time.Second, nil,
@@ -515,8 +558,15 @@ func TestAnalyzeTailDurationBeyondSeekWindow(t *testing.T) {
 		t.Fatalf("final long-GOP window = %+v, want a finalized direct tail", tail)
 	}
 	for _, fragment := range tail.Fragments {
-		if fragment.Duration > 6.25 {
-			t.Fatalf("long-GOP fragment duration = %.3fs, want at most the configured 6s boundary", fragment.Duration)
+		probe := runMediaCommand(t, "ffprobe",
+			"-v", "error", "-select_streams", "v:0",
+			"-read_intervals", "%+0.05",
+			"-show_entries", "packet=flags", "-of", "default=nw=1:nk=1",
+			filepath.Join(tailDir, fragment.Name),
+		)
+		flags := strings.TrimSpace(strings.Split(string(probe), "\n")[0])
+		if !strings.Contains(flags, "K") {
+			t.Fatalf("long-GOP fragment %s starts with flags %q, want a keyframe", fragment.Name, flags)
 		}
 	}
 }

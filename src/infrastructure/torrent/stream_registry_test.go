@@ -79,6 +79,71 @@ func TestCleanupKeepsStreamRegisteredUntilWorkersAndPublicationStop(t *testing.T
 	}
 }
 
+func TestReleaseHlsSessionRetiresOnlyOwnedPresentations(t *testing.T) {
+	root := t.TempDir()
+	assets, err := newHlsAssetStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer assets.Close()
+
+	keys := []streamKey{
+		{InfoHash: "hash", Session: "viewer-one", Index: 0, Audio: 0, Subtitle: -1},
+		{InfoHash: "hash", Session: "viewer-one", Index: 0, Audio: 0, Subtitle: 0},
+		{InfoHash: "hash", Session: "viewer-two", Index: 0, Audio: 0, Subtitle: -1},
+	}
+	manager := &manager{
+		active: make(map[streamKey]*streamInfo),
+		media:  &mediaCache{assets: assets},
+	}
+	streams := make(map[streamKey]*streamInfo)
+	for _, key := range keys {
+		paths := key.paths(root)
+		if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		stream := &streamInfo{
+			source:       &torrentSource{},
+			paths:        paths,
+			cleanupDone:  make(chan struct{}),
+			videoJobs:    make(map[*segmentJob]struct{}),
+			subtitleJobs: make(map[*segmentJob]struct{}),
+		}
+		manager.active[key] = stream
+		streams[key] = stream
+	}
+
+	manager.ReleaseHlsSession("viewer-one")
+
+	for _, key := range keys[:2] {
+		select {
+		case <-streams[key].cleanupDone:
+		default:
+			t.Fatalf("session presentation %v was not released before ReleaseHlsSession returned", key)
+		}
+	}
+	manager.cleanupWG.Wait()
+	manager.mu.Lock()
+	_, firstRegistered := manager.active[keys[0]]
+	_, secondRegistered := manager.active[keys[1]]
+	other := manager.active[keys[2]]
+	manager.mu.Unlock()
+	if firstRegistered || secondRegistered {
+		t.Fatal("released session remains registered")
+	}
+	if other == nil {
+		t.Fatal("another playback session was released")
+	}
+	other.mtx.Lock()
+	otherClosing := other.closing
+	other.mtx.Unlock()
+	if otherClosing {
+		t.Fatal("another playback session was marked closing")
+	}
+
+	manager.cleanup(keys[2])
+}
+
 func TestShutdownStreamsStopsWaitingAtItsDeadline(t *testing.T) {
 	root := t.TempDir()
 	assets, err := newHlsAssetStore(root)

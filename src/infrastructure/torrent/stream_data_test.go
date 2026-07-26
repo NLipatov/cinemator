@@ -36,6 +36,129 @@ func TestTranscodedStreamKeyHasDistinctStableIdentity(t *testing.T) {
 	}
 }
 
+func TestPlaybackSessionsHaveDistinctStableStreamIdentity(t *testing.T) {
+	first := streamKey{InfoHash: "abc123", Index: 7, Audio: 1, Subtitle: -1, Session: "viewer-one"}
+	second := first
+	second.Session = "viewer-two"
+
+	if first.dirName() == second.dirName() {
+		t.Fatal("different playback sessions share one mutable stream identity")
+	}
+	for _, key := range []streamKey{first, second} {
+		parsed, err := parseStreamDir(key.dirName())
+		if err != nil || parsed != key {
+			t.Fatalf("parseStreamDir(%q) = %#v, %v; want %#v", key.dirName(), parsed, err, key)
+		}
+	}
+}
+
+func TestPlaybackSessionSerializesMediaExecution(t *testing.T) {
+	var stream streamInfo
+	releaseFirst, err := stream.reserveMediaExecution(context.Background(), false, nil)
+	if err != nil {
+		t.Fatalf("reserve first media execution: %v", err)
+	}
+
+	acquiredSecond := make(chan func(), 1)
+	go func() {
+		release, reserveErr := stream.reserveMediaExecution(context.Background(), false, nil)
+		if reserveErr == nil {
+			acquiredSecond <- release
+		}
+	}()
+
+	select {
+	case <-acquiredSecond:
+		t.Fatal("one playback session admitted two concurrent FFmpeg executions")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	releaseFirst()
+	select {
+	case releaseSecond := <-acquiredSecond:
+		releaseSecond()
+	case <-time.After(time.Second):
+		t.Fatal("queued media execution did not inherit the playback-session entitlement")
+	}
+}
+
+func TestPlaybackSessionsOwnIndependentMediaExecution(t *testing.T) {
+	var first streamInfo
+	var second streamInfo
+	releaseFirst, err := first.reserveMediaExecution(context.Background(), false, nil)
+	if err != nil {
+		t.Fatalf("reserve first session: %v", err)
+	}
+	defer releaseFirst()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	releaseSecond, err := second.reserveMediaExecution(ctx, false, nil)
+	if err != nil {
+		t.Fatalf("second playback session was blocked by the first: %v", err)
+	}
+	releaseSecond()
+}
+
+func TestPlaybackSessionForegroundMediaExecutionPreemptsBackground(t *testing.T) {
+	var stream streamInfo
+	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	releaseBackground, err := stream.reserveMediaExecution(backgroundCtx, true, cancelBackground)
+	if err != nil {
+		t.Fatalf("reserve background media execution: %v", err)
+	}
+
+	acquiredForeground := make(chan func(), 1)
+	go func() {
+		release, reserveErr := stream.reserveMediaExecution(context.Background(), false, nil)
+		if reserveErr == nil {
+			acquiredForeground <- release
+		}
+	}()
+
+	select {
+	case <-backgroundCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("foreground subtitle work did not preempt background video execution")
+	}
+	select {
+	case <-acquiredForeground:
+		t.Fatal("foreground execution overlapped the cancelled background process")
+	default:
+	}
+
+	releaseBackground()
+	select {
+	case releaseForeground := <-acquiredForeground:
+		releaseForeground()
+	case <-time.After(time.Second):
+		t.Fatal("foreground execution did not inherit the playback-session entitlement")
+	}
+}
+
+func TestPlaybackSessionMediaExecutionWaitHonorsCancellation(t *testing.T) {
+	var stream streamInfo
+	releaseFirst, err := stream.reserveMediaExecution(context.Background(), false, nil)
+	if err != nil {
+		t.Fatalf("reserve first media execution: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := stream.reserveMediaExecution(ctx, false, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled media execution wait = %v, want context cancellation", err)
+	}
+
+	releaseFirst()
+	nextCtx, nextCancel := context.WithTimeout(context.Background(), time.Second)
+	defer nextCancel()
+	releaseNext, err := stream.reserveMediaExecution(nextCtx, false, nil)
+	if err != nil {
+		t.Fatalf("cancelled waiter consumed the session lane: %v", err)
+	}
+	releaseNext()
+}
+
 func TestPlaybackStatusPublishesCurrentAssetGeneration(t *testing.T) {
 	stream := &streamInfo{
 		assetVersion: "generation-2",
@@ -113,6 +236,43 @@ func TestPlaybackStatusUsesOnlyThePublishedPresentationForReadiness(t *testing.T
 	published := stream.playbackStatus(0, timeline, now, 1, 1, true)
 	if published.Phase != domain.HlsPhaseReady {
 		t.Fatalf("status after target publication = %+v", published)
+	}
+}
+
+func TestPlaybackStatusUsesPublishedPlaylistOriginInsteadOfBackfilledCache(t *testing.T) {
+	ready := make(chan struct{})
+	close(ready)
+	now := time.Now()
+	stream := &streamInfo{
+		ready: ready,
+		mediaInfo: domain.MediaInfo{
+			Duration: 120,
+			Seekable: true,
+		},
+		presentationTarget: 40,
+		materializedWindows: map[int][]ffmpeg.HLSFragment{
+			15: {
+				{Start: 30, Duration: 2, Name: videoSegmentName(15)},
+				{Start: 32, Duration: 2, Name: videoSegmentName(16)},
+				{Start: 34, Duration: 2, Name: videoSegmentName(17)},
+				{Start: 36, Duration: 2, Name: videoSegmentName(18)},
+				{Start: 38, Duration: 2, Name: videoSegmentName(19)},
+				{Start: 40, Duration: 2, Name: videoSegmentName(20)},
+			},
+		},
+		publishedFragments: []ffmpeg.HLSFragment{
+			{Start: 38, Duration: 2, Name: videoSegmentName(19)},
+			{Start: 40, Duration: 2, Name: videoSegmentName(20)},
+		},
+		status: domain.HlsStatus{Phase: domain.HlsPhasePreparing},
+	}
+
+	status := stream.playbackStatus(40.2, newPlaybackTimeline(2*time.Second, 15, 120), now, 1, 1, true)
+	if status.Phase != domain.HlsPhaseReady {
+		t.Fatalf("published target status = %+v", status)
+	}
+	if status.PresentationOriginSeconds != 38 {
+		t.Fatalf("presentation origin = %.3f, want published head 38", status.PresentationOriginSeconds)
 	}
 }
 
@@ -412,7 +572,7 @@ func TestStreamKeyPaths(t *testing.T) {
 }
 
 func TestParseStreamDirRejectsMalformedNames(t *testing.T) {
-	for _, name := range []string{"", "hash_1_a0", "hash_x_a0_s0_t0", "hash_1_x0_s0_t0", "hash_1_a0_x0_t0", "hash_1_a0_sx_t0", "hash_1_a0_s0_tx", "hash_1_a0_s0_t0_p12000", "hash_1_a0_s0_t0_g1"} {
+	for _, name := range []string{"", "hash_1_a0", "hash_x_a0_s0_t0", "hash_1_x0_s0_t0", "hash_1_a0_x0_t0", "hash_1_a0_sx_t0", "hash_1_a0_s0_tx", "hash_1_a0_s0_t0_pviewer_one", "hash_1_a0_s0_t0_g1"} {
 		if _, err := parseStreamDir(name); err == nil {
 			t.Fatalf("parseStreamDir(%q) succeeded", name)
 		}

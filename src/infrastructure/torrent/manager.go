@@ -44,6 +44,8 @@ type manager struct {
 	watcherDone  chan struct{}
 	closeOnce    sync.Once
 	closeErr     error
+	analyzer     mediaAnalyzer
+	packager     mediaPackager
 	scheduler    *segmentScheduler
 	demand       *pieceDemand
 	settings     settings.Settings
@@ -153,6 +155,7 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 	if err != nil {
 		return nil, err
 	}
+	engine := newFFmpegMediaEngine()
 	m := &manager{
 		client:      client,
 		active:      make(map[streamKey]*streamInfo),
@@ -167,6 +170,8 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 		watcherStop: make(chan struct{}),
 		watcherDone: make(chan struct{}),
 		events:      newDownloadEventBroadcaster(),
+		analyzer:    engine,
+		packager:    engine,
 		scheduler:   newSegmentScheduler(settings.MaxQueuedJobs(), settings.MaxTranscodes(), settings.MaxPackagers()),
 		demand:      newPieceDemand(),
 		settings:    settings,
@@ -306,7 +311,7 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	}
 	m.touchDownload(ctx, t.InfoHash().HexString())
 	file := files[fileIndex]
-	source, err := newTorrentSource(file, m.sources, m.demand, m.settings.TorrentReadaheadBytes(), nil, nil, nil, nil)
+	source, err := newTorrentSource(file, m.sources, m.demand, m.analyzer, m.settings.TorrentReadaheadBytes(), nil, nil, nil, nil)
 	if err != nil {
 		return domain.MediaInfo{}, err
 	}
@@ -321,9 +326,12 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	return info, err
 }
 
-func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int, startSeconds float64, forceTranscode bool) (string, error) {
+func (m *manager) PrepareHlsStream(ctx context.Context, magnet, playbackSession string, fileIndex, audioTrack, subtitleTrack int, startSeconds float64, forceTranscode bool) (string, error) {
 	if startSeconds < 0 || math.IsNaN(startSeconds) || math.IsInf(startSeconds, 0) {
 		return "", fmt.Errorf("%w: bad start position", domain.ErrBadHlsRequest)
+	}
+	if !validPlaybackSession(playbackSession) {
+		return "", fmt.Errorf("%w: bad playback session", domain.ErrBadHlsRequest)
 	}
 	t, hash, err := m.acquireTorrent(magnet)
 	if err != nil {
@@ -361,7 +369,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	target := m.timeline(duration).locate(startSeconds)
 	startSeconds = target.sourceSeconds
 	startIndex := target.segment
-	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack, Transcode: forceTranscode}
+	key := streamKey{InfoHash: hash, Session: playbackSession, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack, Transcode: forceTranscode}
 	paths := key.paths(m.settings.HlsPath())
 
 	for {
@@ -380,7 +388,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		}
 
 		var candidate *streamInfo
-		source, sourceErr := newTorrentSource(file, m.sources, m.demand, m.settings.TorrentReadaheadBytes(), func(jobID string) int64 {
+		source, sourceErr := newTorrentSource(file, m.sources, m.demand, m.analyzer, m.settings.TorrentReadaheadBytes(), func(jobID string) int64 {
 			if candidate == nil {
 				return 16 << 20
 			}
@@ -422,18 +430,20 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 				StartedAt:     now,
 				LastProgress:  now,
 			},
-			statusSegment:        -1,
-			materializedEnd:      startIndex,
-			playheadSegment:      startIndex,
-			urgentAhead:          30 * time.Second,
-			progressiveSubtitles: startIndex,
-			segmentErrors:        make(map[int]segmentFailure),
-			videoJobs:            make(map[*segmentJob]struct{}),
-			subtitleJobs:         make(map[*segmentJob]struct{}),
-			materializedWindows:  make(map[int][]ffmpeg.HLSFragment),
-			materializedBytes:    make(map[int]int64),
-			retainedAssets:       make(map[string]time.Time),
-			cleanupDone:          make(chan struct{}),
+			statusSegment:           -1,
+			materializedEnd:         startIndex,
+			playheadSegment:         startIndex,
+			videoDeliverySegment:    startIndex,
+			subtitleDeliverySegment: startIndex,
+			urgentAhead:             30 * time.Second,
+			progressiveSubtitles:    startIndex,
+			segmentErrors:           make(map[int]segmentFailure),
+			videoJobs:               make(map[*segmentJob]struct{}),
+			subtitleJobs:            make(map[*segmentJob]struct{}),
+			materializedWindows:     make(map[int][]ffmpeg.HLSFragment),
+			materializedBytes:       make(map[int]int64),
+			retainedAssets:          make(map[string]time.Time),
+			cleanupDone:             make(chan struct{}),
 		}
 
 		// Keep stream publication atomic with the cache cleaner's active-stream

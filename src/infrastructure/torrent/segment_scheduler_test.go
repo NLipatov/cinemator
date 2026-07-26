@@ -66,6 +66,45 @@ func TestSegmentSchedulerHonorsCanceledTranscode(t *testing.T) {
 	}
 }
 
+func TestSegmentSchedulerMediaWorkerReservationSurvivesSourceWait(t *testing.T) {
+	scheduler := newSegmentScheduler(2, 1, 1)
+	release, err := scheduler.reserveMediaWorker(
+		context.Background(),
+		mediaPackagerWorker,
+		false,
+		func() {},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	secondRan := make(chan struct{})
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- scheduler.packageMedia(context.Background(), false, func() {}, func() error {
+			close(secondRan)
+			return nil
+		})
+	}()
+
+	select {
+	case <-secondRan:
+		t.Fatal("worker reservation was transferred while its playback target waited for source")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case <-secondRan:
+	case <-time.After(time.Second):
+		t.Fatal("next playback target did not receive worker after reservation release")
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatalf("second packager = %v", err)
+	}
+}
+
 func TestSegmentSchedulerForegroundPreemptsBackgroundJob(t *testing.T) {
 	scheduler := newSegmentScheduler(1, 1, 1)
 	backgroundCanceled := make(chan struct{})

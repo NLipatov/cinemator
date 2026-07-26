@@ -20,6 +20,7 @@ import (
 
 type streamKey struct {
 	InfoHash  string
+	Session   string
 	Index     int
 	Audio     int
 	Subtitle  int
@@ -62,6 +63,8 @@ type streamInfo struct {
 	segmentErrors                 map[int]segmentFailure
 	materializedEnd               int
 	playheadSegment               int
+	videoDeliverySegment          int
+	subtitleDeliverySegment       int
 	urgentAhead                   time.Duration
 	deliveryRatio                 float64
 	deliveryJitter                float64
@@ -74,10 +77,27 @@ type streamInfo struct {
 	progressiveRetry              bool
 	videoJobs                     map[*segmentJob]struct{}
 	subtitleJobs                  map[*segmentJob]struct{}
+	mediaExecutionOnce            sync.Once
+	mediaExecution                *priorityWorkerPool
 	playlistMtx                   sync.RWMutex
 	generationMtx                 sync.RWMutex
 	cleanupDone                   chan struct{}
 	closing                       bool
+}
+
+func (s *streamInfo) reserveMediaExecution(
+	ctx context.Context,
+	background bool,
+	cancel context.CancelFunc,
+) (func(), error) {
+	s.mediaExecutionOnce.Do(func() {
+		s.mediaExecution = newPriorityWorkerPool(1)
+	})
+	admission, err := s.mediaExecution.acquire(ctx, background, cancel)
+	if err != nil {
+		return nil, err
+	}
+	return func() { s.mediaExecution.release(admission) }, nil
 }
 
 type streamCacheSnapshot struct {
@@ -671,8 +691,13 @@ func (s *streamInfo) playbackStatus(targetSeconds float64, timeline playbackTime
 		status.Seekable = s.mediaInfo.Seekable
 		status.Duration = s.mediaInfo.Duration
 		status.Message = ""
-		if origin, ok := materializedPresentationOrigin(s.materializedWindows, s.presentationTarget); ok {
-			status.PresentationOriginSeconds = origin
+		status.PresentationOriginSeconds = 0
+		if len(s.publishedFragments) > 0 {
+			// The client offset belongs to the immutable head of the published
+			// playlist, not to the wider disk cache. Background backfill may
+			// extend that cache backwards without changing the active HLS
+			// presentation's time origin.
+			status.PresentationOriginSeconds = s.publishedFragments[0].Start
 		}
 		publishedReady = fragmentsCoverTime(s.publishedFragments, targetSeconds)
 		if s.fatalErr != nil {
@@ -739,8 +764,6 @@ func publicStreamError(err error) string {
 		return "Preparing this media window timed out"
 	case errors.Is(err, errPackagerNoOutput):
 		return "The media packager stopped making output progress"
-	case errors.Is(err, errSourceBlocked):
-		return "The media packager is waiting for required torrent pieces"
 	case strings.Contains(message, "no space left"):
 		return "The server ran out of disk space while preparing video"
 	case strings.Contains(message, "insufficient disk") || strings.Contains(message, "free-space floor") || strings.Contains(message, "free-inode"):
@@ -936,7 +959,11 @@ type streamPaths struct {
 }
 
 func (k streamKey) dirName() string {
-	return fmt.Sprintf("%s_%d_a%d_s%d_t%d", k.InfoHash, k.Index, k.Audio, k.Subtitle, btoi(k.Transcode))
+	name := fmt.Sprintf("%s_%d_a%d_s%d_t%d", k.InfoHash, k.Index, k.Audio, k.Subtitle, btoi(k.Transcode))
+	if k.Session != "" {
+		name += "_p" + k.Session
+	}
+	return name
 }
 
 func (k streamKey) paths(root string) streamPaths {
@@ -951,11 +978,21 @@ func (k streamKey) paths(root string) streamPaths {
 
 func parseStreamDir(name string) (streamKey, error) {
 	parts := strings.Split(name, "_")
-	if len(parts) != 5 {
+	if len(parts) < 5 || len(parts) > 6 {
 		return streamKey{}, fmt.Errorf("bad stream dir")
 	}
 	if !strings.HasPrefix(parts[2], "a") || !strings.HasPrefix(parts[3], "s") || !strings.HasPrefix(parts[4], "t") {
 		return streamKey{}, fmt.Errorf("bad stream dir")
+	}
+	session := ""
+	if len(parts) == 6 {
+		if !strings.HasPrefix(parts[5], "p") {
+			return streamKey{}, fmt.Errorf("bad stream dir")
+		}
+		session = strings.TrimPrefix(parts[5], "p")
+		if !validPlaybackSession(session) {
+			return streamKey{}, fmt.Errorf("bad playback session")
+		}
 	}
 	audio := strings.TrimPrefix(parts[2], "a")
 	subtitle := strings.TrimPrefix(parts[3], "s")
@@ -978,11 +1015,28 @@ func parseStreamDir(name string) (streamKey, error) {
 	}
 	return streamKey{
 		InfoHash:  parts[0],
+		Session:   session,
 		Index:     idx,
 		Audio:     audioIdx,
 		Subtitle:  subIdx,
 		Transcode: transcodeValue == 1,
 	}, nil
+}
+
+func validPlaybackSession(session string) bool {
+	if len(session) == 0 || len(session) > 64 {
+		return false
+	}
+	for _, char := range session {
+		if char >= 'a' && char <= 'z' ||
+			char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' ||
+			char == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func btoi(value bool) int {

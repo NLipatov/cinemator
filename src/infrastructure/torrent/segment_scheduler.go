@@ -2,12 +2,14 @@ package torrent
 
 import (
 	"context"
+	"errors"
 	"sync"
 )
 
 // segmentScheduler owns global job admission and independent bounded worker
-// lanes. Foreground work can preempt background ownership within its lane;
-// source waiting happens after the worker admission has been released.
+// lanes. A media-worker reservation belongs to one admitted target for its
+// entire lifetime, including source waits. Foreground work can preempt
+// background ownership within its lane.
 type segmentScheduler struct {
 	mu          sync.Mutex
 	maxJobs     int
@@ -42,6 +44,13 @@ type priorityWorkerPool struct {
 	active  map[*workerAdmission]struct{}
 	waiting []*workerWaiter
 }
+
+type mediaWorkerKind uint8
+
+const (
+	mediaPackagerWorker mediaWorkerKind = iota
+	mediaEncoderWorker
+)
 
 func newSegmentScheduler(maxJobs, maxTranscodes, maxPackagers int) *segmentScheduler {
 	return &segmentScheduler{
@@ -132,29 +141,54 @@ func (s *segmentScheduler) reserveJob(background bool, cancel context.CancelFunc
 }
 
 func (s *segmentScheduler) transcode(ctx context.Context, background bool, cancel context.CancelFunc, run func() error) error {
-	if s == nil {
-		return run()
-	}
-	return s.encoders.run(ctx, background, cancel, run)
+	return s.runMediaWorker(ctx, mediaEncoderWorker, background, cancel, run)
 }
 
 func (s *segmentScheduler) packageMedia(ctx context.Context, background bool, cancel context.CancelFunc, run func() error) error {
-	if s == nil {
-		return run()
-	}
-	return s.packagers.run(ctx, background, cancel, run)
+	return s.runMediaWorker(ctx, mediaPackagerWorker, background, cancel, run)
 }
 
-func (p *priorityWorkerPool) run(ctx context.Context, background bool, cancel context.CancelFunc, run func() error) error {
-	admission, err := p.acquire(ctx, background, cancel)
+func (s *segmentScheduler) runMediaWorker(
+	ctx context.Context,
+	worker mediaWorkerKind,
+	background bool,
+	cancel context.CancelFunc,
+	run func() error,
+) error {
+	release, err := s.reserveMediaWorker(ctx, worker, background, cancel)
 	if err != nil {
 		return err
 	}
-	defer p.release(admission)
+	defer release()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return run()
+}
+
+func (s *segmentScheduler) reserveMediaWorker(
+	ctx context.Context,
+	worker mediaWorkerKind,
+	background bool,
+	cancel context.CancelFunc,
+) (func(), error) {
+	if s == nil {
+		return func() {}, nil
+	}
+	var pool *priorityWorkerPool
+	switch worker {
+	case mediaPackagerWorker:
+		pool = s.packagers
+	case mediaEncoderWorker:
+		pool = s.encoders
+	default:
+		return nil, errors.New("unknown media worker")
+	}
+	admission, err := pool.acquire(ctx, background, cancel)
+	if err != nil {
+		return nil, err
+	}
+	return func() { pool.release(admission) }, nil
 }
 
 func (p *priorityWorkerPool) acquire(ctx context.Context, background bool, cancel context.CancelFunc) (*workerAdmission, error) {

@@ -36,10 +36,12 @@ type fakeTorrentManager struct {
 	open        func(streamDir, assetName, version string) (application.HlsAsset, error)
 	prepareCall *prepareHlsCall
 	statusCall  *statusHlsCall
+	released    *string
 }
 
 type prepareHlsCall struct {
 	magnet                string
+	session               string
 	file, audio, subtitle int
 	start                 float64
 	forceTranscode        bool
@@ -58,10 +60,10 @@ func (m fakeTorrentManager) GetMediaInfo(context.Context, string, int) (domain.M
 	return m.mediaInfo, nil
 }
 
-func (m fakeTorrentManager) PrepareHlsStream(_ context.Context, magnet string, file, audio, subtitle int, start float64, forceTranscode bool) (string, error) {
+func (m fakeTorrentManager) PrepareHlsStream(_ context.Context, magnet, session string, file, audio, subtitle int, start float64, forceTranscode bool) (string, error) {
 	if m.prepareCall != nil {
 		*m.prepareCall = prepareHlsCall{
-			magnet: magnet, file: file, audio: audio, subtitle: subtitle,
+			magnet: magnet, session: session, file: file, audio: audio, subtitle: subtitle,
 			start: start, forceTranscode: forceTranscode,
 		}
 	}
@@ -128,6 +130,12 @@ func (m fakeTorrentManager) GetHlsStatus(_ context.Context, stream string, targe
 
 func (m fakeTorrentManager) TouchStream(context.Context, string) {}
 
+func (m fakeTorrentManager) ReleaseHlsSession(session string) {
+	if m.released != nil {
+		*m.released = session
+	}
+}
+
 func (m fakeTorrentManager) ListDownloads(context.Context) ([]domain.Download, error) {
 	return []domain.Download{}, nil
 }
@@ -158,6 +166,22 @@ func (m fakeTorrentManager) SubscribeDownloadEvents(ctx context.Context) <-chan 
 func (m fakeTorrentManager) CleanupStreams() {}
 
 func (m fakeTorrentManager) Close() error { return nil }
+
+func TestHandleReleaseHlsSession(t *testing.T) {
+	var released string
+	server := &HttpServer{mgr: fakeTorrentManager{released: &released}}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/hls/release?session=viewer-one", nil)
+
+	server.handleReleaseHlsSession(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if released != "viewer-one" {
+		t.Fatalf("released session = %q, want viewer-one", released)
+	}
+}
 
 func TestHandleDownloadActionStatusMapping(t *testing.T) {
 	tests := []struct {
@@ -237,44 +261,56 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 		{
 			name:       "valid",
 			method:     http.MethodGet,
-			target:     "/api/hls/prepare?magnet=magnet&file=0&audio=1&subtitle=-1",
+			target:     "/api/hls/prepare?magnet=magnet&session=viewer-one&file=0&audio=1&subtitle=-1",
 			wantStatus: http.StatusOK,
 			accept:     "application/json",
 		},
 		{
 			name:       "valid legacy redirect",
 			method:     http.MethodGet,
-			target:     "/api/hls/prepare?magnet=magnet&file=0",
+			target:     "/api/hls/prepare?magnet=magnet&session=viewer-one&file=0",
 			wantStatus: http.StatusFound,
+		},
+		{
+			name:       "missing playback session",
+			method:     http.MethodGet,
+			target:     "/api/hls/prepare?magnet=magnet&file=0",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "malformed playback session",
+			method:     http.MethodGet,
+			target:     "/api/hls/prepare?magnet=magnet&session=viewer_one&file=0",
+			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "malformed audio",
 			method:     http.MethodGet,
-			target:     "/api/hls/prepare?magnet=magnet&file=0&audio=default",
+			target:     "/api/hls/prepare?magnet=magnet&session=viewer-one&file=0&audio=default",
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "malformed start",
 			method:     http.MethodGet,
-			target:     "/api/hls/prepare?magnet=magnet&file=0&start=-1",
+			target:     "/api/hls/prepare?magnet=magnet&session=viewer-one&file=0&start=-1",
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "malformed transcode mode",
 			method:     http.MethodGet,
-			target:     "/api/hls/prepare?magnet=magnet&file=0&transcode=yes",
+			target:     "/api/hls/prepare?magnet=magnet&session=viewer-one&file=0&transcode=yes",
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "invalid subtitle",
 			method:     http.MethodGet,
-			target:     "/api/hls/prepare?magnet=magnet&file=0&subtitle=-2",
+			target:     "/api/hls/prepare?magnet=magnet&session=viewer-one&file=0&subtitle=-2",
 			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "negative file",
 			method:     http.MethodGet,
-			target:     "/api/hls/prepare?magnet=magnet&file=-1",
+			target:     "/api/hls/prepare?magnet=magnet&session=viewer-one&file=-1",
 			wantStatus: http.StatusBadRequest,
 		},
 		{
@@ -322,7 +358,7 @@ func TestHandlePrepareHlsStreamForwardsPlaybackSelection(t *testing.T) {
 		},
 		settings: settings.NewSettings(),
 	}
-	req := httptest.NewRequest(http.MethodGet, "/api/hls/prepare?magnet=magnet-value&file=7&audio=2&subtitle=3&start=42.5&transcode=1", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/hls/prepare?magnet=magnet-value&session=viewer-one&file=7&audio=2&subtitle=3&start=42.5&transcode=1", nil)
 	req.Header.Set("Accept", "application/json")
 	rec := httptest.NewRecorder()
 
@@ -331,7 +367,7 @@ func TestHandlePrepareHlsStreamForwardsPlaybackSelection(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %q", rec.Code, rec.Body.String())
 	}
-	want := prepareHlsCall{magnet: "magnet-value", file: 7, audio: 2, subtitle: 3, start: 42.5, forceTranscode: true}
+	want := prepareHlsCall{magnet: "magnet-value", session: "viewer-one", file: 7, audio: 2, subtitle: 3, start: 42.5, forceTranscode: true}
 	if call != want {
 		t.Fatalf("PrepareHlsStream() args = %+v, want %+v", call, want)
 	}
@@ -339,7 +375,7 @@ func TestHandlePrepareHlsStreamForwardsPlaybackSelection(t *testing.T) {
 
 func TestHandlePrepareHlsStreamDoesNotExposeInternalError(t *testing.T) {
 	server := HttpServer{mgr: fakeTorrentManager{prepareErr: errors.New("open /private/cache/master.m3u8: permission denied")}}
-	req := httptest.NewRequest(http.MethodGet, "/api/hls/prepare?magnet=magnet&file=0", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/hls/prepare?magnet=magnet&session=viewer-one&file=0", nil)
 	rec := httptest.NewRecorder()
 
 	server.handlePrepareHlsStream(rec, req)

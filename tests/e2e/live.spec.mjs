@@ -105,7 +105,7 @@ async function samplePlaybackClock(video, durationMS = 15_000) {
 test.describe('live torrent playback', () => {
   test.skip(!baseURL || !magnet, 'requires CINEMATOR_LIVE_BASE_URL and CINEMATOR_LIVE_MAGNET');
 
-  test('shares one initial presentation between concurrent viewers', async ({ browser }) => {
+  test('isolates concurrent viewer presentations on one torrent runtime', async ({ browser }) => {
     test.setTimeout(2 * 60 * 1000);
     const context = await browser.newContext();
     const firstPage = await context.newPage();
@@ -117,7 +117,12 @@ test.describe('live torrent playback', () => {
     await expect.poll(() => first.telemetry.preparedStreams.length).toBeGreaterThan(0);
     await expect.poll(() => second.telemetry.preparedStreams.length).toBeGreaterThan(0);
 
-    expect(first.telemetry.preparedStreams.at(-1)).toBe(second.telemetry.preparedStreams.at(-1));
+    const firstPrepare = new URL(first.telemetry.prepareURLs[0]);
+    const secondPrepare = new URL(second.telemetry.prepareURLs[0]);
+    expect(firstPrepare.searchParams.get('session')).toMatch(/^[A-Za-z0-9-]{1,64}$/);
+    expect(secondPrepare.searchParams.get('session')).toMatch(/^[A-Za-z0-9-]{1,64}$/);
+    expect(firstPrepare.searchParams.get('session')).not.toBe(secondPrepare.searchParams.get('session'));
+    expect(first.telemetry.preparedStreams.at(-1)).not.toBe(second.telemetry.preparedStreams.at(-1));
     expect(first.telemetry.transcodeFlags[0]).toBe(0);
     expect(second.telemetry.transcodeFlags[0]).toBe(0);
     const secondTime = await second.video.evaluate(element => element.currentTime);

@@ -16,9 +16,17 @@ export default defineConfig({
       use: { browserName: 'chromium' },
     },
   ],
-  webServer: {
-    command: 'node tests/e2e/server.mjs',
-    url: 'http://127.0.0.1:4173',
-    reuseExistingServer: !process.env.CI,
-  },
+  webServer: [
+    {
+      command: 'node tests/e2e/server.mjs',
+      url: 'http://127.0.0.1:4173',
+      reuseExistingServer: !process.env.CI,
+    },
+    {
+      command: 'go -C src run ../tests/e2e/fullstack/main.go',
+      url: 'http://127.0.0.1:4175/fixture',
+      reuseExistingServer: false,
+      timeout: 120_000,
+    },
+  ],
 });

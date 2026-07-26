@@ -79,16 +79,20 @@ func PrepareOnDemandHLS(
 
 	withSubtitles := UsesTextSubtitles(info, selection)
 	if withSubtitles {
-		segmentCount := 0
-		lastDuration := 0.0
-		ended := false
-		if info.Duration > 0 {
-			segmentCount = int(math.Ceil(info.Duration / seconds))
-			lastDuration = info.Duration - float64(segmentCount-1)*seconds
-			ended = true
-			windowSegments = max(windowSegments, segmentCount)
-		}
-		subtitles := buildProgressiveMediaPlaylist(seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion, segmentCount, lastDuration, ended)
+		// Subtitle fragments are required playback data and must follow the
+		// materialized video window. Advertising the complete virtual subtitle
+		// timeline makes HLS clients request every missing VTT file eagerly,
+		// turning one play session into whole-file video generation.
+		subtitles := buildProgressiveMediaPlaylist(
+			seconds,
+			max(1, windowSegments),
+			subtitleSegmentPrefix,
+			".vtt",
+			assetVersion,
+			0,
+			0,
+			false,
+		)
 		if err := writeFileAtomic(subtitlePlaylist, []byte(subtitles), 0644); err != nil {
 			return err
 		}
@@ -117,6 +121,101 @@ func UpdateProgressiveSubtitleHLS(
 	}
 	subtitles := buildProgressiveMediaPlaylist(seconds, windowSegments, subtitleSegmentPrefix, ".vtt", assetVersion, segmentCount, lastDuration, ended)
 	return writeFileAtomic(subtitlePlaylist, []byte(subtitles), 0644)
+}
+
+func UpdateMaterializedSubtitleHLS(
+	subtitlePlaylist string,
+	segmentDuration time.Duration,
+	assetVersion string,
+	mediaSequence int,
+	discontinuitySequence int,
+	ended bool,
+	fragments []HLSFragment,
+) error {
+	seconds := segmentDuration.Seconds()
+	if seconds <= 0 {
+		return fmt.Errorf("subtitle segment duration must be positive")
+	}
+
+	fragments = prepareMaterializedFragments(fragments)
+	first := math.Inf(1)
+	last := math.Inf(-1)
+	for _, fragment := range fragments {
+		first = min(first, fragment.Start)
+		last = max(last, fragment.Start+fragment.Duration)
+	}
+	if math.IsInf(first, 1) || math.IsInf(last, -1) {
+		subtitles := buildMaterializedSubtitlePlaylist(seconds, assetVersion, mediaSequence, discontinuitySequence, 0, 0, 0, false, nil)
+		return writeFileAtomic(subtitlePlaylist, []byte(subtitles), 0644)
+	}
+
+	const boundaryTolerance = 0.001
+	begin := max(0, int(math.Floor((first+boundaryTolerance)/seconds)))
+	end := max(begin+1, int(math.Ceil((last-boundaryTolerance)/seconds)))
+	discontinuities := make(map[int]int)
+	for index := 1; index < len(fragments); index++ {
+		if HLSDiscontinuityBetween(fragments[index-1], fragments[index]) {
+			subtitleIndex := max(0, int(math.Floor((fragments[index].Start+boundaryTolerance)/seconds)))
+			discontinuities[subtitleIndex]++
+		}
+	}
+	lastDuration := 0.0
+	if ended {
+		lastDuration = last - float64(end-1)*seconds
+		if lastDuration <= 0 || lastDuration > seconds {
+			lastDuration = seconds
+		}
+	}
+	subtitles := buildMaterializedSubtitlePlaylist(
+		seconds,
+		assetVersion,
+		mediaSequence,
+		discontinuitySequence,
+		begin,
+		end,
+		lastDuration,
+		ended,
+		discontinuities,
+	)
+	return writeFileAtomic(subtitlePlaylist, []byte(subtitles), 0644)
+}
+
+func buildMaterializedSubtitlePlaylist(
+	segmentDuration float64,
+	assetVersion string,
+	mediaSequence int,
+	discontinuitySequence int,
+	begin, end int,
+	lastDuration float64,
+	ended bool,
+	discontinuities map[int]int,
+) string {
+	var b strings.Builder
+	b.WriteString("#EXTM3U\n")
+	b.WriteString("#EXT-X-VERSION:3\n")
+	b.WriteString(fmt.Sprintf("#EXT-X-TARGETDURATION:%d\n", int(math.Ceil(segmentDuration))))
+	b.WriteString(fmt.Sprintf("#EXT-X-MEDIA-SEQUENCE:%d\n", max(0, mediaSequence)))
+	b.WriteString(fmt.Sprintf("#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", max(0, discontinuitySequence)))
+	for index := begin; index < end; index++ {
+		for range discontinuities[index] {
+			b.WriteString("#EXT-X-DISCONTINUITY\n")
+		}
+		length := segmentDuration
+		if ended && index == end-1 && lastDuration > 0 {
+			length = lastDuration
+		}
+		b.WriteString("#EXT-X-PROGRAM-DATE-TIME:" +
+			hlsProgramDateTime(float64(index)*segmentDuration) + "\n")
+		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", length))
+		b.WriteString(versionedAsset(
+			fmt.Sprintf("%s%0*d.vtt", subtitleSegmentPrefix, segmentNumberWidth, index),
+			assetVersion,
+		) + "\n")
+	}
+	if ended {
+		b.WriteString("#EXT-X-ENDLIST\n")
+	}
+	return b.String()
 }
 
 func buildProgressiveMediaPlaylist(segmentDuration float64, windowSegments int, prefix, suffix, assetVersion string, segments int, lastDuration float64, ended bool) string {
@@ -244,30 +343,7 @@ func buildMaterializedPlaylist(
 	ended bool,
 	fragments []HLSFragment,
 ) string {
-	fragments = append([]HLSFragment(nil), fragments...)
-	sort.Slice(fragments, func(i, j int) bool {
-		if math.Abs(fragments[i].Start-fragments[j].Start) > 0.001 {
-			return fragments[i].Start < fragments[j].Start
-		}
-		return fragments[i].Duration > fragments[j].Duration
-	})
-	prepared := fragments[:0]
-	cursor := math.Inf(-1)
-	for _, fragment := range fragments {
-		if fragment.Duration <= 0.001 || fragment.Name == "" {
-			continue
-		}
-		if !math.IsInf(cursor, -1) {
-			if overlap := cursor - fragment.Start; overlap > 0.001 && overlap <= 0.25 {
-				fragment.Start = cursor
-			}
-			if fragment.Start < cursor-0.001 {
-				continue
-			}
-		}
-		prepared = append(prepared, fragment)
-		cursor = fragment.Start + fragment.Duration
-	}
+	prepared := prepareMaterializedFragments(fragments)
 
 	targetSeconds := int(math.Ceil(targetDuration.Seconds()))
 	for _, fragment := range prepared {
@@ -297,6 +373,8 @@ func buildMaterializedPlaylist(
 			b.WriteString(fmt.Sprintf("#EXT-X-MAP:URI=\"%s\"\n", versionedAsset(fragment.Init, assetVersion)))
 			currentInit = fragment.Init
 		}
+		b.WriteString("#EXT-X-PROGRAM-DATE-TIME:" +
+			hlsProgramDateTime(fragment.Start) + "\n")
 		b.WriteString(fmt.Sprintf("#EXTINF:%.3f,\n", fragment.Duration))
 		b.WriteString(versionedAsset(fragment.Name, assetVersion) + "\n")
 		previous = fragment
@@ -306,6 +384,43 @@ func buildMaterializedPlaylist(
 		b.WriteString("#EXT-X-ENDLIST\n")
 	}
 	return b.String()
+}
+
+func prepareMaterializedFragments(fragments []HLSFragment) []HLSFragment {
+	fragments = append([]HLSFragment(nil), fragments...)
+	sort.Slice(fragments, func(i, j int) bool {
+		if math.Abs(fragments[i].Start-fragments[j].Start) > 0.001 {
+			return fragments[i].Start < fragments[j].Start
+		}
+		return fragments[i].Duration > fragments[j].Duration
+	})
+	prepared := fragments[:0]
+	cursor := math.Inf(-1)
+	for _, fragment := range fragments {
+		if fragment.Duration <= 0.001 || fragment.Name == "" ||
+			math.IsNaN(fragment.Start) || math.IsInf(fragment.Start, 0) ||
+			math.IsNaN(fragment.Duration) || math.IsInf(fragment.Duration, 0) {
+			continue
+		}
+		if !math.IsInf(cursor, -1) {
+			if overlap := cursor - fragment.Start; overlap > 0.001 && overlap <= 0.25 {
+				fragment.Start = cursor
+			}
+			if fragment.Start < cursor-0.001 {
+				continue
+			}
+		}
+		prepared = append(prepared, fragment)
+		cursor = fragment.Start + fragment.Duration
+	}
+	return prepared
+}
+
+func hlsProgramDateTime(sourceSeconds float64) string {
+	const layout = "2006-01-02T15:04:05.000Z07:00"
+	base := time.Date(2000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	offset := time.Duration(math.Round(max(0, sourceSeconds) * float64(time.Second)))
+	return base.Add(offset).Format(layout)
 }
 
 func playlistStartOffset(fragments []HLSFragment, sourceTarget float64) (float64, bool) {
@@ -376,12 +491,12 @@ func GenerateDirectWindow(
 	)
 	if fmp4 {
 		args = append(args,
-			"-hls_flags", "temp_file+split_by_time",
+			"-hls_flags", "temp_file",
 			"-hls_segment_type", "fmp4",
 			"-hls_fmp4_init_filename", "init.mp4",
 		)
 	} else {
-		args = append(args, "-hls_flags", "temp_file+split_by_time")
+		args = append(args, "-hls_flags", "temp_file")
 	}
 	args = append(args,
 		"-hls_segment_filename", filepath.Join(workDir, "part_%06d"+segmentExtension),
@@ -912,48 +1027,28 @@ func GenerateSubtitleSegment(
 		args = append(args, "-rw_timeout", "250000")
 	}
 	args = append(args,
-		// Preserve source timestamps so a cue repeated across adjacent WebVTT
-		// segments retains identical timing for hls.js deduplication.
 		"-copyts",
 		"-i", inputURL,
+		// Preserve source timestamps so a cue repeated across adjacent WebVTT
+		// segments retains identical timing for hls.js deduplication.
 		"-to", segmentEnd,
 		"-map", fmt.Sprintf("0:s:%d", subtitleTrack),
 		"-c:s", "webvtt",
 		"-f", "webvtt",
 		tmp,
+		// A subtitle-only output has no packet clock when the interval contains
+		// no cues, so FFmpeg otherwise reads until the next cue. A stream-copy
+		// video sink supplies the target interval's media clock without decoding
+		// or publishing duplicate video.
+		"-to", segmentEnd,
+		"-map", "0:v:0",
+		"-c:v", "copy",
+		"-an", "-sn", "-dn",
+		"-f", "null",
+		"-",
 	)
-	runCtx, stop := context.WithCancel(ctx)
-	runDone := make(chan error, 1)
-	go func() {
-		_, err := cli.RunWithStdin(runCtx, nil, "ffmpeg", args...)
-		runDone <- err
-	}()
-
-	// A subtitle-only output can still look beyond the target interval for the
-	// next subtitle packet. Stop that look-ahead after the materialized packets
-	// have had time to be decoded; the result is either the complete cue set for
-	// this interval or an intentionally empty segment.
-	const cachedIntervalScanGrace = 500 * time.Millisecond
-	timer := time.NewTimer(cachedIntervalScanGrace)
-	defer timer.Stop()
-	scanExpired := false
-	var runErr error
-	select {
-	case runErr = <-runDone:
-	case <-timer.C:
-		scanExpired = true
-		stop()
-		runErr = <-runDone
-	case <-ctx.Done():
-		stop()
-		return errors.Join(ctx.Err(), <-runDone)
-	}
-	stop()
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Join(ctxErr, runErr)
-	}
-	if runErr != nil && !(scanExpired && errors.Is(runErr, context.Canceled)) {
-		return runErr
+	if _, err := cli.RunWithStdin(ctx, nil, "ffmpeg", args...); err != nil {
+		return err
 	}
 	if err := addWebVTTTimestampMap(tmp, segmentStartTime); err != nil {
 		return err
@@ -976,7 +1071,11 @@ func addWebVTTTimestampMap(path string, mediaOffset time.Duration) error {
 	mapped := make([]byte, 0, len(data)+len(header))
 	mapped = append(mapped, data[:lineEnd+1]...)
 	mapped = append(mapped, header...)
-	mapped = append(mapped, data[lineEnd+1:]...)
+	body := data[lineEnd+1:]
+	if len(body) == 0 || body[0] != '\n' {
+		mapped = append(mapped, '\n')
+	}
+	mapped = append(mapped, body...)
 	return os.WriteFile(path, mapped, 0644)
 }
 

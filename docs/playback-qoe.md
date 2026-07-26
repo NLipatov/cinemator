@@ -39,8 +39,18 @@ if that is predicted to avoid an immediate interruption.
 
 A selected subtitle track is part of useful playback rather than an optional
 startup enhancement. Time to useful playback therefore ends only after the
-subtitle segment covering the requested position is ready; attaching video
-without the selected track does not satisfy the startup or seek objective.
+subtitle segment covering the requested position is readable and the browser
+player has successfully processed that selected subtitle fragment. The client
+MUST NOT call `play()` before that point. During playback, every later subtitle
+fragment requested at the active playhead remains foreground work. Attaching
+or continuing video without the selected track does not satisfy the startup,
+seek, or continuity objective.
+
+The video and selected-subtitle media playlists MUST expose the same media
+sequence and a common source-time program-date-time mapping. Browser integration
+tests MUST fetch both real playlists, verify that mapping, and observe the
+selected VTT processing before the first resumed decoded frame. A mocked HLS
+event test alone is not evidence for this invariant.
 
 No buffering policy can provide uninterrupted source-quality playback when
 available delivery capacity remains below the selected representation's
@@ -70,22 +80,30 @@ playlist errors, empty forward buffers, and unsolicited media `seeking` events.
 They verify that the video element, hls.js instance, duration, and last
 presented position remain stable until the user issues a command.
 
-The application-owned seek timeline is the browser command boundary. Its
-pointer and keyboard input may emit multiple scrub positions, which are
-coalesced to the final target. A `seeking` event from the media element or
-hls.js is an internal positioning effect, not a user command; browser-native
-controls inside a closed user-agent shadow tree are not used as an
-authorization signal. An internal seek MUST NOT replace the committed target
-or cancel preparation of its missing presentation. A decoded frame from the
-old position that arrives after the commit also MUST NOT take ownership of the
-playhead or satisfy the seek-to-first-frame measurement.
+The browser-native `<video controls>` timeline is the browser command boundary.
+The client MUST recognize the command through every signal the browser exposes:
+pointer or keyboard intent where available, Chromium's pointer-less
+`pause → seeking → play` transaction, and `seeking` from an already-paused
+transport outside known attach, readiness, or playhead-restoration work.
+Known internal positioning during attach or restoration is not a user command
+and MUST NOT replace the committed target or cancel preparation of its missing
+presentation. Accepted positions are coalesced to the final target.
+A decoded frame from the old position that arrives after the commit also MUST
+NOT take ownership of the playhead or satisfy the seek-to-first-frame
+measurement.
 
-Pause and Resume intent is owned by the playback session, independently of a
-particular media or hls.js attachment. The application controls MUST remain
-actionable while startup, a cold seek, presentation recovery, or a track change
-is preparing. Replacing or recovering a presentation MUST preserve the latest
+Chromium does not expose pointer events from its user-agent timeline to the
+page. While playing, it emits Pause before `seeking` and Resume immediately
+afterward, with the new `currentTime` already visible at Pause. That transaction
+MUST authorize the seek and MUST NOT turn it into an internal snap-back.
+
+Once the browser emits an explicit native Pause or Resume command, that intent
+is owned by the playback session independently of a particular media or hls.js
+attachment. Replacing or recovering a presentation MUST preserve the latest
 explicit transport intent: a paused session stays paused, and a requested
-resume starts only when its target presentation can play.
+resume starts only when its target presentation can play. Before media is
+playable, control availability and disabled state follow the browser's native
+`<video controls>` behavior.
 
 Before the first presented frame, the client MAY discard one attachment whose
 playlist generation became stale between readiness and loading. It MUST prepare
@@ -248,9 +266,10 @@ pieces.
 - Waiting for source data before FFmpeg starts MUST NOT consume a scarce media
   worker. A live FFmpeg process remains under its encoder or packager limit
   until it exits or is cancelled; it MUST NOT resume outside that limit.
-- A job with no source, FFmpeg, or publication progress MUST leave or be
-  preempted from the active CPU stage by its stage-specific no-progress
-  deadline.
+- A live FFmpeg process waiting on its currently requested torrent range keeps
+  its admitted worker and is fed in place. The packaging no-progress deadline
+  applies once that range is complete; the overall preparation deadline still
+  bounds unavailable-source waiting.
 - The system MUST NOT report `ready` until a complete decodable fragment
   covering the requested target is readable.
 
@@ -262,17 +281,17 @@ the deterministic SLO fixtures.
 
 ### Stage-aware preparation
 
-Each media job MUST expose one current stage. Source underflow moves a live
-process briefly to `source_blocked`, cancels that attempt, and returns the job
-to `waiting_source` outside worker admission:
+Each media job MUST expose one current stage. Source underflow moves the
+admitted process to `source_blocked` without replacing it; the torrent reader
+feeds the missing range into that same process:
 
 ```text
 queued -> waiting_source -> waiting_cpu -> packaging -> publishing -> ready
-              ^                               |
-              |                               v
-              +----------------------- source_blocked
-                                              |
-                                       cancelled | error
+                                          ^      |
+                                          |      v
+                                      source_blocked
+                                          |
+                                   cancelled | error
 ```
 
 Stage transitions, last progress, active/known peers, generation mode, and
@@ -293,22 +312,25 @@ process-wide or range-reader counter.
 The existing overall preparation deadline remains a final safety bound. It is
 not a substitute for stage-specific no-progress handling:
 
-- `waiting_source` remains waitable while useful delivery advances and does not
-  hold encoder or packager admission;
+- `waiting_source` remains waitable before process admission while useful
+  delivery advances. Once FFmpeg is admitted, `source_blocked` retains both the
+  logical entitlement and the live process while its requested range downloads;
 - when the range reader has identified a bounded byte range with missing pieces
   and neither source bytes nor HLS output advances during the 500-millisecond
-  observation interval, the attempt enters `source_blocked` and is cancelled.
-  Worker admission is released before the job waits for that range. The source
-  owns the bounded piece-priority lease until the range is fully verified, the
-  job is cancelled, or the overall preparation deadline expires;
+  observation interval, the process enters `source_blocked` but is not
+  cancelled or restarted. The reader remains the single demand path for those
+  pieces until the range is verified, the target is retired, or the overall
+  preparation deadline expires;
 - a packaging process that receives input but creates neither output nor a
   diagnostic within `max(10 seconds, 3D, 2 * Tpackage)` is terminated and
-  reported. The deadline may be renewed only by verified input progress,
+  reported once its current source range is complete. The deadline may be
+  renewed only by verified input progress,
   published output progress, or a new bounded diagnostic identifying a
   different required range; repeated reads of the same bytes are not progress;
-- retries reuse verified pieces and complete immutable assets, resume from the
-  first unpublished nominal segment, and never truncate the already advertised
-  tail of the same presentation.
+- a process retry after a real media failure reuses verified pieces and
+  complete immutable assets, resumes from the first unpublished nominal
+  segment, and never truncates the already advertised tail of the same
+  presentation.
 
 ### Foreground scheduling
 
@@ -330,18 +352,39 @@ materialization.
   the cancelled job MUST be released before the replacement can be rejected as
   capacity-exhausted.
 - A required target-subtitle job receives foreground packager admission and is
-  a readiness barrier before later media packaging. It does not consume the
-  encoder lane, and confirmed source waiting releases the packager lane.
-- Requests for the same canonical asset MUST still join one operation, and
-  multiple viewers of the same representation MUST share its materialized
-  horizon.
+  a readiness barrier before later media packaging. Every later selected
+  subtitle fragment requested by the active player is also foreground work. It
+  preempts background video continuation in the same session execution lane,
+  does not overlap that cancelled process, and confirmed source waiting retains
+  its packager entitlement.
+- Requests for the same canonical asset within one playback session MUST still
+  join one operation. Mutable presentation and target ownership MUST NOT be
+  shared across playback sessions.
+- One torrent runtime is shared per infohash. Each distinct admitted playback
+  session target keeps an independent bounded critical-range demand on that
+  runtime and reuses the process-wide verified torrent piece cache.
+- Admission of a new viewer MUST queue or fail visibly before it revokes,
+  replaces, or repeatedly preempts the worker entitlement or critical source
+  range of an existing admitted playback target. Peer throughput is still a
+  shared physical resource; bandwidth-aware admission is not yet a current
+  guarantee.
 
 Encoder admission, lightweight-packager admission, and source-I/O waiting are
 separate resources. Where bounded access metadata is available, hybrid
 playback SHOULD materialize its first critical source extent before starting
-FFmpeg. Otherwise a source-blocked FFmpeg is cancelled promptly before its
-worker admission is released; it MUST NOT leave an unlimited process outside
-admission control.
+FFmpeg. Otherwise the admitted FFmpeg process remains attached to its torrent
+reader while the requested source range arrives. Missing pieces change the
+observable stage, not process identity or worker ownership.
+
+One playback session runs at most one FFmpeg process concurrently. Video and
+subtitle packaging share a priority-aware session execution lane. Foreground
+work cancels a background owner, waits for its release, and then executes;
+independent sessions may run concurrently only when global capacity admits
+them.
+
+Selected text-subtitle materialization is bounded by the target's video clock.
+A cue-free interval publishes an empty WebVTT segment after reading only that
+media interval; it MUST NOT scan forward to the next subtitle cue.
 
 ### Fast startup path
 
@@ -467,6 +510,12 @@ hash or internal stream identifier MAY be used in diagnostic logs.
 Tests exercise public behavior and MUST NOT add production hooks solely for
 measurement.
 
+Backend orchestration tests replace FFprobe and FFmpeg only at the narrow
+package-private media-process boundaries. Scheduling, source demand, retries,
+publication callbacks, playlists, and cache ownership remain real in those
+tests. Separate integration tests execute the production adapter against the
+installed binaries.
+
 ### Gated regression contract
 
 The following user-visible regressions are release-gating. The named tests run
@@ -481,10 +530,10 @@ before running Go tests.
 | Readiness never exposes materialized cache outside the published generation during a presentation change; a pre-frame `409` is recovered once without an attach loop | Go: `TestPlaybackStatusUsesOnlyThePublishedPresentationForReadiness`; Playwright: `reprepares once when the presentation changes before the first frame` and `never replaces or rewinds active playback when the next HLS fragment is delayed` |
 | Direct and hybrid startup returns after the first complete target-covering fragment while the admitted window continues under one owner | Go: `TestWaitForDirectTargetReturnsBeforeTheWindowJobCompletes` and integration `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` |
 | GOP-aligned fragments that continuously cover a nominal interval, including a partially overlapping bridge between independently generated windows, terminate prefetch instead of re-enqueuing the same interval | Go: `TestNextUncoveredDirectSegmentAcceptsContiguousFragmentCoverage` and `TestDirectOverlapBridgeAdvancesMaterializedCoverage` |
-| A committed seek owns its exact target; older work, a late decoded frame, or a trailing media/HLS seek after the gesture cannot snap it back, jump to a live edge, or win a seek storm | Playwright: `keeps an unbuffered timeline click committed while its presentation is loading`, `keeps a committed seek authoritative over a late frame from the old position`, `returns playhead ownership to presented frames after a committed seek`, `keeps an unbuffered seek committed when media snaps back after the gesture`, `keeps a keyboard seek committed when media snaps back`, and `does not treat a cancelled timeline gesture as a seek command`, plus seek tests covering 0 seconds, 22 minutes, retained history, delayed preparation, repeated events, and latest-target wins |
-| Explicit Pause and Resume survive startup, track changes, and presentation replacement without an unsolicited start | Playwright: `honors pause before the first HLS presentation is ready`, `honors resume requested before the first HLS presentation is ready`, `keeps an explicit pause while a cold seek attaches its target presentation`, and `keeps a paused session paused while changing the selected subtitle track` |
+| A committed native seek owns its exact target; missing pointer events, older work, late decoded frames, and media/HLS snap-back cannot return it to the previous position | Playwright: `accepts the native Chromium timeline sequence even though controls expose no pointer events`, `accepts a native timeline seek from an already paused session without pointer events`, `keeps an unbuffered native timeline seek committed while its presentation is loading`, `keeps a committed seek authoritative over a late frame from the old position`, `returns playhead ownership to presented frames after a committed seek`, the keyboard, retained-history, seek-storm, and latest-target scenarios, and full-stack `keeps selected subtitles through consecutive real cold seeks`, which physically clicks the native timeline |
+| Explicit Pause and Resume survive track changes and presentation replacement without an unsolicited start | Playwright: `keeps an explicit pause while a cold seek attaches its target presentation` and `keeps a paused session paused while changing the selected subtitle track` |
+| A selected text subtitle is part of readiness and continuous playback; main video alone cannot start or starve later active-playhead cues, cue-free target intervals do not scan to a distant cue, video and subtitle discontinuity sequences remain aligned, and fatal subtitle loss stops visibly | Playwright: `renders a later selected cue after an empty leading segment through real hls.js`, `does not attach playback until the selected subtitle target is ready`, `does not start playback until the selected subtitle fragment is processed`, `keeps a cold seek pending until its selected subtitle segment is ready`, `keeps a replacement HLS presentation paused until subtitles at the cold seek target are processed`, `stops instead of silently continuing without selected subtitles`, deterministic full-stack `keeps selected subtitles through consecutive real cold seeks`, and opt-in public-magnet playback with selected subtitles; Go: playlist-continuity coverage, `TestAddWebVTTTimestampMapKeepsEmptySegmentValid`, `TestSelectedSubtitleAssetPreemptsBackgroundSessionExecution`, `TestPlaybackSessionForegroundMediaExecutionPreemptsBackground`, `TestPackagerWaitsInPlaceForMissingTorrentData`, real-FFmpeg `TestGenerateEmptySubtitleSegmentDoesNotReadUntilTheNextCue`, scheduler/status tests, and `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` |
 | Temporary `429`/`503` admission pressure remains waitable and a newer seek cancels the old retries | Playwright: `retries transient streaming capacity without replacing the player or losing the seek target` and `cancels capacity retries when the user commits a newer seek` |
-| A selected text subtitle is part of readiness at startup and after a cold seek; fatal subtitle loss stops playback visibly | Playwright selected-subtitle tests plus Go scheduler/status tests `TestPlaybackStatusWaitsForSelectedSubtitleTarget`, `TestRequestedSubtitleWaitsForTargetVideoWithoutStoppingItsRemainder`, and `TestSelectedSubtitleJobFailureFailsItsPlaybackTarget` |
 | Advancing media time without new decoded video frames is detected as a playback stall | Playwright: `detects frozen video frames even while the player clock can advance` |
 | The real backend path produces decodable video and audio, selected WebVTT at the initial and distant targets, one reusable presentation, a fast cached return, generation-readable playlists for concurrent prepare calls, and continued publication while cache enforcement snapshots active assets | Go integration: `TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory` using a local BitTorrent seeder and real FFmpeg/ffprobe; streaming changes additionally stress this scenario with repeated runs |
 | Capped torrent storage cannot recurse until goroutine stack overflow | Go integration: `TestForkReaderBoundsCappedStorageRetriesUntilCancellation` against the selected torrent fork |
@@ -500,15 +549,14 @@ The deterministic suite includes:
 
 - warm H.264/AAC startup;
 - cold H.264/AAC startup through a seeded torrent;
-- H.264 with E-AC-3 5.1 hybrid startup, proving that source waiting does not
-  monopolize CPU admission beyond the source-blocked grace period;
+- H.264 with E-AC-3 5.1 hybrid startup, proving that one admitted process keeps
+  its worker while the torrent reader feeds a delayed range without spawning
+  replacement processes;
 - H.264 with E-AC-3 5.1 where an initial sparse range succeeds, FFmpeg then
   requests a delayed nonsequential range, and the first fragment is not yet
-  publishable; status MUST identify that range and its missing pieces, foreground
-  CPU work MUST become admissible no later than the source-blocked grace
-  deadline, manager-owned demand for those pieces MUST remain active after
-  FFmpeg and its reader exit, and playback MUST continue automatically when
-  those pieces are verified;
+  publishable; status MUST identify that range and its missing pieces, the same
+  admitted FFmpeg process and reader MUST remain alive, and playback MUST
+  continue automatically when those pieces are verified;
 - five or more consecutive generation windows at sustainable delivery;
 - marginal delivery with buffer growth before playback;
 - no-peer and missing-piece waiting with visible stage and no CPU-slot leak;

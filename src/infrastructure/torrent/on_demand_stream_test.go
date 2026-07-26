@@ -41,6 +41,47 @@ func TestStreamStatusTracksRequestedSegmentProgress(t *testing.T) {
 	}
 }
 
+func TestPackagerWaitsInPlaceForMissingTorrentData(t *testing.T) {
+	now := time.Now()
+	stage, err := classifyPackagerObservation(packagerObservation{
+		now:                now,
+		sourceProgress:     now.Add(-time.Second),
+		outputProgress:     now.Add(-time.Second),
+		diagnosticProgress: now.Add(-time.Second),
+		rangeStart:         8 << 20,
+		rangeEnd:           16 << 20,
+		missingPieces:      1,
+		noOutputDeadline:   10 * time.Second,
+	})
+
+	if err != nil {
+		t.Fatalf("missing torrent data stopped the active media process: %v", err)
+	}
+	if stage != domain.HlsStageSourceBlocked {
+		t.Fatalf("stage = %q, want %q", stage, domain.HlsStageSourceBlocked)
+	}
+}
+
+func TestPackagerFailsWhenCompleteSourceMakesNoProgress(t *testing.T) {
+	now := time.Now()
+	stage, err := classifyPackagerObservation(packagerObservation{
+		now:                now,
+		sourceProgress:     now.Add(-time.Minute),
+		outputProgress:     now.Add(-time.Minute),
+		diagnosticProgress: now.Add(-time.Minute),
+		rangeStart:         8 << 20,
+		rangeEnd:           16 << 20,
+		noOutputDeadline:   10 * time.Second,
+	})
+
+	if !errors.Is(err, errPackagerNoOutput) {
+		t.Fatalf("complete source stall = %v, want %v", err, errPackagerNoOutput)
+	}
+	if stage != domain.HlsStageError {
+		t.Fatalf("stage = %q, want %q", stage, domain.HlsStageError)
+	}
+}
+
 func TestParseSegmentName(t *testing.T) {
 	index, ok := parseSegmentName("chunk_000123.ts", "chunk_", ".ts")
 	if !ok || index != 123 {
@@ -573,6 +614,40 @@ func TestDirectPrefetchAdvancesOnlyForTailAsset(t *testing.T) {
 	}
 }
 
+func TestProgressivePrefetchDoesNotTreatBufferedVideoAsThePlayhead(t *testing.T) {
+	stream := &streamInfo{
+		playheadSegment:  10,
+		progressiveRetry: true,
+	}
+	manager := &manager{settings: settings.NewSettings()}
+
+	manager.prefetchProgressiveWindow(stream, 20)
+
+	if stream.playheadSegment != 10 {
+		t.Fatalf("playhead segment = %d, want 10", stream.playheadSegment)
+	}
+}
+
+func TestSelectedRenditionsAdvanceTheDeliveryPlayheadTogether(t *testing.T) {
+	stream := &streamInfo{
+		mediaInfo:               domain.MediaInfo{Subtitles: []domain.SubtitleTrack{{Index: 0, Codec: "subrip"}}},
+		selection:               ffmpeg.StreamSelection{SubtitleTrackIndex: 0},
+		playheadSegment:         19,
+		videoDeliverySegment:    19,
+		subtitleDeliverySegment: 19,
+	}
+
+	if got := recordVideoDeliveryLocked(stream, 30); got != 19 {
+		t.Fatalf("video-only delivery advanced playhead to %d, want 19", got)
+	}
+	if got := recordSubtitleDeliveryLocked(stream, 20); got != 20 {
+		t.Fatalf("synchronized delivery playhead = %d, want 20", got)
+	}
+	if got := recordSubtitleDeliveryLocked(stream, 25); got != 25 {
+		t.Fatalf("synchronized delivery playhead = %d, want 25", got)
+	}
+}
+
 func TestDirectFragmentsReportTheRequestedTimeReady(t *testing.T) {
 	windows := map[int][]ffmpeg.HLSFragment{
 		101: {{Start: 603, Duration: 8, Name: "direct.m4s"}},
@@ -964,6 +1039,55 @@ func TestExtendingCurrentPresentationDoesNotRotateGeneration(t *testing.T) {
 	}
 	if !strings.Contains(string(playlist), "first.m4s?v=current") || !strings.Contains(string(playlist), "extension.m4s?v=current") {
 		t.Fatalf("extended presentation is incomplete:\n%s", playlist)
+	}
+}
+
+func TestAdjacentTranscodeWindowsKeepContinuousPlaylistTimeline(t *testing.T) {
+	dir := t.TempDir()
+	first := ffmpeg.HLSFragment{
+		Start:    0,
+		Duration: 2,
+		Name:     videoSegmentName(0),
+	}
+	stream := &streamInfo{
+		paths: streamPaths{
+			outDir:           dir,
+			videoPlaylist:    filepath.Join(dir, "index.m3u8"),
+			subtitlePlaylist: filepath.Join(dir, "subs.m3u8"),
+			masterPlaylist:   filepath.Join(dir, "master.m3u8"),
+		},
+		assetVersion:           "current",
+		directPlay:             false,
+		selection:              ffmpeg.StreamSelection{AudioTrackIndex: -1, SubtitleTrackIndex: -1},
+		playlistTargetDuration: 2 * time.Second,
+		mediaInfo:              domain.MediaInfo{Duration: 120},
+		materializedWindows: map[int][]ffmpeg.HLSFragment{
+			0: {first},
+		},
+		publishedFragments: []ffmpeg.HLSFragment{first},
+	}
+	manager := &manager{settings: settings.NewSettings()}
+	job := &segmentJob{begin: 1, materializationBegin: 1, targetSeconds: 0}
+	stream.videoJobs = map[*segmentJob]struct{}{job: {}}
+
+	continuation := []ffmpeg.HLSFragment{{
+		Start:    2,
+		Duration: 2,
+		Name:     videoSegmentName(1),
+	}}
+	if err := manager.publishMaterializedWindow(stream, job, continuation, false, false, 2, false); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := stream.materializedWindows[1][0].Discontinuity; got {
+		t.Fatal("continuous transcode window was marked discontinuous")
+	}
+	playlist, err := os.ReadFile(stream.paths.videoPlaylist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(playlist), "\n#EXT-X-DISCONTINUITY\n") {
+		t.Fatalf("continuous transcode playlist contains a discontinuity:\n%s", playlist)
 	}
 }
 

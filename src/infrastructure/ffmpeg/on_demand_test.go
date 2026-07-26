@@ -34,7 +34,7 @@ func TestPublishFileWithoutReplacementKeepsPublishedAsset(t *testing.T) {
 	}
 }
 
-func TestPrepareOnDemandHLSPublishesVirtualTextSubtitleTimeline(t *testing.T) {
+func TestPrepareOnDemandHLSDoesNotAdvertiseUnmaterializedSubtitles(t *testing.T) {
 	dir := t.TempDir()
 	info := domain.MediaInfo{
 		Duration:  30,
@@ -71,10 +71,101 @@ func TestPrepareOnDemandHLSPublishesVirtualTextSubtitleTimeline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"#EXT-X-MEDIA-SEQUENCE:0", "subs_000000.vtt?v=v1", "subs_000001.vtt?v=v1", "subs_000002.vtt?v=v1", "#EXT-X-ENDLIST"} {
-		if !strings.Contains(string(subtitles), want) {
-			t.Fatalf("virtual subtitle playlist missing %q:\n%s", want, subtitles)
+	if strings.Contains(string(subtitles), "subs_") || strings.Contains(string(subtitles), "#EXT-X-ENDLIST") {
+		t.Fatalf("initial subtitle playlist advertises unmaterialized media:\n%s", subtitles)
+	}
+}
+
+func TestUpdateMaterializedSubtitleHLSMatchesVideoWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subs.m3u8")
+	err := UpdateMaterializedSubtitleHLS(
+		path,
+		2*time.Second,
+		"v2",
+		7,
+		1,
+		false,
+		[]HLSFragment{
+			{Start: 38.2, Duration: 2.1, Name: "chunk_000019.ts"},
+			{Start: 40.3, Duration: 3.8, Name: "chunk_000020.ts"},
+		},
+	)
+	if err != nil {
+		t.Fatalf("UpdateMaterializedSubtitleHLS() error = %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	playlist := string(data)
+	for _, want := range []string{
+		"#EXT-X-MEDIA-SEQUENCE:7",
+		"#EXT-X-DISCONTINUITY-SEQUENCE:1",
+		"#EXT-X-PROGRAM-DATE-TIME:2000-01-01T00:00:38.000Z",
+		"#EXT-X-PROGRAM-DATE-TIME:2000-01-01T00:00:40.000Z",
+		"subs_000019.vtt?v=v2",
+		"subs_000020.vtt?v=v2",
+		"subs_000021.vtt?v=v2",
+		"subs_000022.vtt?v=v2",
+	} {
+		if !strings.Contains(playlist, want) {
+			t.Fatalf("materialized subtitle playlist missing %q:\n%s", want, playlist)
 		}
+	}
+	for _, unwanted := range []string{
+		"#EXT-X-GAP",
+		"subs_000000.vtt",
+		"subs_000018.vtt?v=",
+		"subs_000023.vtt",
+		"#EXT-X-ENDLIST",
+	} {
+		if strings.Contains(playlist, unwanted) {
+			t.Fatalf("materialized subtitle playlist contains %q:\n%s", unwanted, playlist)
+		}
+	}
+}
+
+func TestMaterializedSubtitlePlaylistPreservesContinuityAcrossWindowSlide(t *testing.T) {
+	dir := t.TempDir()
+	initial := filepath.Join(dir, "initial.m3u8")
+	rotated := filepath.Join(dir, "rotated.m3u8")
+	fragments := []HLSFragment{
+		{Start: 0, Duration: 2, Name: "direct_000000_0000.ts", Discontinuity: true},
+		{Start: 2, Duration: 2, Name: "direct_000001_0000.ts", Discontinuity: true},
+		{Start: 4, Duration: 2, Name: "direct_000002_0000.ts", Discontinuity: true},
+	}
+	if err := UpdateMaterializedSubtitleHLS(
+		initial, 2*time.Second, "v1", 0, 0, false, fragments,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpdateMaterializedSubtitleHLS(
+		rotated, 2*time.Second, "v1", 1, 1, false, fragments[1:],
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	initialData, err := os.ReadFile(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotatedData, err := os.ReadFile(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialPlaylist := string(initialData)
+	rotatedPlaylist := string(rotatedData)
+	if !strings.Contains(initialPlaylist,
+		"#EXT-X-DISCONTINUITY\n#EXT-X-PROGRAM-DATE-TIME:2000-01-01T00:00:02.000Z\n"+
+			"#EXTINF:2.000,\nsubs_000001.vtt?v=v1",
+	) {
+		t.Fatalf("initial subtitle playlist does not put subs_000001 in continuity domain 1:\n%s", initialPlaylist)
+	}
+	if !strings.Contains(rotatedPlaylist,
+		"#EXT-X-DISCONTINUITY-SEQUENCE:1\n#EXT-X-PROGRAM-DATE-TIME:2000-01-01T00:00:02.000Z\n"+
+			"#EXTINF:2.000,\nsubs_000001.vtt?v=v1",
+	) {
+		t.Fatalf("rotated subtitle playlist changes the continuity domain of subs_000001:\n%s", rotatedPlaylist)
 	}
 }
 
@@ -148,6 +239,8 @@ func TestBuildMaterializedPlaylistContainsOnlyMaterializedFragments(t *testing.T
 		"#EXT-X-MEDIA-SEQUENCE:4",
 		"#EXT-X-DISCONTINUITY-SEQUENCE:0",
 		"#EXT-X-START:TIME-OFFSET=3.000,PRECISE=YES",
+		"#EXT-X-PROGRAM-DATE-TIME:2000-01-01T00:00:24.000Z",
+		"#EXT-X-PROGRAM-DATE-TIME:2000-01-01T00:00:29.500Z",
 		"#EXT-X-MAP:URI=\"init_000004.mp4?v=v1\"",
 		"direct_000004_0000.m4s?v=v1",
 		"direct_000004_0001.m4s?v=v1",
@@ -156,7 +249,7 @@ func TestBuildMaterializedPlaylistContainsOnlyMaterializedFragments(t *testing.T
 			t.Fatalf("progressive direct playlist missing %q:\n%s", want, got)
 		}
 	}
-	for _, unwanted := range []string{"seek_", "chunk_", "#EXT-X-PLAYLIST-TYPE", "#EXT-X-ENDLIST"} {
+	for _, unwanted := range []string{"seek_", "chunk_", "#EXT-X-GAP", "#EXT-X-PLAYLIST-TYPE", "#EXT-X-ENDLIST"} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("progressive direct playlist contains %q:\n%s", unwanted, got)
 		}
@@ -216,6 +309,24 @@ func TestAddWebVTTTimestampMapUsesAbsoluteMediaTime(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertFileContains(t, path, "X-TIMESTAMP-MAP=LOCAL:00:00:06.000,MPEGTS:540000")
+}
+
+func TestAddWebVTTTimestampMapKeepsEmptySegmentValid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subs.vtt")
+	if err := os.WriteFile(path, []byte("WEBVTT\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := addWebVTTTimestampMap(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "WEBVTT\nX-TIMESTAMP-MAP=LOCAL:00:00:00.000,MPEGTS:0\n\n"
+	if string(got) != want {
+		t.Fatalf("empty WebVTT segment = %q, want %q", got, want)
+	}
 }
 
 func TestFormatWebVTTTimestampPreservesLongMediaOffsets(t *testing.T) {

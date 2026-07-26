@@ -98,6 +98,7 @@ func (s *HttpServer) handler() http.Handler {
 	app.HandleFunc("/api/downloads/events", s.handleDownloadEvents)
 	app.HandleFunc("/api/downloads/", s.handleDownloadAction)
 	app.HandleFunc("/api/hls/prepare", s.handlePrepareHlsStream)
+	app.HandleFunc("/api/hls/release", s.handleReleaseHlsSession)
 	app.HandleFunc("/api/hls/status/", s.handleGetHlsStatus)
 	app.Handle("/api/hls/", http.StripPrefix("/api/hls/", http.HandlerFunc(s.handleGetHlsChunk)))
 
@@ -110,6 +111,21 @@ func (s *HttpServer) handler() http.Handler {
 	root.HandleFunc("/api/auth/login", s.handleAuthLogin)
 	root.Handle("/", s.requireAuthentication(app))
 	return root
+}
+
+func (s *HttpServer) handleReleaseHlsSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	session, err := parsePlaybackSession(r)
+	if err != nil {
+		http.Error(w, "bad playback session", http.StatusBadRequest)
+		return
+	}
+	s.mgr.ReleaseHlsSession(session)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Request) {
@@ -291,13 +307,18 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	playbackSession, err := parsePlaybackSession(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	forceTranscode := r.URL.Query().Get("transcode") == "1"
 	if value := r.URL.Query().Get("transcode"); value != "" && value != "0" && value != "1" {
 		http.Error(w, "bad transcode mode", http.StatusBadRequest)
 		return
 	}
 
-	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack, startSeconds, forceTranscode)
+	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, playbackSession, fileIndex, audioTrack, subtitleTrack, startSeconds, forceTranscode)
 	if err != nil {
 		log.Printf("prepare HLS stream: %v", err)
 		status := hlsErrorStatus(err)
@@ -638,4 +659,21 @@ func parseStartSeconds(r *http.Request) (float64, error) {
 		return 0, errors.New("bad start time")
 	}
 	return seconds, nil
+}
+
+func parsePlaybackSession(r *http.Request) (string, error) {
+	session := r.URL.Query().Get("session")
+	if len(session) == 0 || len(session) > 64 {
+		return "", errors.New("bad playback session")
+	}
+	for _, char := range session {
+		if char >= 'a' && char <= 'z' ||
+			char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' ||
+			char == '-' {
+			continue
+		}
+		return "", errors.New("bad playback session")
+	}
+	return session, nil
 }

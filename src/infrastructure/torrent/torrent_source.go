@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"cinemator/domain"
-	"cinemator/infrastructure/ffmpeg"
 
 	"github.com/anacrolix/torrent"
 )
@@ -25,6 +24,7 @@ type torrentSource struct {
 	file      *torrent.File
 	registry  *rangeServer
 	demand    *pieceDemand
+	analyzer  mediaAnalyzer
 	token     string
 	url       string
 	readahead int64
@@ -37,7 +37,7 @@ type filePieceWindow struct {
 	state torrent.PieceState
 }
 
-func newTorrentSource(file *torrent.File, registry *rangeServer, demand *pieceDemand, readaheadLimit int64, readaheadFor func(string) int64, onRequest func(string, int64, int64), onRead func(string, int64, int64), onError func(error)) (*torrentSource, error) {
+func newTorrentSource(file *torrent.File, registry *rangeServer, demand *pieceDemand, analyzer mediaAnalyzer, readaheadLimit int64, readaheadFor func(string) int64, onRequest func(string, int64, int64), onRead func(string, int64, int64), onError func(error)) (*torrentSource, error) {
 	readahead := targetReadaheadBytes(file, readaheadLimit)
 	token, sourceURL, err := registry.register(file, readahead, readaheadFor, onRequest, onRead, onError)
 	if err != nil {
@@ -47,6 +47,7 @@ func newTorrentSource(file *torrent.File, registry *rangeServer, demand *pieceDe
 		file:      file,
 		registry:  registry,
 		demand:    demand,
+		analyzer:  analyzer,
 		token:     token,
 		url:       sourceURL,
 		readahead: readahead,
@@ -95,7 +96,7 @@ func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err e
 		}()
 		reader.SetContext(ctx)
 		reader.SetReadahead(min(int64(maxProbeBytes), s.readahead))
-		return (ffmpeg.SampleAnalyzer{}).Analyze(ctx, sourceProgressReader{Reader: reader, onRead: func(n int64) {
+		return s.analyzer.Probe(ctx, sourceProgressReader{Reader: reader, onRead: func(n int64) {
 			if s.onRead != nil {
 				s.onRead("", 0, n)
 			}
@@ -110,7 +111,7 @@ func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err e
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, urlProbeTimeout)
 	defer cancel()
-	info, urlErr := (ffmpeg.SampleAnalyzer{}).AnalyzeURL(probeCtx, s.url)
+	info, urlErr := s.analyzer.ProbeURL(probeCtx, s.url)
 	if urlErr == nil {
 		return info, nil
 	}
@@ -120,7 +121,7 @@ func (s *torrentSource) Probe(ctx context.Context) (info domain.MediaInfo, err e
 func (s *torrentSource) refineDurationFromTail(ctx context.Context, info domain.MediaInfo) (domain.MediaInfo, error) {
 	tailCtx, cancel := context.WithTimeout(ctx, urlProbeTimeout)
 	defer cancel()
-	tailDuration, err := (ffmpeg.SampleAnalyzer{}).AnalyzeTailDurationURL(tailCtx, s.url, info.VideoTrackIndex)
+	tailDuration, err := s.analyzer.ProbeTailDuration(tailCtx, s.url, info.VideoTrackIndex)
 	if err != nil {
 		return info, err
 	}

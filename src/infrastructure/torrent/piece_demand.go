@@ -31,7 +31,10 @@ func (d *pieceDemand) acquire(t *torrent.Torrent, begin, end int) func() {
 	for index := begin; index < end; index++ {
 		key := pieceDemandKey{torrent: t, index: index}
 		if d.refs[key] == 0 {
-			t.Piece(index).SetPriority(torrent.PiecePriorityNormal)
+			// WaitRange represents bytes an active media worker is blocked on.
+			// Give that explicit viewer demand the same urgency as an
+			// anacrolix Reader consuming the piece right now.
+			t.Piece(index).SetPriority(torrent.PiecePriorityNow)
 		}
 		d.refs[key]++
 		keys = append(keys, key)

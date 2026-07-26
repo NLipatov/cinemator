@@ -23,6 +23,23 @@ func (m *manager) CleanupStreams() {
 	m.cleanupExpiredDownloads(context.Background())
 }
 
+func (m *manager) ReleaseHlsSession(session string) {
+	if !validPlaybackSession(session) {
+		return
+	}
+	var cleanups []<-chan struct{}
+	m.mu.Lock()
+	for key, stream := range m.active {
+		if key.Session == session {
+			cleanups = append(cleanups, m.scheduleStreamCleanupLocked(key, stream))
+		}
+	}
+	m.mu.Unlock()
+	for _, done := range cleanups {
+		<-done
+	}
+}
+
 func (m *manager) cleanup(key streamKey) {
 	m.mu.Lock()
 	stream := m.active[key]

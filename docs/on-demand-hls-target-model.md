@@ -644,11 +644,18 @@ materialization. Capacity pressure waits and retries the required subtitle
 work; it MUST NOT silently drop the selected track or attach video-only
 playback.
 
-The managed player uses an application-owned full-duration timeline and seek
-control. Browser media time is presentation-local and MUST be translated through
-the source-time mapping for display, recovery, Media Session actions, and the
-next prepare request. The native `<video>` seek range MUST NOT be presented as
-the complete source range when it represents only a bounded LIVE window.
+After startup, each selected-subtitle fragment requested at the active playhead
+remains foreground work. Within the session-owned execution lane it cancels a
+background video continuation, waits until that process has released the lane,
+then runs without overlap. Successful subtitle publication resumes the
+preempted prefetch plan from its already published prefix.
+
+The managed player uses the browser-native `<video controls>` full-duration
+timeline and seek control. Browser media time is presentation-local and MUST be
+translated through the source-time mapping for recovery, Media Session actions,
+and the next prepare request. The native `<video>` seek range MUST represent
+the complete source duration even when the materialized HLS presentation is a
+bounded window.
 
 On initial play and a seek outside currently readable media, the client MUST:
 
@@ -684,6 +691,16 @@ Concurrent requests for the same canonical asset MUST join one generation
 operation. Target time and horizon are validated and bounded by server policy.
 Rapid seeks are coalesced per session, stale queued work is cancelled, and
 per-session plus global active and queued preparation limits are enforced.
+A playback session runs at most one FFmpeg process concurrently. Its selected
+video and subtitle jobs serialize through one priority-aware, session-owned
+media execution lane. Foreground work preempts a background owner and waits for
+the cancelled process to release the lane; separate sessions may execute
+concurrently only after global admission.
+Once admitted, that process remains attached to its torrent range reader while
+missing pieces arrive; source underflow changes observable stage without
+restarting the process or re-entering worker admission. Cue-free selected-text
+subtitle intervals are terminated by the same target video clock instead of
+scanning forward to the next subtitle packet.
 
 Sessions and jobs have leases and heartbeats. FFmpeg and source reads have both
 wall-time and no-progress deadlines. Expired or abandoned work becomes
@@ -729,10 +746,13 @@ leave it registered under a direct identity.
 
 ## Session and asset identity
 
-A playback session is keyed by the source selection and resolved output
-profile, not by a mutable boolean mode. Identity includes:
+A playback session has a stable browser-generated session ID and is keyed by
+that ID, the source selection, and the resolved output profile, not by a
+mutable boolean mode. Different session IDs never share mutable target or
+presentation state. Identity includes:
 
 ```text
+playback session ID
 torrent info hash and file
 video track
 audio track or rendition

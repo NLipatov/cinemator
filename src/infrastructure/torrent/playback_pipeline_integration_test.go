@@ -104,7 +104,7 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 		t.Fatalf("media info = %+v", mediaInfo)
 	}
 
-	playlist, err := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 0, false)
+	playlist, err := m.PrepareHlsStream(ctx, magnet, "viewer-one", 0, 0, 0, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +125,7 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 		t.Fatalf("initial cue-free subtitle segment is invalid:\n%s", subtitles)
 	}
 
-	if _, err := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 4, false); err != nil {
+	if _, err := m.PrepareHlsStream(ctx, magnet, "viewer-one", 0, 0, 0, 4, false); err != nil {
 		t.Fatal(err)
 	}
 	withCue := waitForPlaybackTarget(t, m, streamDir, 4, 5*time.Second)
@@ -133,7 +133,7 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 		t.Fatalf("selected subtitle cue was not retained after the cue-free start:\n%s", got)
 	}
 
-	distantPlaylist, err := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 10, false)
+	distantPlaylist, err := m.PrepareHlsStream(ctx, magnet, "viewer-one", 0, 0, 0, 10, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +156,7 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 	prepareResults := make(chan prepareResult, 2)
 	for range 2 {
 		go func() {
-			retainedPlaylist, prepareErr := m.PrepareHlsStream(ctx, magnet, 0, 0, 0, 0, false)
+			retainedPlaylist, prepareErr := m.PrepareHlsStream(ctx, magnet, "viewer-one", 0, 0, 0, 0, false)
 			prepareResults <- prepareResult{playlist: retainedPlaylist, err: prepareErr}
 		}()
 	}
@@ -180,6 +180,29 @@ func TestLocalTorrentPlaybackPipelineKeepsAVSubtitlesAndRetainedHistory(t *testi
 		t.Fatalf("master playlist for ready generation is invalid:\n%s", got)
 	}
 	readPlaybackAsset(t, m, streamDir, "index.m3u8", retained.Generation)
+
+	secondPlaylist, err := m.PrepareHlsStream(ctx, magnet, "viewer-two", 0, 0, 0, 10, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondPlaylist == playlist {
+		t.Fatal("different playback sessions shared one mutable HLS presentation")
+	}
+	secondStreamDir := filepath.Base(filepath.Dir(secondPlaylist))
+	second := waitForPlaybackTarget(t, m, secondStreamDir, 10, 30*time.Second)
+	if second.TargetSeconds < 9.9 {
+		t.Fatalf("second playback session status = %+v", second)
+	}
+	firstAfterSecond, err := m.GetHlsStatus(ctx, streamDir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstAfterSecond.TargetSeconds != 0 || firstAfterSecond.Phase != domain.HlsPhaseReady {
+		t.Fatalf("second viewer replaced the first playback target: %+v", firstAfterSecond)
+	}
+	if got := len(m.client.Torrents()); got != 1 {
+		t.Fatalf("torrent runtimes after two playback sessions = %d, want 1", got)
+	}
 }
 
 func makePlaybackFixture(t *testing.T, dir string) string {
