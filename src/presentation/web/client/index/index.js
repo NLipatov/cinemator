@@ -111,6 +111,9 @@
       }
       if (resetLayout) document.body.classList.remove('has-player');
       const oldVideo = $('video');
+      oldVideo.pause();
+      oldVideo.removeAttribute('src');
+      oldVideo.load();
       const newVideo = oldVideo.cloneNode(false);
       oldVideo.parentNode.replaceChild(newVideo, oldVideo);
       newVideo.id = 'video';
