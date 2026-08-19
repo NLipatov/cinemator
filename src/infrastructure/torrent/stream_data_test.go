@@ -210,9 +210,12 @@ func TestCompletedStreamIsNotPausedOrReset(t *testing.T) {
 		t.Fatal("pauseStream() marked a completed stream as paused")
 	}
 
-	m.startConversionLocked(key, s)
+	_, _, resumed, exists, err := m.getOrResumeStream(context.Background(), key)
+	if err != nil || !exists || resumed {
+		t.Fatalf("getOrResumeStream() = exists %v, resumed %v, error %v", exists, resumed, err)
+	}
 	if _, err := os.Stat(sentinel); err != nil {
-		t.Fatalf("startConversionLocked() removed completed HLS cache: %v", err)
+		t.Fatalf("getOrResumeStream() removed completed HLS cache: %v", err)
 	}
 }
 
@@ -232,7 +235,7 @@ func TestGetOrResumeStreamReturnsResetFailure(t *testing.T) {
 	}
 	m := &manager{active: map[streamKey]*streamInfo{key: s}}
 
-	got, _, resumed, exists, err := m.getOrResumeStream(key)
+	got, _, resumed, exists, err := m.getOrResumeStream(context.Background(), key)
 	if !exists || got != s {
 		t.Fatalf("getOrResumeStream() stream = %p, exists = %v", got, exists)
 	}
@@ -241,6 +244,69 @@ func TestGetOrResumeStreamReturnsResetFailure(t *testing.T) {
 	}
 	if err == nil {
 		t.Fatal("getOrResumeStream() error = nil, want reset failure")
+	}
+}
+
+func TestResumeWaitDoesNotHoldManagerLock(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	s := &streamInfo{
+		paused:  true,
+		paths:   key.paths(t.TempDir()),
+		runDone: make(chan struct{}),
+	}
+	m := &manager{active: map[streamKey]*streamInfo{key: s}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	resumeResult := make(chan error, 1)
+	go func() {
+		_, _, _, _, err := m.getOrResumeStream(ctx, key)
+		resumeResult <- err
+	}()
+
+	operationObserved := make(chan struct{})
+	go func() {
+		for {
+			m.mu.Lock()
+			waiting := m.streamOps[key] != nil
+			m.mu.Unlock()
+			if waiting {
+				close(operationObserved)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Millisecond):
+			}
+		}
+	}()
+	select {
+	case <-operationObserved:
+	case <-time.After(time.Second):
+		t.Fatal("resume did not enter the old-run wait")
+	}
+
+	differentKeyReady := make(chan struct{})
+	go func() {
+		m.mu.Lock()
+		m.active[streamKey{InfoHash: "other"}] = &streamInfo{}
+		m.mu.Unlock()
+		close(differentKeyReady)
+	}()
+	select {
+	case <-differentKeyReady:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("resume wait blocked unrelated manager state")
+	}
+
+	cancel()
+	select {
+	case err := <-resumeResult:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("getOrResumeStream() error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("getOrResumeStream() did not honor cancellation")
 	}
 }
 
@@ -275,6 +341,12 @@ func TestCanceledLastStartupWaiterCleansAbandonedStream(t *testing.T) {
 	}
 	if _, ok := m.active[key]; ok {
 		t.Fatal("waitForPlayableStream() left abandoned stream active")
+	}
+	m.mu.Lock()
+	cleanupDone := m.streamOps[key]
+	m.mu.Unlock()
+	if err := waitForDone(context.Background(), cleanupDone); err != nil {
+		t.Fatalf("waiting for abandoned stream cleanup: %v", err)
 	}
 	if _, err := os.Stat(paths.outDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("abandoned HLS directory still exists: %v", err)
@@ -359,7 +431,7 @@ func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 	m := &manager{active: map[streamKey]*streamInfo{key: s}}
 	cleanupDone := make(chan struct{})
 	go func() {
-		m.cleanup(key)
+		_ = m.cleanup(context.Background(), key)
 		close(cleanupDone)
 	}()
 
@@ -375,7 +447,7 @@ func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 	}
 
 	m.mu.Lock()
-	cleanupBarrier := m.cleanups[key]
+	cleanupBarrier := m.streamOps[key]
 	m.mu.Unlock()
 	if cleanupBarrier == nil {
 		close(runDone)
@@ -386,7 +458,7 @@ func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 	replacementPath := filepath.Join(paths.outDir, "replacement.m3u8")
 	replacementReady := make(chan error, 1)
 	go func() {
-		if err := waitForStreamCleanup(context.Background(), cleanupBarrier); err != nil {
+		if err := waitForDone(context.Background(), cleanupBarrier); err != nil {
 			replacementReady <- err
 			return
 		}
@@ -442,7 +514,7 @@ func TestCleanupDoesNotBlockDifferentStreamKey(t *testing.T) {
 	}
 	cleanupDone := make(chan struct{})
 	go func() {
-		m.cleanup(key)
+		_ = m.cleanup(context.Background(), key)
 		close(cleanupDone)
 	}()
 

@@ -22,15 +22,17 @@ import (
 )
 
 type manager struct {
-	client    *torrent.Client
-	active    map[streamKey]*streamInfo
-	cleanups  map[streamKey]chan struct{} // Reserves each output path until teardown finishes.
-	torrents  map[string]int              // References held by preparing, active, and cleaning streams.
-	sources   *rangeServer
-	downloads *downloadStore
-	events    *downloadEventBroadcaster
-	mu        sync.Mutex
-	settings  settings.Settings
+	client       *torrent.Client
+	active       map[streamKey]*streamInfo
+	streamOps    map[streamKey]chan struct{} // Serializes output lifecycle changes for each stream.
+	torrents     map[string]int              // References held by preparing, active, and cleaning streams.
+	torrentDrops map[string]chan struct{}    // Prevents reuse until the old torrent has finished dropping.
+	deletions    map[string]chan struct{}    // Prevents new streams while a download is being deleted.
+	sources      *rangeServer
+	downloads    *downloadStore
+	events       *downloadEventBroadcaster
+	mu           sync.Mutex
+	settings     settings.Settings
 }
 
 func NewManager(settings settings.Settings) (application.TorrentManager, error) {
@@ -57,14 +59,16 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 		return nil, err
 	}
 	m := &manager{
-		client:    client,
-		active:    make(map[streamKey]*streamInfo),
-		cleanups:  make(map[streamKey]chan struct{}),
-		torrents:  make(map[string]int),
-		sources:   sources,
-		downloads: downloads,
-		events:    newDownloadEventBroadcaster(),
-		settings:  settings,
+		client:       client,
+		active:       make(map[streamKey]*streamInfo),
+		streamOps:    make(map[streamKey]chan struct{}),
+		torrents:     make(map[string]int),
+		torrentDrops: make(map[string]chan struct{}),
+		deletions:    make(map[string]chan struct{}),
+		sources:      sources,
+		downloads:    downloads,
+		events:       newDownloadEventBroadcaster(),
+		settings:     settings,
 	}
 	go m.viewerWatcher()
 	return m, nil
@@ -125,16 +129,11 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 }
 
 func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (string, error) {
-	m.mu.Lock()
-	t, err := addMagnet(m.client, magnet)
+	t, hash, err := m.retainTorrent(ctx, magnet)
 	if err != nil {
-		m.mu.Unlock()
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
 		return "", err
 	}
-	hash := t.InfoHash().HexString()
-	m.torrents[hash]++
-	m.mu.Unlock()
 	torrentRetained := true
 	defer func() {
 		if torrentRetained {
@@ -158,17 +157,10 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	paths := key.paths(m.settings.HlsPath())
 
 	for {
-		m.mu.Lock()
-		cleanupDone := m.cleanups[key]
-		m.mu.Unlock()
-		if cleanupDone != nil {
-			if err := waitForStreamCleanup(ctx, cleanupDone); err != nil {
-				return "", err
-			}
-			continue
+		if err := ctx.Err(); err != nil {
+			return "", err
 		}
-
-		if s, runID, resumed, exists, err := m.getOrResumeStream(key); exists {
+		if s, runID, resumed, exists, err := m.getOrResumeStream(ctx, key); exists {
 			if err != nil {
 				return "", err
 			}
@@ -184,28 +176,25 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		}
 
 		m.mu.Lock()
-		if cleanupDone := m.cleanups[key]; cleanupDone != nil {
+		if operationDone := m.streamOps[key]; operationDone != nil {
 			m.mu.Unlock()
 			source.Close()
-			if err := waitForStreamCleanup(ctx, cleanupDone); err != nil {
+			if err := waitForDone(ctx, operationDone); err != nil {
 				return "", err
 			}
 			continue
 		}
-		if s, runID, resumed, exists, resumeErr := m.getOrResumeStreamLocked(key); exists {
+		if _, exists := m.active[key]; exists {
 			m.mu.Unlock()
 			source.Close()
-			if resumeErr != nil {
-				return "", resumeErr
-			}
-			if resumed {
-				m.notifyDownloadsChanged()
-			}
-			return m.waitForPlayableStream(ctx, key, s, runID)
+			continue
 		}
+		operationDone := m.reserveStreamOperationLocked(key)
+		m.mu.Unlock()
+
 		if err := resetStreamOutput(paths); err != nil {
 			source.Close()
-			m.mu.Unlock()
+			m.finishStreamOperation(key, operationDone)
 			return "", fmt.Errorf("reset stream output %s: %w", paths.outDir, err)
 		}
 
@@ -222,16 +211,18 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		}
 		runID := s.beginRun()
 		s.registerStartupWaiter()
+		m.mu.Lock()
 		m.active[key] = s
 		torrentRetained = false
 		m.mu.Unlock()
-		m.notifyDownloadsChanged()
 
 		file.Download()
 		file.SetPriority(torrent.PiecePriorityHigh)
 		source.PrefetchRange(0, initialProbeBytes)
 
 		m.launchConversion(streamCtx, key, s, runID)
+		m.finishStreamOperation(key, operationDone)
+		m.notifyDownloadsChanged()
 		playlist, err := m.waitForPlayableStream(ctx, key, s, runID)
 		if err != nil {
 			return "", err
@@ -241,28 +232,66 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	}
 }
 
-func (m *manager) getOrResumeStream(key streamKey) (*streamInfo, uint64, bool, bool, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.getOrResumeStreamLocked(key)
-}
-
-func (m *manager) getOrResumeStreamLocked(key streamKey) (*streamInfo, uint64, bool, bool, error) {
-	s, exists := m.active[key]
-	if !exists {
-		return nil, 0, false, false, nil
-	}
-	s.mtx.Lock()
-	s.lastView = time.Now()
-	needResume := !s.completed && (s.paused || s.cancel == nil)
-	s.mtx.Unlock()
-	if needResume {
-		if err := m.startConversionLocked(key, s); err != nil {
-			return s, 0, false, true, err
+func (m *manager) getOrResumeStream(ctx context.Context, key streamKey) (*streamInfo, uint64, bool, bool, error) {
+	for {
+		m.mu.Lock()
+		if operationDone := m.streamOps[key]; operationDone != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, operationDone); err != nil {
+				return nil, 0, false, true, err
+			}
+			continue
 		}
+
+		s, exists := m.active[key]
+		if !exists {
+			m.mu.Unlock()
+			return nil, 0, false, false, nil
+		}
+		s.mtx.Lock()
+		s.lastView = time.Now()
+		needResume := !s.completed && (s.paused || s.cancel == nil)
+		oldRunDone := s.runDone
+		s.mtx.Unlock()
+		if !needResume {
+			runID := s.registerStartupWaiter()
+			m.mu.Unlock()
+			return s, runID, false, true, nil
+		}
+
+		operationDone := m.reserveStreamOperationLocked(key)
+		m.mu.Unlock()
+		if oldRunDone != nil {
+			if err := waitForDone(ctx, oldRunDone); err != nil {
+				m.finishStreamOperation(key, operationDone)
+				return s, 0, false, true, err
+			}
+		}
+		if err := resetStreamOutput(s.paths); err != nil {
+			m.finishStreamOperation(key, operationDone)
+			return s, 0, false, true, fmt.Errorf("reset stream output %s: %w", s.paths.outDir, err)
+		}
+
+		streamCtx, cancel := context.WithCancel(context.Background())
+		m.mu.Lock()
+		if current, active := m.active[key]; !active || current != s {
+			m.mu.Unlock()
+			cancel()
+			m.finishStreamOperation(key, operationDone)
+			continue
+		}
+		s.cancel = cancel
+		s.paused = false
+		s.running = true
+		runID := s.beginRun()
+		s.registerStartupWaiter()
+		m.mu.Unlock()
+
+		s.file.SetPriority(torrent.PiecePriorityHigh)
+		m.launchConversion(streamCtx, key, s, runID)
+		m.finishStreamOperation(key, operationDone)
+		return s, runID, true, true, nil
 	}
-	runID := s.registerStartupWaiter()
-	return s, runID, needResume, true, nil
 }
 
 func (m *manager) waitForPlayableStream(ctx context.Context, key streamKey, s *streamInfo, runID uint64) (string, error) {
@@ -312,18 +341,36 @@ func (m *manager) DeleteDownload(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
+	deletionDone, err := m.reserveDownloadDeletion(ctx, id)
+	if err != nil {
+		return err
+	}
+	defer m.finishDownloadDeletion(id, deletionDone)
 
 	keys := m.streamKeysForDownload(id)
 	for _, key := range keys {
-		m.cleanup(key)
+		if err := m.cleanup(ctx, key); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	refs := m.torrents[id]
+	dropDone := m.torrentDrops[id]
+	m.mu.Unlock()
+	if refs != 0 {
+		return fmt.Errorf("torrent %s is still in use", id)
+	}
+	if err := waitForDone(ctx, dropDone); err != nil {
+		return err
 	}
 	if t, ok := m.client.Torrent(metainfo.NewHashFromHex(id)); ok {
-		t.Drop()
+		if err := m.dropTorrent(ctx, id, t); err != nil {
+			return err
+		}
 	}
-
-	m.mu.Lock()
-	delete(m.torrents, id)
-	m.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	if err := m.removeDownloadHlsDirs(id); err != nil {
 		return err
@@ -385,7 +432,7 @@ func (m *manager) streamKeysForDownload(id string) []streamKey {
 			keys = append(keys, key)
 		}
 	}
-	for key := range m.cleanups {
+	for key := range m.streamOps {
 		if key.InfoHash == id {
 			keys = append(keys, key)
 		}

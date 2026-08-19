@@ -20,7 +20,11 @@ func (m *manager) CleanupStreams() {
 		noViewers := now.Sub(s.lastView) > m.settings.ViewerTimeout()
 		s.mtx.Unlock()
 		if noViewers {
-			go m.cleanup(key)
+			go func(key streamKey) {
+				if err := m.cleanup(context.Background(), key); err != nil {
+					log.Printf("Failed to clean up stream: key=%v, err=%v", key, err)
+				}
+			}(key)
 		}
 	}
 	m.mu.Unlock()
@@ -28,39 +32,49 @@ func (m *manager) CleanupStreams() {
 	m.cleanupExpiredDownloads(context.Background())
 }
 
-func (m *manager) cleanup(key streamKey) {
-	m.cleanupMatching(key, nil, 0, false)
-}
-
-func (m *manager) cleanupIfCurrent(key streamKey, expected *streamInfo) {
-	m.cleanupMatching(key, expected, 0, false)
+func (m *manager) cleanup(ctx context.Context, key streamKey) error {
+	return m.cleanupMatching(ctx, key, nil, 0, false)
 }
 
 func (m *manager) cleanupIfCurrentRun(key streamKey, expected *streamInfo, runID uint64) {
-	m.cleanupMatching(key, expected, runID, true)
+	if err := m.cleanupMatching(context.Background(), key, expected, runID, true); err != nil {
+		log.Printf("Failed to clean up stream: key=%v, err=%v", key, err)
+	}
 }
 
-func (m *manager) cleanupMatching(key streamKey, expected *streamInfo, runID uint64, checkRun bool) {
-	m.mu.Lock()
-	s, cleanupDone, cleaned := m.cleanupMatchingLocked(key, expected, runID, checkRun)
-	m.mu.Unlock()
-	if !cleaned {
-		if cleanupDone != nil && expected == nil {
-			<-cleanupDone
+func (m *manager) cleanupMatching(ctx context.Context, key streamKey, expected *streamInfo, runID uint64, checkRun bool) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		return
+
+		m.mu.Lock()
+		s, operationDone, started := m.cleanupMatchingLocked(key, expected, runID, checkRun)
+		m.mu.Unlock()
+		if started {
+			go m.finishStreamCleanup(key, s, operationDone)
+			return waitForDone(ctx, operationDone)
+		}
+		if operationDone != nil {
+			if err := waitForDone(ctx, operationDone); err != nil {
+				return err
+			}
+			continue
+		}
+		return nil
 	}
-	m.finishStreamCleanup(key, s, cleanupDone)
 }
 
 func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, runID uint64, checkRun bool) (*streamInfo, chan struct{}, bool) {
+	if operationDone := m.streamOps[key]; operationDone != nil {
+		return nil, operationDone, false
+	}
 	s, ok := m.active[key]
 	if !ok {
-		cleanupDone := m.cleanups[key]
-		if expected == nil && cleanupDone == nil {
+		if expected == nil {
 			log.Printf("cleanup called, but no active stream found: key=%v", key)
 		}
-		return nil, cleanupDone, false
+		return nil, nil, false
 	}
 	if expected != nil && s != expected {
 		return nil, nil, false
@@ -71,16 +85,12 @@ func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, run
 	if s.cancel != nil {
 		s.cancel()
 	}
-	if m.cleanups == nil {
-		m.cleanups = make(map[streamKey]chan struct{})
-	}
-	cleanupDone := make(chan struct{})
-	m.cleanups[key] = cleanupDone
+	operationDone := m.reserveStreamOperationLocked(key)
 	delete(m.active, key)
-	return s, cleanupDone, true
+	return s, operationDone, true
 }
 
-func (m *manager) finishStreamCleanup(key streamKey, s *streamInfo, cleanupDone chan struct{}) {
+func (m *manager) finishStreamCleanup(key streamKey, s *streamInfo, operationDone chan struct{}) {
 	s.source.Close()
 	if s.runDone != nil {
 		<-s.runDone
@@ -98,40 +108,178 @@ func (m *manager) finishStreamCleanup(key streamKey, s *streamInfo, cleanupDone 
 			break
 		}
 	}
+	m.mu.Unlock()
 	if s.file != nil && !fileInUse {
 		s.file.SetPriority(torrent.PiecePriorityNone)
+
+		m.mu.Lock()
+		for activeKey := range m.active {
+			if activeKey.InfoHash == key.InfoHash && activeKey.Index == key.Index {
+				fileInUse = true
+				break
+			}
+		}
+		m.mu.Unlock()
+		if fileInUse {
+			s.file.SetPriority(torrent.PiecePriorityHigh)
+		}
 	}
-	shouldDrop := m.releaseTorrentLocked(key.InfoHash)
-	if shouldDrop && s.torrent != nil {
-		log.Printf("Dropping torrent: %s", key.InfoHash)
-		s.torrent.Drop()
+	if dropDone := m.releaseTorrent(key.InfoHash, s.torrent); dropDone != nil {
+		_ = waitForDone(context.Background(), dropDone)
 	}
-	delete(m.cleanups, key)
-	close(cleanupDone)
-	m.mu.Unlock()
+	m.finishStreamOperation(key, operationDone)
 
 	m.notifyDownloadsChanged()
 	log.Printf("Stream cleaned up: key=%v", key)
 }
 
-func waitForStreamCleanup(ctx context.Context, cleanupDone <-chan struct{}) error {
+func waitForDone(ctx context.Context, done <-chan struct{}) error {
+	if done == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	select {
-	case <-cleanupDone:
+	case <-done:
 		return ctx.Err()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (m *manager) releaseTorrent(hash string, t *torrent.Torrent) {
+func (m *manager) reserveStreamOperationLocked(key streamKey) chan struct{} {
+	if m.streamOps == nil {
+		m.streamOps = make(map[streamKey]chan struct{})
+	}
+	done := make(chan struct{})
+	m.streamOps[key] = done
+	return done
+}
+
+func (m *manager) finishStreamOperation(key streamKey, done chan struct{}) {
+	m.mu.Lock()
+	if m.streamOps[key] == done {
+		delete(m.streamOps, key)
+		close(done)
+	}
+	m.mu.Unlock()
+}
+
+func (m *manager) retainTorrent(ctx context.Context, magnet string) (*torrent.Torrent, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+		t, err := addMagnet(m.client, magnet)
+		if err != nil {
+			return nil, "", err
+		}
+		hash := t.InfoHash().HexString()
+
+		m.mu.Lock()
+		operationDone := m.deletions[hash]
+		if operationDone == nil {
+			operationDone = m.torrentDrops[hash]
+		}
+		if operationDone == nil {
+			if m.torrents == nil {
+				m.torrents = make(map[string]int)
+			}
+			m.torrents[hash]++
+			m.mu.Unlock()
+			return t, hash, nil
+		}
+		m.mu.Unlock()
+		if err := waitForDone(ctx, operationDone); err != nil {
+			return nil, "", err
+		}
+	}
+}
+
+func (m *manager) reserveDownloadDeletion(ctx context.Context, hash string) (chan struct{}, error) {
+	for {
+		m.mu.Lock()
+		if m.deletions == nil {
+			m.deletions = make(map[string]chan struct{})
+		}
+		if done := m.deletions[hash]; done != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, done); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		done := make(chan struct{})
+		m.deletions[hash] = done
+		m.mu.Unlock()
+		return done, nil
+	}
+}
+
+func (m *manager) finishDownloadDeletion(hash string, done chan struct{}) {
+	m.mu.Lock()
+	if m.deletions[hash] == done {
+		delete(m.deletions, hash)
+		close(done)
+	}
+	m.mu.Unlock()
+}
+
+func (m *manager) releaseTorrent(hash string, t *torrent.Torrent) <-chan struct{} {
 	m.mu.Lock()
 	shouldDrop := m.releaseTorrentLocked(hash)
-	if shouldDrop && t != nil {
-		log.Printf("Dropping torrent: %s", hash)
-		t.Drop()
+	if !shouldDrop || t == nil {
+		m.mu.Unlock()
+		return nil
+	}
+	done, started := m.reserveTorrentDropLocked(hash)
+	m.mu.Unlock()
+	if started {
+		go m.finishTorrentDrop(hash, t, done)
+	}
+	return done
+}
+
+func (m *manager) dropTorrent(ctx context.Context, hash string, t *torrent.Torrent) error {
+	m.mu.Lock()
+	if refs := m.torrents[hash]; refs != 0 {
+		m.mu.Unlock()
+		return fmt.Errorf("torrent %s is still in use", hash)
+	}
+	done, started := m.reserveTorrentDropLocked(hash)
+	m.mu.Unlock()
+	if started {
+		go m.finishTorrentDrop(hash, t, done)
+	}
+	return waitForDone(ctx, done)
+}
+
+func (m *manager) reserveTorrentDropLocked(hash string) (chan struct{}, bool) {
+	if m.torrentDrops == nil {
+		m.torrentDrops = make(map[string]chan struct{})
+	}
+	if done := m.torrentDrops[hash]; done != nil {
+		return done, false
+	}
+	done := make(chan struct{})
+	m.torrentDrops[hash] = done
+	return done, true
+}
+
+func (m *manager) finishTorrentDrop(hash string, t *torrent.Torrent, done chan struct{}) {
+	log.Printf("Dropping torrent: %s", hash)
+	t.Drop()
+	m.mu.Lock()
+	if m.torrentDrops[hash] == done {
+		delete(m.torrentDrops, hash)
+		close(done)
 	}
 	m.mu.Unlock()
 }
@@ -170,13 +318,17 @@ func (m *manager) releaseStartupWaiter(key streamKey, s *streamInfo, runID uint6
 	}
 	m.mu.Unlock()
 	if cleaned {
-		m.finishStreamCleanup(key, cleanedStream, cleanupDone)
+		go m.finishStreamCleanup(key, cleanedStream, cleanupDone)
 	}
 	return cleaned
 }
 
 func (m *manager) pauseStream(key streamKey) {
 	m.mu.Lock()
+	if m.streamOps[key] != nil {
+		m.mu.Unlock()
+		return
+	}
 	s, ok := m.active[key]
 	if !ok {
 		m.mu.Unlock()
@@ -186,36 +338,19 @@ func (m *manager) pauseStream(key streamKey) {
 		m.mu.Unlock()
 		return
 	}
+	operationDone := m.reserveStreamOperationLocked(key)
 	if s.cancel != nil {
 		s.cancel()
 		s.cancel = nil
 	}
 	s.paused = true
 	s.running = false
-	s.file.SetPriority(torrent.PiecePriorityNone)
+	file := s.file
 	m.mu.Unlock()
+	file.SetPriority(torrent.PiecePriorityNone)
+	m.finishStreamOperation(key, operationDone)
 	m.notifyDownloadsChanged()
 	log.Printf("Paused stream due to inactivity: key=%v", key)
-}
-
-func (m *manager) startConversionLocked(key streamKey, s *streamInfo) error {
-	if s.running || s.completed {
-		return nil
-	}
-	if s.runDone != nil {
-		<-s.runDone
-	}
-	if err := resetStreamOutput(s.paths); err != nil {
-		return fmt.Errorf("reset stream output %s: %w", s.paths.outDir, err)
-	}
-	streamCtx, cancel := context.WithCancel(context.Background())
-	s.cancel = cancel
-	s.paused = false
-	s.running = true
-	s.file.SetPriority(torrent.PiecePriorityHigh)
-	runID := s.beginRun()
-	m.launchConversion(streamCtx, key, s, runID)
-	return nil
 }
 
 func resetStreamOutput(paths streamPaths) error {
@@ -262,7 +397,11 @@ func (m *manager) viewerWatcher() {
 			}
 			if noViewers {
 				log.Printf("Viewer timeout detected, cleaning up stream: key=%v", key)
-				go m.cleanup(key)
+				go func(key streamKey) {
+					if err := m.cleanup(context.Background(), key); err != nil {
+						log.Printf("Failed to clean up stream: key=%v, err=%v", key, err)
+					}
+				}(key)
 			}
 		}
 		m.mu.Unlock()
