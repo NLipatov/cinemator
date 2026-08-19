@@ -43,11 +43,12 @@ func (m *manager) cleanupIfCurrentRun(key streamKey, expected *streamInfo, runID
 func (m *manager) cleanupMatching(key streamKey, expected *streamInfo, runID uint64, checkRun bool) {
 	m.mu.Lock()
 	s, shouldDrop, cleaned := m.cleanupMatchingLocked(key, expected, runID, checkRun)
-	m.mu.Unlock()
 	if !cleaned {
+		m.mu.Unlock()
 		return
 	}
-	m.finishStreamCleanup(key, s, shouldDrop)
+	m.finishStreamCleanupLocked(key, s, shouldDrop)
+	m.mu.Unlock()
 }
 
 func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, runID uint64, checkRun bool) (*streamInfo, bool, bool) {
@@ -80,7 +81,7 @@ func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, run
 	return s, shouldDrop, true
 }
 
-func (m *manager) finishStreamCleanup(key streamKey, s *streamInfo, shouldDrop bool) {
+func (m *manager) finishStreamCleanupLocked(key streamKey, s *streamInfo, shouldDrop bool) {
 	s.source.Close()
 	if s.runDone != nil {
 		<-s.runDone
@@ -119,10 +120,10 @@ func (m *manager) releaseStartupWaiter(key streamKey, s *streamInfo, runID uint6
 	if abandoned {
 		cleanedStream, shouldDrop, cleaned = m.cleanupMatchingLocked(key, s, runID, true)
 	}
-	m.mu.Unlock()
 	if cleaned {
-		m.finishStreamCleanup(key, cleanedStream, shouldDrop)
+		m.finishStreamCleanupLocked(key, cleanedStream, shouldDrop)
 	}
+	m.mu.Unlock()
 	return cleaned
 }
 

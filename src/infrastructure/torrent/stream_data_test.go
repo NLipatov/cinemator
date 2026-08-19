@@ -341,7 +341,7 @@ func TestCleanupIfCurrentRunIgnoresStaleRun(t *testing.T) {
 	}
 }
 
-func TestCleanupWaitsForConversionRun(t *testing.T) {
+func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	paths := key.paths(t.TempDir())
 	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
@@ -374,14 +374,44 @@ func TestCleanupWaitsForConversionRun(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
+	replacementPath := filepath.Join(paths.outDir, "replacement.m3u8")
+	replacementReady := make(chan error, 1)
+	go func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+			replacementReady <- err
+			return
+		}
+		replacementReady <- os.WriteFile(replacementPath, []byte("replacement"), 0644)
+	}()
+	select {
+	case err := <-replacementReady:
+		close(runDone)
+		<-cleanupDone
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("replacement acquired the stream registry before cleanup finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+
 	close(runDone)
 	select {
 	case <-cleanupDone:
 	case <-time.After(time.Second):
 		t.Fatal("cleanup() did not finish after the conversion run stopped")
 	}
-	if _, err := os.Stat(paths.outDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stream output still exists after cleanup: %v", err)
+	select {
+	case err := <-replacementReady:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not start after cleanup finished")
+	}
+	if _, err := os.Stat(replacementPath); err != nil {
+		t.Fatalf("replacement output was removed by the previous cleanup: %v", err)
 	}
 }
 
