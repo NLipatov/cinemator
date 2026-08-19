@@ -289,38 +289,44 @@
         const row = document.createElement('div');
         row.className = 'download-row' + (download.id === activeDownloadID ? ' active' : '');
         row.dataset.id = download.id;
-        row.tabIndex = 0;
-        row.setAttribute('role', 'button');
-        row.setAttribute('aria-label', `Open ${download.title || download.id}`);
-        if (download.id === activeDownloadID) row.setAttribute('aria-current', 'true');
 
-        const main = document.createElement('div');
+        const openBtn = document.createElement('button');
+        openBtn.type = 'button';
+        openBtn.className = 'download-open';
+        openBtn.dataset.action = 'open';
+        openBtn.dataset.id = download.id;
+        openBtn.setAttribute('aria-label', `Open ${download.title || download.id}`);
+        if (download.id === activeDownloadID) openBtn.setAttribute('aria-current', 'true');
+
+        const main = document.createElement('span');
         main.className = 'download-main';
-        const titleRow = document.createElement('div');
+        const titleRow = document.createElement('span');
         titleRow.className = 'download-title-row';
-        const title = document.createElement('div');
+        const title = document.createElement('span');
         title.className = 'download-title';
         title.textContent = download.title || `Torrent ${download.id.slice(0, 8)}`;
         titleRow.appendChild(title);
-        const subtitle = document.createElement('div');
+        const subtitle = document.createElement('span');
         subtitle.className = 'download-subtitle';
         subtitle.textContent = download.id;
         main.append(titleRow, subtitle);
 
-        const meta = document.createElement('div');
+        const meta = document.createElement('span');
         meta.className = 'download-meta';
         const metaText = document.createElement('span');
         metaText.className = 'download-meta-text';
         metaText.textContent = `${formatDownloadSize(download)} · ${formatExpiry(download.expiresAt)}`;
+        meta.append(metaText);
+        openBtn.append(main, meta);
+
+        const actions = document.createElement('div');
+        actions.className = 'download-actions';
+
         const extendMenu = createExtendMenu(download.id);
         if (download.id === restoreExtendID) {
           openExtendMenu(extendMenu);
           restoredExtendMenu = true;
         }
-        meta.append(metaText, extendMenu);
-
-        const actions = document.createElement('div');
-        actions.className = 'download-actions';
 
         const deleteBtn = document.createElement('button');
         deleteBtn.type = 'button';
@@ -330,9 +336,9 @@
         deleteBtn.title = 'Delete';
         deleteBtn.setAttribute('aria-label', 'Delete');
 
-        actions.append(deleteBtn);
+        actions.append(extendMenu, deleteBtn);
 
-        row.append(main, meta, actions);
+        row.append(openBtn, actions);
         list.appendChild(row);
       });
       if (!restoredExtendMenu) openExtendDownloadID = null;
@@ -377,10 +383,12 @@
       document.querySelectorAll('.download-row[data-id]').forEach(row => {
         const isActive = row.dataset.id === id;
         row.classList.toggle('active', isActive);
+        const openBtn = row.querySelector('.download-open');
+        if (!openBtn) return;
         if (isActive) {
-          row.setAttribute('aria-current', 'true');
+          openBtn.setAttribute('aria-current', 'true');
         } else {
-          row.removeAttribute('aria-current');
+          openBtn.removeAttribute('aria-current');
         }
       });
     }
@@ -424,16 +432,14 @@
     async function deleteDownload(id) {
       const download = findDownload(id);
       if (!download || !window.confirm(`Delete ${download.title || id}?`)) return;
-      const deletingCurrentDownload = $('magnet').value.trim() === download.magnet;
-      if (deletingCurrentDownload) {
-        cancelFlowRequest();
-        destroyVideoAndHls();
-      }
+      const deletingCurrentDownload = activeDownloadID === id;
       showMsg('downloadsMsg', 'Deleting download...', false, true);
       try {
         const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('Could not delete download');
-        if (deletingCurrentDownload && $('magnet').value.trim() === download.magnet) {
+        if (deletingCurrentDownload && activeDownloadID === id) {
+          cancelFlowRequest();
+          destroyVideoAndHls();
           setActiveDownload(null);
           $('magnet').value = '';
           $('filelist').textContent = '';
@@ -497,23 +503,13 @@
       }
       const btn = e.target.closest('button[data-action][data-id]');
       if (btn) {
+        if (btn.dataset.action === 'open') openDownload(findDownload(btn.dataset.id));
         if (btn.dataset.action === 'extend') {
           closeExtendMenus();
           extendDownload(btn.dataset.id, parseInt(btn.dataset.days || '7', 10));
         }
         if (btn.dataset.action === 'delete') deleteDownload(btn.dataset.id);
         return;
-      }
-
-      const row = e.target.closest('.download-row[data-id]');
-      if (row) openDownload(findDownload(row.dataset.id));
-    });
-    $('downloadsList').addEventListener('keydown', e => {
-      const row = e.target.closest('.download-row[data-id]');
-      if (!row || e.target !== row) return;
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        openDownload(findDownload(row.dataset.id));
       }
     });
     document.addEventListener('click', e => {

@@ -166,7 +166,7 @@ func TestUnregisterCancelsAndWaitsForActiveRequest(t *testing.T) {
 
 	requestCtx, cancelRequest := context.WithCancel(context.Background())
 	defer cancelRequest()
-	request := httptest.NewRequest(http.MethodGet, "/source/token/file.mkv", nil).WithContext(requestCtx)
+	request := httptest.NewRequestWithContext(requestCtx, http.MethodGet, "/source/token/file.mkv", nil)
 	handlerDone := make(chan struct{})
 	go func() {
 		rs.ServeHTTP(httptest.NewRecorder(), request)

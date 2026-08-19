@@ -144,7 +144,7 @@ button:active {
 }
 
 button:focus-visible,
-.download-row:focus-visible {
+.download-open:focus-visible {
   outline: 0.1875rem solid var(--color-accent);
   outline-offset: 0.125rem;
 }
@@ -479,26 +479,45 @@ button:disabled {
 .download-row {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 2.75rem;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.75rem;
   padding: 0.7rem 0.45rem;
   border-bottom: 0.0625rem solid var(--color-border);
   border-radius: 0.25rem;
-  cursor: pointer;
-  outline: none;
   transition: background-color var(--transition);
 }
 
 .download-row:hover,
-.download-row:focus-visible {
+.download-row:focus-within {
   background: var(--color-surface-soft);
 }
 
 .download-row.active,
 .download-row.active:hover,
-.download-row.active:focus-visible {
+.download-row.active:focus-within {
   background: var(--color-selection);
+}
+
+.download-open {
+  width: 100%;
+  min-height: 0;
+  display: grid;
+  gap: 0.22rem;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 0.25rem;
+  font-weight: inherit;
+  text-align: left;
+  box-shadow: none;
+}
+
+.download-open:hover,
+.download-open:focus-visible {
+  background: transparent;
+  transform: none;
 }
 
 .download-main {
@@ -537,7 +556,6 @@ button:disabled {
 }
 
 .download-meta {
-  grid-column: 1;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -549,10 +567,10 @@ button:disabled {
 }
 
 .download-actions {
-  grid-column: 2;
-  grid-row: 1 / 3;
-  align-self: center;
   display: grid;
+  grid-template-columns: repeat(2, 2.75rem);
+  align-items: center;
+  gap: 0.25rem;
 }
 
 .download-action,
@@ -730,8 +748,6 @@ button:disabled {
 
   .downloads-panel {
     background: var(--color-glass);
-    -webkit-backdrop-filter: saturate(160%) blur(1.15rem);
-    backdrop-filter: saturate(160%) blur(1.15rem);
   }
 }
 

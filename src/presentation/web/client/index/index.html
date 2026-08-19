@@ -34,10 +34,10 @@
       </form>
     </section>
 
-    <section class="workspace" aria-label="Playback workspace" aria-live="polite">
+    <section class="workspace" aria-label="Playback workspace">
       <div id="player-block" class="player-stage step" style="display:none">
         <video id="video" controls autoplay playsinline></video>
-        <div class="msg" id="playerMsg"></div>
+        <div class="msg" id="playerMsg" role="status" aria-live="polite"></div>
       </div>
 
       <div class="control-stack">
@@ -45,7 +45,7 @@
           <label class="field-label" for="filelist">Video file</label>
           <select id="filelist" class="input-style"></select>
           <button id="selectTracks" type="button" class="input-style">Select tracks</button>
-          <div class="msg" id="fileMsg"></div>
+          <div class="msg" id="fileMsg" role="status" aria-live="polite"></div>
         </div>
 
         <div class="step panel" id="step-tracks" style="display:none">
@@ -67,7 +67,7 @@
             </div>
           </div>
           <button id="play" type="button" class="input-style">Play</button>
-          <div class="msg" id="trackMsg"></div>
+          <div class="msg" id="trackMsg" role="status" aria-live="polite"></div>
         </div>
 
         <div id="warn-container">
