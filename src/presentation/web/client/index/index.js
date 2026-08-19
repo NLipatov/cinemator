@@ -295,7 +295,6 @@
         openBtn.className = 'download-open';
         openBtn.dataset.action = 'open';
         openBtn.dataset.id = download.id;
-        openBtn.setAttribute('aria-label', `Open ${download.title || download.id}`);
         if (download.id === activeDownloadID) openBtn.setAttribute('aria-current', 'true');
 
         const main = document.createElement('span');

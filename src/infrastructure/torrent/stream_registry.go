@@ -42,46 +42,45 @@ func (m *manager) cleanupIfCurrentRun(key streamKey, expected *streamInfo, runID
 
 func (m *manager) cleanupMatching(key streamKey, expected *streamInfo, runID uint64, checkRun bool) {
 	m.mu.Lock()
-	s, shouldDrop, cleaned := m.cleanupMatchingLocked(key, expected, runID, checkRun)
+	s, cleanupDone, cleaned := m.cleanupMatchingLocked(key, expected, runID, checkRun)
+	m.mu.Unlock()
 	if !cleaned {
-		m.mu.Unlock()
+		if cleanupDone != nil && expected == nil {
+			<-cleanupDone
+		}
 		return
 	}
-	m.finishStreamCleanupLocked(key, s, shouldDrop)
-	m.mu.Unlock()
+	m.finishStreamCleanup(key, s, cleanupDone)
 }
 
-func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, runID uint64, checkRun bool) (*streamInfo, bool, bool) {
+func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, runID uint64, checkRun bool) (*streamInfo, chan struct{}, bool) {
 	s, ok := m.active[key]
 	if !ok {
-		if expected == nil {
+		cleanupDone := m.cleanups[key]
+		if expected == nil && cleanupDone == nil {
 			log.Printf("cleanup called, but no active stream found: key=%v", key)
 		}
-		return nil, false, false
+		return nil, cleanupDone, false
 	}
 	if expected != nil && s != expected {
-		return nil, false, false
+		return nil, nil, false
 	}
 	if checkRun && !s.isCurrentRun(runID) {
-		return nil, false, false
+		return nil, nil, false
 	}
 	if s.cancel != nil {
 		s.cancel()
 	}
-	shouldDrop := false
-	if cnt, ok := m.torrents[key.InfoHash]; ok {
-		if cnt <= 1 {
-			delete(m.torrents, key.InfoHash)
-			shouldDrop = true
-		} else {
-			m.torrents[key.InfoHash] = cnt - 1
-		}
+	if m.cleanups == nil {
+		m.cleanups = make(map[streamKey]chan struct{})
 	}
+	cleanupDone := make(chan struct{})
+	m.cleanups[key] = cleanupDone
 	delete(m.active, key)
-	return s, shouldDrop, true
+	return s, cleanupDone, true
 }
 
-func (m *manager) finishStreamCleanupLocked(key streamKey, s *streamInfo, shouldDrop bool) {
+func (m *manager) finishStreamCleanup(key streamKey, s *streamInfo, cleanupDone chan struct{}) {
 	s.source.Close()
 	if s.runDone != nil {
 		<-s.runDone
@@ -90,15 +89,64 @@ func (m *manager) finishStreamCleanupLocked(key streamKey, s *streamInfo, should
 	if err := os.RemoveAll(s.paths.outDir); err != nil {
 		log.Printf("Failed to cleanup directory: %s, err=%v", s.paths.outDir, err)
 	}
-	if s.file != nil {
+
+	m.mu.Lock()
+	fileInUse := false
+	for activeKey := range m.active {
+		if activeKey.InfoHash == key.InfoHash && activeKey.Index == key.Index {
+			fileInUse = true
+			break
+		}
+	}
+	if s.file != nil && !fileInUse {
 		s.file.SetPriority(torrent.PiecePriorityNone)
 	}
-	m.notifyDownloadsChanged()
-	log.Printf("Stream cleaned up: key=%v", key)
+	shouldDrop := m.releaseTorrentLocked(key.InfoHash)
 	if shouldDrop && s.torrent != nil {
 		log.Printf("Dropping torrent: %s", key.InfoHash)
 		s.torrent.Drop()
 	}
+	delete(m.cleanups, key)
+	close(cleanupDone)
+	m.mu.Unlock()
+
+	m.notifyDownloadsChanged()
+	log.Printf("Stream cleaned up: key=%v", key)
+}
+
+func waitForStreamCleanup(ctx context.Context, cleanupDone <-chan struct{}) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-cleanupDone:
+		return ctx.Err()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *manager) releaseTorrent(hash string, t *torrent.Torrent) {
+	m.mu.Lock()
+	shouldDrop := m.releaseTorrentLocked(hash)
+	if shouldDrop && t != nil {
+		log.Printf("Dropping torrent: %s", hash)
+		t.Drop()
+	}
+	m.mu.Unlock()
+}
+
+func (m *manager) releaseTorrentLocked(hash string) bool {
+	cnt, ok := m.torrents[hash]
+	if !ok {
+		return false
+	}
+	if cnt > 1 {
+		m.torrents[hash] = cnt - 1
+		return false
+	}
+	delete(m.torrents, hash)
+	return true
 }
 
 func (m *manager) releaseStartupWaiter(key streamKey, s *streamInfo, runID uint64, requestCanceled bool) bool {
@@ -116,14 +164,14 @@ func (m *manager) releaseStartupWaiter(key streamKey, s *streamInfo, runID uint6
 
 	cleaned := false
 	var cleanedStream *streamInfo
-	var shouldDrop bool
+	var cleanupDone chan struct{}
 	if abandoned {
-		cleanedStream, shouldDrop, cleaned = m.cleanupMatchingLocked(key, s, runID, true)
-	}
-	if cleaned {
-		m.finishStreamCleanupLocked(key, cleanedStream, shouldDrop)
+		cleanedStream, cleanupDone, cleaned = m.cleanupMatchingLocked(key, s, runID, true)
 	}
 	m.mu.Unlock()
+	if cleaned {
+		m.finishStreamCleanup(key, cleanedStream, cleanupDone)
+	}
 	return cleaned
 }
 

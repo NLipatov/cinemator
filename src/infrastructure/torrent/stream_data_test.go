@@ -374,11 +374,22 @@ func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
+	m.mu.Lock()
+	cleanupBarrier := m.cleanups[key]
+	m.mu.Unlock()
+	if cleanupBarrier == nil {
+		close(runDone)
+		<-cleanupDone
+		t.Fatal("cleanup did not reserve the stream key")
+	}
+
 	replacementPath := filepath.Join(paths.outDir, "replacement.m3u8")
 	replacementReady := make(chan error, 1)
 	go func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
+		if err := waitForStreamCleanup(context.Background(), cleanupBarrier); err != nil {
+			replacementReady <- err
+			return
+		}
 		if err := os.MkdirAll(paths.outDir, 0755); err != nil {
 			replacementReady <- err
 			return
@@ -392,7 +403,7 @@ func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Fatal("replacement acquired the stream registry before cleanup finished")
+		t.Fatal("replacement passed the cleanup barrier before cleanup finished")
 	case <-time.After(50 * time.Millisecond):
 	}
 
@@ -412,6 +423,62 @@ func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 	}
 	if _, err := os.Stat(replacementPath); err != nil {
 		t.Fatalf("replacement output was removed by the previous cleanup: %v", err)
+	}
+}
+
+func TestCleanupDoesNotBlockDifferentStreamKey(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	differentKey := streamKey{InfoHash: "hash", Index: 1, Audio: 1, Subtitle: -1}
+	canceled := make(chan struct{})
+	runDone := make(chan struct{})
+	s := &streamInfo{
+		cancel:  func() { close(canceled) },
+		runDone: runDone,
+		running: true,
+	}
+	m := &manager{
+		active:   map[streamKey]*streamInfo{key: s},
+		torrents: map[string]int{key.InfoHash: 1},
+	}
+	cleanupDone := make(chan struct{})
+	go func() {
+		m.cleanup(key)
+		close(cleanupDone)
+	}()
+
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup() did not cancel the conversion run")
+	}
+
+	differentStreamReady := make(chan struct{})
+	go func() {
+		m.mu.Lock()
+		m.active[differentKey] = &streamInfo{}
+		m.torrents[differentKey.InfoHash]++
+		m.mu.Unlock()
+		close(differentStreamReady)
+	}()
+	select {
+	case <-differentStreamReady:
+	case <-time.After(50 * time.Millisecond):
+		close(runDone)
+		<-cleanupDone
+		t.Fatal("cleanup blocked a different stream key")
+	}
+
+	close(runDone)
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup() did not finish after the conversion run stopped")
+	}
+	m.mu.Lock()
+	remainingTorrentReferences := m.torrents[key.InfoHash]
+	m.mu.Unlock()
+	if remainingTorrentReferences != 1 {
+		t.Fatalf("torrent references after cleanup = %d, want 1", remainingTorrentReferences)
 	}
 }
 
