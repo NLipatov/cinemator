@@ -67,6 +67,7 @@
     let downloadFallbackPolling = false;
     let downloadPollingTimer = null;
     let openExtendDownloadID = null;
+    let activeDownloadID = null;
     let requestSeq = 0;
     let flowRequestController = null;
     const idleRecoveryMs = 12 * 60 * 1000;
@@ -286,11 +287,12 @@
 
       downloads.forEach(download => {
         const row = document.createElement('div');
-        row.className = 'download-row';
+        row.className = 'download-row' + (download.id === activeDownloadID ? ' active' : '');
         row.dataset.id = download.id;
         row.tabIndex = 0;
         row.setAttribute('role', 'button');
         row.setAttribute('aria-label', `Open ${download.title || download.id}`);
+        if (download.id === activeDownloadID) row.setAttribute('aria-current', 'true');
 
         const main = document.createElement('div');
         main.className = 'download-main';
@@ -347,6 +349,10 @@
         const res = await apiFetch('/api/downloads');
         if (!res.ok) throw new Error('Could not load downloads');
         downloadCatalog = await res.json();
+        if (!downloadCatalog.some(download => download.id === activeDownloadID)) {
+          const currentMagnet = $('magnet').value.trim();
+          activeDownloadID = downloadCatalog.find(download => download.magnet === currentMagnet)?.id || null;
+        }
         renderDownloads(downloadCatalog);
         if (!quiet) showMsg('downloadsMsg', '');
       } catch (e) {
@@ -366,6 +372,19 @@
       return downloadCatalog.find(download => download.id === id);
     }
 
+    function setActiveDownload(id) {
+      activeDownloadID = id;
+      document.querySelectorAll('.download-row[data-id]').forEach(row => {
+        const isActive = row.dataset.id === id;
+        row.classList.toggle('active', isActive);
+        if (isActive) {
+          row.setAttribute('aria-current', 'true');
+        } else {
+          row.removeAttribute('aria-current');
+        }
+      });
+    }
+
     function openDownload(download) {
       if (!download || !download.magnet || !download.files || download.files.length === 0) {
         showMsg('downloadsMsg', 'Download metadata is incomplete', true);
@@ -373,6 +392,7 @@
       }
       cancelFlowRequest();
       destroyVideoAndHls();
+      setActiveDownload(download.id);
       $('magnet').value = download.magnet;
       setFileList(download.files);
       $('step-files').style.display = '';
@@ -414,6 +434,7 @@
         const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('Could not delete download');
         if (deletingCurrentDownload && $('magnet').value.trim() === download.magnet) {
+          setActiveDownload(null);
           $('magnet').value = '';
           $('filelist').textContent = '';
           $('step-files').style.display = 'none';
@@ -522,6 +543,7 @@
         showMsg('magnetMsg', 'Magnet link required', true);
         return;
       }
+      setActiveDownload(downloadCatalog.find(download => download.magnet === magnet)?.id || null);
       const request = beginFlowRequest();
       const requestId = request.id;
       destroyVideoAndHls();
