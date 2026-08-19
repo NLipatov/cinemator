@@ -408,8 +408,10 @@ func (m *manager) launchConversion(
 	s *streamInfo,
 	runID uint64,
 ) {
+	runDone := s.runDone
 	go func() {
 		err := m.runConversion(streamCtx, s, runID)
+		close(runDone)
 		m.finishConversion(key, s, runID, err)
 	}()
 }
@@ -424,8 +426,10 @@ func (m *manager) runConversion(
 		return err
 	}
 
+	conversionCtx, cancelConversion := context.WithCancel(streamCtx)
+	defer cancelConversion()
 	ffmpegHandler := ffmpeg.NewURLConverter(
-		streamCtx,
+		conversionCtx,
 		s.source.URL(),
 		s.paths.outDir,
 		s.paths.videoPlaylist,
@@ -439,7 +443,7 @@ func (m *manager) runConversion(
 	}()
 
 	playlistReady := make(chan error, 1)
-	go func() { playlistReady <- waitForPlaylist(streamCtx, s.paths.masterPlaylist) }()
+	go func() { playlistReady <- waitForPlaylist(conversionCtx, s.paths.masterPlaylist) }()
 
 	streamDone := streamCtx.Done()
 	playlistReadyCh := playlistReady
@@ -457,12 +461,16 @@ func (m *manager) runConversion(
 			if !playableSent {
 				s.signalPlayable(runID, err)
 			}
+			cancelConversion()
+			<-errCh
 			return err
 		case err := <-playlistReadyCh:
 			if err != nil {
 				if !playableSent {
 					s.signalPlayable(runID, err)
 				}
+				cancelConversion()
+				<-errCh
 				return err
 			}
 			s.signalPlayable(runID, nil)

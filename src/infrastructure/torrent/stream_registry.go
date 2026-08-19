@@ -67,7 +67,6 @@ func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, run
 	if s.cancel != nil {
 		s.cancel()
 	}
-	s.source.Close()
 	shouldDrop := false
 	if cnt, ok := m.torrents[key.InfoHash]; ok {
 		if cnt <= 1 {
@@ -77,19 +76,22 @@ func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, run
 			m.torrents[key.InfoHash] = cnt - 1
 		}
 	}
-	log.Printf("Cleaning up stream: key=%v, dir=%s", key, s.paths.outDir)
-	err := os.RemoveAll(s.paths.outDir)
-	if err != nil {
-		log.Printf("Failed to cleanup directory: %s, err=%v", s.paths.outDir, err)
-	}
-	if s.file != nil {
-		s.file.SetPriority(0)
-	}
 	delete(m.active, key)
 	return s, shouldDrop, true
 }
 
 func (m *manager) finishStreamCleanup(key streamKey, s *streamInfo, shouldDrop bool) {
+	s.source.Close()
+	if s.runDone != nil {
+		<-s.runDone
+	}
+	log.Printf("Cleaning up stream: key=%v, dir=%s", key, s.paths.outDir)
+	if err := os.RemoveAll(s.paths.outDir); err != nil {
+		log.Printf("Failed to cleanup directory: %s, err=%v", s.paths.outDir, err)
+	}
+	if s.file != nil {
+		s.file.SetPriority(torrent.PiecePriorityNone)
+	}
 	m.notifyDownloadsChanged()
 	log.Printf("Stream cleaned up: key=%v", key)
 	if shouldDrop && s.torrent != nil {
@@ -150,6 +152,9 @@ func (m *manager) pauseStream(key streamKey) {
 func (m *manager) startConversionLocked(key streamKey, s *streamInfo) error {
 	if s.running || s.completed {
 		return nil
+	}
+	if s.runDone != nil {
+		<-s.runDone
 	}
 	if err := resetStreamOutput(s.paths); err != nil {
 		return fmt.Errorf("reset stream output %s: %w", s.paths.outDir, err)

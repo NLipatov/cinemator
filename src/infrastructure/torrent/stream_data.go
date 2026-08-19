@@ -31,6 +31,7 @@ type streamInfo struct {
 	paths          streamPaths
 	source         *torrentSource
 	runID          uint64
+	runDone        chan struct{}
 	playableErr    error
 	playableSent   bool
 	startupWaiters int
@@ -50,6 +51,7 @@ type streamPaths struct {
 func (s *streamInfo) beginRun() uint64 {
 	s.mtx.Lock()
 	s.runID++
+	s.runDone = make(chan struct{})
 	s.playable = make(chan struct{})
 	s.playableErr = nil
 	s.playableSent = false

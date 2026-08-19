@@ -1,6 +1,7 @@
 package torrent
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -30,6 +31,9 @@ type rangeServer struct {
 type rangeSource struct {
 	file      rangeFile
 	readahead int64
+	ctx       context.Context
+	cancel    context.CancelFunc
+	requests  *sync.WaitGroup
 }
 
 type rangeFile interface {
@@ -69,7 +73,14 @@ func (rs *rangeServer) register(file *torrent.File, readahead int64) (token, sou
 
 		rs.mu.Lock()
 		if _, exists := rs.sources[token]; !exists {
-			rs.sources[token] = rangeSource{file: file, readahead: readahead}
+			ctx, cancel := context.WithCancel(context.Background())
+			rs.sources[token] = rangeSource{
+				file:      file,
+				readahead: readahead,
+				ctx:       ctx,
+				cancel:    cancel,
+				requests:  &sync.WaitGroup{},
+			}
 			rs.mu.Unlock()
 			name := url.PathEscape(filepath.Base(file.DisplayPath()))
 			return token, rs.baseURL + "/source/" + token + "/" + name, nil
@@ -83,8 +94,15 @@ func (rs *rangeServer) unregister(token string) {
 		return
 	}
 	rs.mu.Lock()
+	src, ok := rs.sources[token]
 	delete(rs.sources, token)
+	if ok {
+		src.cancel()
+	}
 	rs.mu.Unlock()
+	if ok {
+		src.requests.Wait()
+	}
 }
 
 func (rs *rangeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -102,11 +120,23 @@ func (rs *rangeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rs.mu.RLock()
 	src, ok := rs.sources[token]
+	if ok {
+		src.requests.Add(1)
+	}
 	rs.mu.RUnlock()
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
+	defer src.requests.Done()
+
+	requestCtx, cancelRequest := context.WithCancel(r.Context())
+	stopCancel := context.AfterFunc(src.ctx, cancelRequest)
+	defer func() {
+		stopCancel()
+		cancelRequest()
+	}()
+	r = r.WithContext(requestCtx)
 
 	if err := serveTorrentRange(w, r, src); err != nil && !isClientDisconnect(err) {
 		log.Printf("range server: %v", err)
@@ -211,7 +241,8 @@ func randomToken() (string, error) {
 }
 
 func isClientDisconnect(err error) bool {
-	return errors.Is(err, syscall.EPIPE) ||
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, syscall.EPIPE) ||
 		errors.Is(err, syscall.ECONNRESET) ||
 		strings.Contains(strings.ToLower(err.Error()), "broken pipe") ||
 		strings.Contains(strings.ToLower(err.Error()), "connection reset by peer")

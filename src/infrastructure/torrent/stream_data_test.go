@@ -252,11 +252,14 @@ func TestCanceledLastStartupWaiterCleansAbandonedStream(t *testing.T) {
 	}
 	canceled := false
 	s := &streamInfo{
-		cancel:  func() { canceled = true },
 		paths:   paths,
 		running: true,
 	}
 	runID := s.beginRun()
+	s.cancel = func() {
+		canceled = true
+		close(s.runDone)
+	}
 	s.registerStartupWaiter()
 	m := &manager{active: map[streamKey]*streamInfo{key: s}}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -335,6 +338,50 @@ func TestCleanupIfCurrentRunIgnoresStaleRun(t *testing.T) {
 
 	if _, ok := m.active[key]; !ok {
 		t.Fatal("cleanupIfCurrentRun() removed current run for stale run ID")
+	}
+}
+
+func TestCleanupWaitsForConversionRun(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	paths := key.paths(t.TempDir())
+	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	canceled := make(chan struct{})
+	runDone := make(chan struct{})
+	s := &streamInfo{
+		cancel:  func() { close(canceled) },
+		paths:   paths,
+		runDone: runDone,
+		running: true,
+	}
+	m := &manager{active: map[streamKey]*streamInfo{key: s}}
+	cleanupDone := make(chan struct{})
+	go func() {
+		m.cleanup(key)
+		close(cleanupDone)
+	}()
+
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup() did not cancel the conversion run")
+	}
+	select {
+	case <-cleanupDone:
+		t.Fatal("cleanup() returned before the conversion run stopped")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(runDone)
+	select {
+	case <-cleanupDone:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup() did not finish after the conversion run stopped")
+	}
+	if _, err := os.Stat(paths.outDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stream output still exists after cleanup: %v", err)
 	}
 }
 

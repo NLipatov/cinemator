@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/anacrolix/torrent"
 )
@@ -145,6 +147,60 @@ func TestServeTorrentRangeHTTPBehavior(t *testing.T) {
 	}
 }
 
+func TestUnregisterCancelsAndWaitsForActiveRequest(t *testing.T) {
+	reader := &blockingTorrentReader{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+	sourceCtx, sourceCancel := context.WithCancel(context.Background())
+	rs := &rangeServer{
+		sources: map[string]rangeSource{
+			"token": {
+				file:     blockingRangeFile{reader: reader},
+				ctx:      sourceCtx,
+				cancel:   sourceCancel,
+				requests: &sync.WaitGroup{},
+			},
+		},
+	}
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	defer cancelRequest()
+	request := httptest.NewRequest(http.MethodGet, "/source/token/file.mkv", nil).WithContext(requestCtx)
+	handlerDone := make(chan struct{})
+	go func() {
+		rs.ServeHTTP(httptest.NewRecorder(), request)
+		close(handlerDone)
+	}()
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("range request did not start reading")
+	}
+
+	unregisterDone := make(chan struct{})
+	go func() {
+		rs.unregister("token")
+		close(unregisterDone)
+	}()
+	select {
+	case <-reader.closed:
+	case <-unregisterDone:
+		cancelRequest()
+		<-handlerDone
+		t.Fatal("unregister() returned while the active reader was still open")
+	case <-time.After(time.Second):
+		cancelRequest()
+		<-handlerDone
+		t.Fatal("unregister() did not cancel the active reader")
+	}
+	select {
+	case <-unregisterDone:
+	case <-time.After(time.Second):
+		t.Fatal("unregister() did not return after the active reader closed")
+	}
+}
+
 type fakeRangeFile struct {
 	data []byte
 }
@@ -184,3 +240,52 @@ func (r *fakeTorrentReader) SetReadahead(_ int64) {}
 func (r *fakeTorrentReader) SetReadaheadFunc(_ torrent.ReadaheadFunc) {}
 
 func (r *fakeTorrentReader) SetResponsive() {}
+
+type blockingRangeFile struct {
+	reader *blockingTorrentReader
+}
+
+func (f blockingRangeFile) Length() int64 {
+	return 1
+}
+
+func (f blockingRangeFile) NewReader() torrent.Reader {
+	return f.reader
+}
+
+type blockingTorrentReader struct {
+	ctx       context.Context
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func (r *blockingTorrentReader) Read(_ []byte) (int, error) {
+	r.startOnce.Do(func() { close(r.started) })
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
+}
+
+func (r *blockingTorrentReader) Seek(_ int64, _ int) (int64, error) {
+	return 0, nil
+}
+
+func (r *blockingTorrentReader) SetContext(ctx context.Context) {
+	r.ctx = ctx
+}
+
+func (r *blockingTorrentReader) ReadContext(ctx context.Context, b []byte) (int, error) {
+	return r.Read(b)
+}
+
+func (r *blockingTorrentReader) Close() error {
+	r.closeOnce.Do(func() { close(r.closed) })
+	return nil
+}
+
+func (r *blockingTorrentReader) SetReadahead(_ int64) {}
+
+func (r *blockingTorrentReader) SetReadaheadFunc(_ torrent.ReadaheadFunc) {}
+
+func (r *blockingTorrentReader) SetResponsive() {}

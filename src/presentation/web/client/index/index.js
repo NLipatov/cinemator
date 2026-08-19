@@ -401,13 +401,16 @@
     async function deleteDownload(id) {
       const download = findDownload(id);
       if (!download || !window.confirm(`Delete ${download.title || id}?`)) return;
+      const deletingCurrentDownload = $('magnet').value.trim() === download.magnet;
+      if (deletingCurrentDownload) {
+        cancelFlowRequest();
+        destroyVideoAndHls();
+      }
       showMsg('downloadsMsg', 'Deleting download...', false, true);
       try {
         const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (!res.ok) throw new Error('Could not delete download');
-        if ($('magnet').value.trim() === download.magnet) {
-          cancelFlowRequest();
-          destroyVideoAndHls();
+        if (deletingCurrentDownload && $('magnet').value.trim() === download.magnet) {
           $('magnet').value = '';
           $('filelist').textContent = '';
           $('step-files').style.display = 'none';
