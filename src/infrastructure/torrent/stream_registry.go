@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/anacrolix/torrent"
+	"github.com/anacrolix/torrent/metainfo"
 )
 
 const idlePauseTimeout = 15 * time.Minute
@@ -173,34 +174,94 @@ func (m *manager) retainTorrent(ctx context.Context, magnet string) (*torrent.To
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	spec, hash, err := parseMagnet(magnet)
+	if err != nil {
+		return nil, "", err
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
-		t, err := addMagnet(m.client, magnet)
+
+		operationDone, err := m.reserveTorrentOperation(ctx, hash)
 		if err != nil {
 			return nil, "", err
 		}
-		hash := t.InfoHash().HexString()
 
 		m.mu.Lock()
-		operationDone := m.deletions[hash]
-		if operationDone == nil {
-			operationDone = m.torrentDrops[hash]
+		deletionDone := m.deletions[hash]
+		m.mu.Unlock()
+		if deletionDone != nil {
+			m.finishTorrentOperation(hash, operationDone)
+			if err := waitForDone(ctx, deletionDone); err != nil {
+				return nil, "", err
+			}
+			continue
 		}
-		if operationDone == nil {
+
+		t, _, err := m.client.AddTorrentSpec(spec)
+		if err != nil {
+			m.finishTorrentOperation(hash, operationDone)
+			return nil, "", err
+		}
+		if t == nil {
+			m.finishTorrentOperation(hash, operationDone)
+			return nil, "", fmt.Errorf("torrent not created")
+		}
+
+		// A deletion reserved while AddTorrentSpec was running wins this race.
+		m.mu.Lock()
+		deletionDone = m.deletions[hash]
+		if deletionDone == nil {
 			if m.torrents == nil {
 				m.torrents = make(map[string]int)
 			}
 			m.torrents[hash]++
-			m.mu.Unlock()
-			return t, hash, nil
 		}
 		m.mu.Unlock()
-		if err := waitForDone(ctx, operationDone); err != nil {
+		m.finishTorrentOperation(hash, operationDone)
+		if deletionDone == nil {
+			return t, hash, nil
+		}
+		if err := waitForDone(ctx, deletionDone); err != nil {
 			return nil, "", err
 		}
 	}
+}
+
+func (m *manager) reserveTorrentOperation(ctx context.Context, hash string) (chan struct{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		m.mu.Lock()
+		if m.torrentOps == nil {
+			m.torrentOps = make(map[string]chan struct{})
+		}
+		if done := m.torrentOps[hash]; done != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, done); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		done := make(chan struct{})
+		m.torrentOps[hash] = done
+		m.mu.Unlock()
+		return done, nil
+	}
+}
+
+func (m *manager) finishTorrentOperation(hash string, done chan struct{}) {
+	m.mu.Lock()
+	if m.torrentOps[hash] == done {
+		delete(m.torrentOps, hash)
+		close(done)
+	}
+	m.mu.Unlock()
 }
 
 func (m *manager) reserveDownloadDeletion(ctx context.Context, hash string) (chan struct{}, error) {
@@ -239,49 +300,59 @@ func (m *manager) releaseTorrent(hash string, t *torrent.Torrent) <-chan struct{
 		m.mu.Unlock()
 		return nil
 	}
-	done, started := m.reserveTorrentDropLocked(hash)
 	m.mu.Unlock()
-	if started {
-		go m.finishTorrentDrop(hash, t, done)
-	}
+
+	done := make(chan struct{})
+	go func() {
+		operationDone, _ := m.reserveTorrentOperation(context.Background(), hash)
+		m.mu.Lock()
+		refs := m.torrents[hash]
+		m.mu.Unlock()
+		current, exists := m.client.Torrent(t.InfoHash())
+		if refs == 0 && exists && current == t {
+			log.Printf("Dropping torrent: %s", hash)
+			t.Drop()
+		}
+		m.finishTorrentOperation(hash, operationDone)
+		close(done)
+	}()
 	return done
 }
 
-func (m *manager) dropTorrent(ctx context.Context, hash string, t *torrent.Torrent) error {
+func (m *manager) dropTorrent(ctx context.Context, hash string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	operationDone, err := m.reserveTorrentOperation(ctx, hash)
+	if err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		m.finishTorrentOperation(hash, operationDone)
+		return err
+	}
 	m.mu.Lock()
 	if refs := m.torrents[hash]; refs != 0 {
 		m.mu.Unlock()
+		m.finishTorrentOperation(hash, operationDone)
 		return fmt.Errorf("torrent %s is still in use", hash)
 	}
-	done, started := m.reserveTorrentDropLocked(hash)
 	m.mu.Unlock()
-	if started {
-		go m.finishTorrentDrop(hash, t, done)
-	}
-	return waitForDone(ctx, done)
-}
 
-func (m *manager) reserveTorrentDropLocked(hash string) (chan struct{}, bool) {
-	if m.torrentDrops == nil {
-		m.torrentDrops = make(map[string]chan struct{})
+	t, ok := m.client.Torrent(metainfo.NewHashFromHex(hash))
+	if !ok {
+		m.finishTorrentOperation(hash, operationDone)
+		return nil
 	}
-	if done := m.torrentDrops[hash]; done != nil {
-		return done, false
-	}
-	done := make(chan struct{})
-	m.torrentDrops[hash] = done
-	return done, true
-}
 
-func (m *manager) finishTorrentDrop(hash string, t *torrent.Torrent, done chan struct{}) {
-	log.Printf("Dropping torrent: %s", hash)
-	t.Drop()
-	m.mu.Lock()
-	if m.torrentDrops[hash] == done {
-		delete(m.torrentDrops, hash)
-		close(done)
-	}
-	m.mu.Unlock()
+	dropDone := make(chan struct{})
+	go func() {
+		log.Printf("Dropping torrent: %s", hash)
+		t.Drop()
+		m.finishTorrentOperation(hash, operationDone)
+		close(dropDone)
+	}()
+	return waitForDone(ctx, dropDone)
 }
 
 func (m *manager) releaseTorrentLocked(hash string) bool {

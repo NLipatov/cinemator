@@ -17,22 +17,21 @@ import (
 	"cinemator/presentation/settings"
 
 	"github.com/anacrolix/torrent"
-	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
 )
 
 type manager struct {
-	client       *torrent.Client
-	active       map[streamKey]*streamInfo
-	streamOps    map[streamKey]chan struct{} // Serializes output lifecycle changes for each stream.
-	torrents     map[string]int              // References held by preparing, active, and cleaning streams.
-	torrentDrops map[string]chan struct{}    // Prevents reuse until the old torrent has finished dropping.
-	deletions    map[string]chan struct{}    // Prevents new streams while a download is being deleted.
-	sources      *rangeServer
-	downloads    *downloadStore
-	events       *downloadEventBroadcaster
-	mu           sync.Mutex
-	settings     settings.Settings
+	client     *torrent.Client
+	active     map[streamKey]*streamInfo
+	streamOps  map[streamKey]chan struct{} // Serializes output lifecycle changes for each stream.
+	torrents   map[string]int              // References held by preparing, active, and cleaning streams.
+	torrentOps map[string]chan struct{}    // Serializes add and drop for each torrent.
+	deletions  map[string]chan struct{}    // Prevents new streams while a download is being deleted.
+	sources    *rangeServer
+	downloads  *downloadStore
+	events     *downloadEventBroadcaster
+	mu         sync.Mutex
+	settings   settings.Settings
 }
 
 func NewManager(settings settings.Settings) (application.TorrentManager, error) {
@@ -59,26 +58,27 @@ func NewManager(settings settings.Settings) (application.TorrentManager, error) 
 		return nil, err
 	}
 	m := &manager{
-		client:       client,
-		active:       make(map[streamKey]*streamInfo),
-		streamOps:    make(map[streamKey]chan struct{}),
-		torrents:     make(map[string]int),
-		torrentDrops: make(map[string]chan struct{}),
-		deletions:    make(map[string]chan struct{}),
-		sources:      sources,
-		downloads:    downloads,
-		events:       newDownloadEventBroadcaster(),
-		settings:     settings,
+		client:     client,
+		active:     make(map[streamKey]*streamInfo),
+		streamOps:  make(map[streamKey]chan struct{}),
+		torrents:   make(map[string]int),
+		torrentOps: make(map[string]chan struct{}),
+		deletions:  make(map[string]chan struct{}),
+		sources:    sources,
+		downloads:  downloads,
+		events:     newDownloadEventBroadcaster(),
+		settings:   settings,
 	}
 	go m.viewerWatcher()
 	return m, nil
 }
 
 func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.FileInfo, error) {
-	t, err := addMagnet(m.client, magnet)
+	t, hash, err := m.retainTorrent(ctx, magnet)
 	if err != nil {
 		return nil, err
 	}
+	defer m.releaseTorrent(hash, t)
 
 	select {
 	case <-ctx.Done():
@@ -91,7 +91,7 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 	for i, f := range files {
 		result[i] = domain.FileInfo{Index: i, Name: f.DisplayPath(), Size: f.Length()}
 	}
-	if _, err := m.downloads.upsert(ctx, t.InfoHash().HexString(), magnet, result); err != nil {
+	if _, err := m.downloads.upsert(ctx, hash, magnet, result); err != nil {
 		log.Printf("GetTorrentFiles: failed to write download metadata: %v", err)
 	} else {
 		m.notifyDownloadsChanged()
@@ -100,10 +100,11 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 }
 
 func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int) (domain.MediaInfo, error) {
-	t, err := addMagnet(m.client, magnet)
+	t, hash, err := m.retainTorrent(ctx, magnet)
 	if err != nil {
 		return domain.MediaInfo{}, err
 	}
+	defer m.releaseTorrent(hash, t)
 	select {
 	case <-t.GotInfo():
 	case <-ctx.Done():
@@ -113,7 +114,7 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 	if fileIndex < 0 || fileIndex >= len(files) {
 		return domain.MediaInfo{}, fmt.Errorf("bad file index")
 	}
-	m.touchDownload(ctx, t.InfoHash().HexString())
+	m.touchDownload(ctx, hash)
 	file := files[fileIndex]
 	origPrio := file.Priority()
 	file.SetPriority(torrent.PiecePriorityHigh)
@@ -353,20 +354,8 @@ func (m *manager) DeleteDownload(ctx context.Context, id string) error {
 			return err
 		}
 	}
-	m.mu.Lock()
-	refs := m.torrents[id]
-	dropDone := m.torrentDrops[id]
-	m.mu.Unlock()
-	if refs != 0 {
-		return fmt.Errorf("torrent %s is still in use", id)
-	}
-	if err := waitForDone(ctx, dropDone); err != nil {
+	if err := m.dropTorrent(ctx, id); err != nil {
 		return err
-	}
-	if t, ok := m.client.Torrent(metainfo.NewHashFromHex(id)); ok {
-		if err := m.dropTorrent(ctx, id, t); err != nil {
-			return err
-		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err

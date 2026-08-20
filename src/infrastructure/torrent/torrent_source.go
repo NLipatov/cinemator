@@ -206,18 +206,18 @@ func targetReadaheadBytes(f *torrent.File) int64 {
 	return ahead
 }
 
-func addMagnet(client *torrent.Client, magnet string) (*torrent.Torrent, error) {
+func parseMagnet(magnet string) (*torrent.TorrentSpec, string, error) {
 	spec, err := torrent.TorrentSpecFromMagnetUri(magnet)
 	if err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	hash := spec.InfoHash
+	if hash.IsZero() {
+		if !spec.InfoHashV2.Ok {
+			return nil, "", fmt.Errorf("magnet has no info hash")
+		}
+		hash = *spec.InfoHashV2.Value.ToShort()
 	}
 	spec.IgnoreUnverifiedPieceCompletion = true
-	t, _, err := client.AddTorrentSpec(spec)
-	if err != nil {
-		return nil, err
-	}
-	if t == nil {
-		return nil, fmt.Errorf("torrent not created")
-	}
-	return t, nil
+	return spec, hash.HexString(), nil
 }

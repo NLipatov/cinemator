@@ -44,15 +44,19 @@ func (m *manager) enforceCacheLimit() {
 		var size int64
 		if err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 			if err != nil {
-				return nil
+				return err
 			}
-			if info, err := d.Info(); err == nil && !info.IsDir() {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
 				size += info.Size()
 			}
 			return nil
 		}); err != nil {
 			log.Printf("enforceCacheLimit: failed to inspect %s: %v", dir, err)
-			continue
+			return
 		}
 		total += size
 		it := item{path: dir, size: size, last: time.Now()}
