@@ -21,9 +21,14 @@ func TestParseMagnetRejectsV2Only(t *testing.T) {
 }
 
 func TestParseMagnetAcceptsV1AndHybrid(t *testing.T) {
+	const wantHash = "631a31dd0a46257d5078c0dee4e66e26f73e42ac"
 	for _, magnet := range []string{v1Magnet, hybridMagnet} {
-		if _, _, err := parseMagnet(magnet); err != nil {
+		_, gotHash, err := parseMagnet(magnet)
+		if err != nil {
 			t.Fatalf("parseMagnet() error = %v", err)
+		}
+		if gotHash != wantHash {
+			t.Fatalf("parseMagnet() hash = %q, want %q", gotHash, wantHash)
 		}
 	}
 }
