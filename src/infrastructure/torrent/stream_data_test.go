@@ -310,6 +310,58 @@ func TestResumeWaitDoesNotHoldManagerLock(t *testing.T) {
 	}
 }
 
+func TestGetOrResumeStreamWaitsForReservedStreamOperation(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	s := &streamInfo{
+		completed: true,
+		paths:     key.paths(t.TempDir()),
+	}
+	m := &manager{active: map[streamKey]*streamInfo{key: s}}
+
+	m.mu.Lock()
+	operationDone := m.reserveStreamOperationLocked(key)
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observedCtx := &doneObservedContext{
+		Context:   ctx,
+		requested: make(chan struct{}),
+	}
+	type result struct {
+		stream  *streamInfo
+		resumed bool
+		exists  bool
+		err     error
+	}
+	resultReady := make(chan result, 1)
+	go func() {
+		got, _, resumed, exists, err := m.getOrResumeStream(observedCtx, key)
+		resultReady <- result{stream: got, resumed: resumed, exists: exists, err: err}
+	}()
+
+	select {
+	case <-observedCtx.requested:
+	case <-time.After(time.Second):
+		t.Fatal("getOrResumeStream() did not wait for the reserved stream operation")
+	}
+	select {
+	case <-resultReady:
+		t.Fatal("getOrResumeStream() passed the reserved stream operation")
+	default:
+	}
+
+	m.finishStreamOperation(key, operationDone)
+	select {
+	case got := <-resultReady:
+		if got.err != nil || !got.exists || got.resumed || got.stream != s {
+			t.Fatalf("getOrResumeStream() = stream %p, exists %v, resumed %v, error %v", got.stream, got.exists, got.resumed, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("getOrResumeStream() did not proceed after the stream operation finished")
+	}
+}
+
 func TestCanceledLastStartupWaiterCleansAbandonedStream(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	paths := key.paths(t.TempDir())

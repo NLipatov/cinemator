@@ -107,7 +107,7 @@ func (m *manager) enforceCacheLimit() {
 		if err := os.RemoveAll(it.path); err != nil {
 			m.finishStreamOperation(key, operationDone)
 			log.Printf("enforceCacheLimit: failed to remove %s: %v", it.path, err)
-			continue
+			return
 		}
 		m.finishStreamOperation(key, operationDone)
 		total -= it.size
