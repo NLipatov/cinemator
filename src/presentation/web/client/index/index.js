@@ -31,6 +31,18 @@
       return response;
     }
 
+    const versionLabel = $('appVersion');
+    if (versionLabel) {
+      apiFetch('/api/version', { cache: 'no-store' })
+        .then(response => response.ok ? response.json() : null)
+        .then(info => {
+          if (!info || typeof info.version !== 'string' || !info.version) return;
+          versionLabel.textContent = `[${info.version}]`;
+          versionLabel.hidden = false;
+        })
+        .catch(() => {});
+    }
+
     const logoutBtn = $('logoutBtn');
     if (logoutBtn) {
       window.fetch('/api/auth/status', { cache: 'no-store' })

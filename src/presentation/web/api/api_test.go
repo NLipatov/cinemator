@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,43 @@ import (
 	"cinemator/domain"
 	"cinemator/presentation/settings"
 )
+
+func TestVersionEndpoint(t *testing.T) {
+	server := HttpServer{version: "0.3.1"}
+
+	t.Run("returns build version", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		server.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/version", nil))
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+		}
+		if got := rec.Header().Get("Content-Type"); got != "application/json" {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+		var response struct {
+			Version string `json:"version"`
+		}
+		if err := json.NewDecoder(rec.Body).Decode(&response); err != nil {
+			t.Fatalf("decode response: %v", err)
+		}
+		if response.Version != "0.3.1" {
+			t.Fatalf("version = %q, want 0.3.1", response.Version)
+		}
+	})
+
+	t.Run("rejects other methods", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		server.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/version", nil))
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+		}
+		if got := rec.Header().Get("Allow"); got != http.MethodGet {
+			t.Fatalf("Allow = %q, want %q", got, http.MethodGet)
+		}
+	})
+}
 
 type fakeTorrentManager struct {
 	extendErr error

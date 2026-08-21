@@ -25,9 +25,10 @@ type HttpServer struct {
 	mgr      application.TorrentManager
 	settings settings.Settings
 	auth     *authenticator
+	version  string
 }
 
-func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
+func NewHttpServer(settings settings.Settings, version string) (*HttpServer, error) {
 	auth, err := newAuthenticator(settings.PasswordHash(), settings.SessionSecret())
 	if err != nil {
 		return nil, fmt.Errorf("configure authentication: %w", err)
@@ -40,6 +41,7 @@ func NewHttpServer(settings settings.Settings) (*HttpServer, error) {
 		mgr:      mgr,
 		settings: settings,
 		auth:     auth,
+		version:  version,
 	}, nil
 }
 
@@ -62,6 +64,7 @@ func (s *HttpServer) handler() http.Handler {
 	app.Handle("/", http.FileServer(http.Dir(clientDir)))
 	app.Handle("/favicon.ico", http.FileServer(http.Dir(staticDir)))
 	app.Handle("/assets/", http.StripPrefix("/assets/", http.FileServer(http.Dir(filepath.Join(staticDir, "assets")))))
+	app.HandleFunc("/api/version", s.handleGetVersion)
 	app.HandleFunc("/api/auth/logout", s.handleAuthLogout)
 	app.HandleFunc("/api/torrent/files", s.handleGetTorrentFiles)
 	app.HandleFunc("/api/media/info", s.handleGetMediaInfo)
@@ -80,6 +83,17 @@ func (s *HttpServer) handler() http.Handler {
 	root.HandleFunc("/api/auth/login", s.handleAuthLogin)
 	root.Handle("/", s.requireAuthentication(app))
 	return root
+}
+
+func (s *HttpServer) handleGetVersion(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, struct {
+		Version string `json:"version"`
+	}{Version: s.version})
 }
 
 func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Request) {

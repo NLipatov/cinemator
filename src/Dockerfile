@@ -2,9 +2,10 @@
 
 # Build stage
 FROM golang:1.25-alpine AS builder
+ARG VERSION=dev-build
 WORKDIR /app
 COPY . .
-RUN go build -o cinemator ./main.go
+RUN go build -ldflags "-X main.version=${VERSION}" -o cinemator ./main.go
 
 # Final stage: minimal image with ffmpeg
 FROM alpine:latest

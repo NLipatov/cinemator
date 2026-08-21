@@ -183,6 +183,7 @@ button:disabled {
 .brand {
   display: flex;
   align-items: center;
+  gap: 0.35rem;
 }
 
 .brand-name {
@@ -190,6 +191,13 @@ button:disabled {
   font-size: 1.05rem;
   font-weight: 700;
   letter-spacing: -0.015em;
+}
+
+.brand-version {
+  color: var(--color-muted);
+  font-size: 0.8rem;
+  font-weight: 500;
+  letter-spacing: -0.01em;
 }
 
 .top-actions {

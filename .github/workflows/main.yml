@@ -95,6 +95,8 @@ jobs:
         with:
           context: ./src
           push: true
+          build-args: |
+            VERSION=${{ needs.release-please.outputs.tag_name }}
           tags: |
             nlipatov/cinemator:${{ needs.release-please.outputs.tag_name }}
             nlipatov/cinemator:latest

@@ -6,9 +6,12 @@ import (
 	"log"
 )
 
+// version is replaced with the release tag through -ldflags.
+var version = "dev-build"
+
 func main() {
 	serverSettings := settings.NewSettings()
-	server, newServerErr := api.NewHttpServer(serverSettings)
+	server, newServerErr := api.NewHttpServer(serverSettings, version)
 	if newServerErr != nil {
 		log.Fatalf("failed to init server: %v", newServerErr)
 	}
