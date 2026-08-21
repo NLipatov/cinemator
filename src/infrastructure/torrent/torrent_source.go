@@ -213,10 +213,10 @@ func parseMagnet(magnet string) (*torrent.TorrentSpec, string, error) {
 	}
 	hash := spec.InfoHash
 	if hash.IsZero() {
-		if !spec.InfoHashV2.Ok {
-			return nil, "", fmt.Errorf("magnet has no info hash")
+		if spec.InfoHashV2.Ok {
+			return nil, "", domain.ErrUnsupportedMagnetVersion
 		}
-		hash = *spec.InfoHashV2.Value.ToShort()
+		return nil, "", fmt.Errorf("magnet has no info hash")
 	}
 	spec.IgnoreUnverifiedPieceCompletion = true
 	return spec, hash.HexString(), nil

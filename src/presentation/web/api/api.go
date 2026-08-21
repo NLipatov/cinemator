@@ -95,7 +95,7 @@ func (s *HttpServer) handleGetTorrentFiles(w http.ResponseWriter, r *http.Reques
 	}
 	files, err := s.mgr.GetTorrentFiles(r.Context(), magnet)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), apiErrorStatus(err))
 		return
 	}
 
@@ -116,7 +116,7 @@ func (s *HttpServer) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) 
 	}
 	info, err := s.mgr.GetMediaInfo(r.Context(), magnet, fileIndex)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), apiErrorStatus(err))
 		return
 	}
 
@@ -204,7 +204,7 @@ func (s *HttpServer) handleDownloadAction(w http.ResponseWriter, r *http.Request
 			return
 		}
 		if err := s.mgr.DeleteDownload(r.Context(), id); err != nil {
-			http.Error(w, err.Error(), downloadErrorStatus(err))
+			http.Error(w, err.Error(), apiErrorStatus(err))
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -224,7 +224,7 @@ func (s *HttpServer) handleDownloadAction(w http.ResponseWriter, r *http.Request
 		}
 		download, err := s.mgr.ExtendDownload(r.Context(), id, time.Duration(days)*24*time.Hour)
 		if err != nil {
-			http.Error(w, err.Error(), downloadErrorStatus(err))
+			http.Error(w, err.Error(), apiErrorStatus(err))
 			return
 		}
 		writeJSON(w, download)
@@ -259,7 +259,7 @@ func (s *HttpServer) handlePrepareHlsStream(w http.ResponseWriter, r *http.Reque
 
 	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		http.Error(w, err.Error(), apiErrorStatus(err))
 		return
 	}
 	http.Redirect(
@@ -312,8 +312,8 @@ func writeSSEEvent(w io.Writer, event string) error {
 	return err
 }
 
-func downloadErrorStatus(err error) int {
-	if errors.Is(err, domain.ErrBadDownloadID) {
+func apiErrorStatus(err error) int {
+	if errors.Is(err, domain.ErrBadDownloadID) || errors.Is(err, domain.ErrUnsupportedMagnetVersion) {
 		return http.StatusBadRequest
 	}
 	if errors.Is(err, domain.ErrDownloadNotFound) {

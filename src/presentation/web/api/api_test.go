@@ -19,12 +19,13 @@ import (
 type fakeTorrentManager struct {
 	extendErr error
 	deleteErr error
+	filesErr  error
 	events    <-chan struct{}
 	prepare   string
 }
 
 func (m fakeTorrentManager) GetTorrentFiles(context.Context, string) ([]domain.FileInfo, error) {
-	return nil, nil
+	return nil, m.filesErr
 }
 
 func (m fakeTorrentManager) GetMediaInfo(context.Context, string, int) (domain.MediaInfo, error) {
@@ -65,6 +66,24 @@ func (m fakeTorrentManager) SubscribeDownloadEvents(ctx context.Context) <-chan 
 }
 
 func (m fakeTorrentManager) CleanupStreams() {}
+
+func TestHandleGetTorrentFilesReturnsUnsupportedMagnetError(t *testing.T) {
+	server := HttpServer{
+		mgr:      fakeTorrentManager{filesErr: domain.ErrUnsupportedMagnetVersion},
+		settings: settings.NewSettings(),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/torrent/files?magnet=v2", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleGetTorrentFiles(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusBadRequest)
+	}
+	if got := strings.TrimSpace(rec.Body.String()); got != domain.ErrUnsupportedMagnetVersion.Error() {
+		t.Fatalf("body = %q, want %q", got, domain.ErrUnsupportedMagnetVersion)
+	}
+}
 
 func TestHandleDownloadActionStatusMapping(t *testing.T) {
 	tests := []struct {
@@ -286,9 +305,9 @@ func TestParseExtendDays(t *testing.T) {
 	}
 }
 
-func TestDownloadErrorStatusDefaultsToInternalServerError(t *testing.T) {
-	if got := downloadErrorStatus(errors.New("boom")); got != http.StatusInternalServerError {
-		t.Fatalf("downloadErrorStatus() = %d, want %d", got, http.StatusInternalServerError)
+func TestAPIErrorStatusDefaultsToInternalServerError(t *testing.T) {
+	if got := apiErrorStatus(errors.New("boom")); got != http.StatusInternalServerError {
+		t.Fatalf("apiErrorStatus() = %d, want %d", got, http.StatusInternalServerError)
 	}
 }
 
