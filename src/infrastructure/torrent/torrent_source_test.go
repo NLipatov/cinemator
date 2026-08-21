@@ -1,6 +1,37 @@
 package torrent
 
-import "testing"
+import (
+	"errors"
+	"testing"
+
+	"cinemator/domain"
+)
+
+const (
+	v1Magnet     = "magnet:?xt=urn:btih:631a31dd0a46257d5078c0dee4e66e26f73e42ac"
+	v2Magnet     = "magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa9f6105232b28ad099f3a302e"
+	hybridMagnet = v1Magnet +
+		"&xt=urn:btmh:1220d8dd32ac93357c368556af3ac1d95c9d76bd0dff6fa9833ecdac3d53134efabb"
+)
+
+func TestParseMagnetRejectsV2Only(t *testing.T) {
+	if _, _, err := parseMagnet(v2Magnet); !errors.Is(err, domain.ErrUnsupportedMagnetVersion) {
+		t.Fatalf("parseMagnet() error = %v, want ErrUnsupportedMagnetVersion", err)
+	}
+}
+
+func TestParseMagnetAcceptsV1AndHybrid(t *testing.T) {
+	const wantHash = "631a31dd0a46257d5078c0dee4e66e26f73e42ac"
+	for _, magnet := range []string{v1Magnet, hybridMagnet} {
+		_, gotHash, err := parseMagnet(magnet)
+		if err != nil {
+			t.Fatalf("parseMagnet() error = %v", err)
+		}
+		if gotHash != wantHash {
+			t.Fatalf("parseMagnet() hash = %q, want %q", gotHash, wantHash)
+		}
+	}
+}
 
 func TestClampRange(t *testing.T) {
 	tests := []struct {

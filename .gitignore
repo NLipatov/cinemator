@@ -31,3 +31,6 @@ go.work.sum
 *.db
 *.db-shm
 *.db-wal
+
+# Local development metadata
+/.serena/

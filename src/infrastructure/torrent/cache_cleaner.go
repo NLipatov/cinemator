@@ -32,8 +32,6 @@ func (m *manager) enforceCacheLimit() {
 		return
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
@@ -44,22 +42,38 @@ func (m *manager) enforceCacheLimit() {
 		}
 		dir := filepath.Join(root, e.Name())
 		var size int64
-		filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err := filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
 			if err != nil {
-				return nil
+				return err
 			}
-			if info, err := d.Info(); err == nil && !info.IsDir() {
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() {
 				size += info.Size()
 			}
 			return nil
-		})
+		}); err != nil {
+			log.Printf("enforceCacheLimit: failed to inspect %s: %v", dir, err)
+			return
+		}
 		total += size
 		it := item{path: dir, size: size, last: time.Now()}
+		m.mu.Lock()
 		if s, ok := m.active[key]; ok {
+			s.mtx.Lock()
 			it.last = s.lastView
+			s.mtx.Unlock()
 			it.active = true
-		} else if info, err := os.Stat(dir); err == nil {
-			it.last = info.ModTime()
+		} else if m.streamOps[key] != nil {
+			it.active = true
+		}
+		m.mu.Unlock()
+		if !it.active {
+			if info, err := os.Stat(dir); err == nil {
+				it.last = info.ModTime()
+			}
 		}
 		items = append(items, it)
 	}
@@ -79,10 +93,23 @@ func (m *manager) enforceCacheLimit() {
 		if it.active {
 			continue
 		}
-		if err := os.RemoveAll(it.path); err != nil {
-			log.Printf("enforceCacheLimit: failed to remove %s: %v", it.path, err)
+		key, err := parseStreamDir(filepath.Base(it.path))
+		if err != nil {
 			continue
 		}
+		m.mu.Lock()
+		if m.active[key] != nil || m.streamOps[key] != nil {
+			m.mu.Unlock()
+			continue
+		}
+		operationDone := m.reserveStreamOperationLocked(key)
+		m.mu.Unlock()
+		if err := os.RemoveAll(it.path); err != nil {
+			m.finishStreamOperation(key, operationDone)
+			log.Printf("enforceCacheLimit: failed to remove %s: %v", it.path, err)
+			return
+		}
+		m.finishStreamOperation(key, operationDone)
 		total -= it.size
 		log.Printf("enforceCacheLimit: removed %s (freed %d bytes)", it.path, it.size)
 	}
