@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.0](https://github.com/NLipatov/cinemator/compare/0.3.0...0.4.0) (2026-08-21)
+
+
+### Features
+
+* **web:** display build version ([b70f07f](https://github.com/NLipatov/cinemator/commit/b70f07f9baeb3a337c0bc302a9fb575a4699b581))
+* **web:** simplify playback interface ([b6056cb](https://github.com/NLipatov/cinemator/commit/b6056cb595a8ac2c0799877df5ac2ba05d62740c))
+
+
+### Bug Fixes
+
+* **app:** harden streaming and refresh playback UI ([7765a74](https://github.com/NLipatov/cinemator/commit/7765a7446d7aeebb38963858c7b2a02715536639))
+* **downloads:** wait for active streams before cleanup ([f71f6da](https://github.com/NLipatov/cinemator/commit/f71f6da3b1cb5fdef04eec768561ffdc4ae4de12))
+* **player:** reset native hls source on switch ([5a27640](https://github.com/NLipatov/cinemator/commit/5a27640a762681301dcfddb3047528361b8b0f2f))
+* resolve cleanup and accessibility regressions ([9118852](https://github.com/NLipatov/cinemator/commit/91188520a51f5a0e5cf932cdffd461f8b45742f1))
+* **streams:** make teardown context-aware ([87a477e](https://github.com/NLipatov/cinemator/commit/87a477ee0c0262e828765e5746edf92ebf2140b9))
+* **streams:** serialize cleanup and replacement ([bb3b9db](https://github.com/NLipatov/cinemator/commit/bb3b9db096ae43fb39e255b5fd0e45e69258422a))
+* **torrent:** harden stream cleanup serialization ([fd10962](https://github.com/NLipatov/cinemator/commit/fd1096289cafbd5fbf68acfdd29516e124061e19))
+* **torrent:** reject unsupported v2-only magnets ([8e1ecac](https://github.com/NLipatov/cinemator/commit/8e1ecacde53c191d76106e998276c321cf104b7a))
+* **torrent:** serialize add and deletion ([bb3324f](https://github.com/NLipatov/cinemator/commit/bb3324f637e8d3d4cea5a6be628185ec4206dee3))
+* **web:** address review feedback ([070e9d0](https://github.com/NLipatov/cinemator/commit/070e9d000fc66dd1f9621ce3dad325e0f17f8494))
+
 ## [0.3.0](https://github.com/NLipatov/cinemator/compare/0.2.1...0.3.0) (2026-07-16)
 
 
