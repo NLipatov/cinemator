@@ -78,9 +78,16 @@ func (s *HttpServer) handler() http.Handler {
 	root.Handle("/favicon.ico", http.FileServer(http.Dir(staticDir)))
 	root.Handle("/index.css", http.FileServer(http.Dir(clientDir)))
 	root.Handle("/login.js", http.FileServer(http.Dir(clientDir)))
+	root.Handle("/sign-in-approval.js", http.FileServer(http.Dir(clientDir)))
 	root.HandleFunc("/login", s.handleLoginPage)
+	root.HandleFunc("GET /sign-in-approvals/{approvalToken}", s.handleSignInApprovalPage)
 	root.HandleFunc("/api/auth/status", s.handleAuthStatus)
 	root.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	root.HandleFunc("POST /api/auth/sign-in-requests", s.handleStartSignInRequest)
+	root.HandleFunc("GET /api/auth/sign-in-requests/{deviceToken}/qr", s.handleSignInRequestQRCode)
+	root.HandleFunc("POST /api/auth/sign-in-requests/{deviceToken}/session", s.handleSignInRequestSession)
+	root.HandleFunc("GET /api/auth/sign-in-approvals/{approvalToken}", s.handleSignInApproval)
+	root.HandleFunc("POST /api/auth/sign-in-approvals/{approvalToken}", s.handleApproveSignInRequest)
 	root.Handle("/", s.requireAuthentication(app))
 	return root
 }

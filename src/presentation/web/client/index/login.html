@@ -22,17 +22,30 @@
     </div>
   </header>
   <main class="login-shell">
-    <section class="login-card">
+    <section class="login-content">
       <div class="login-copy">
         <h1>Sign in</h1>
         <p>Enter the password configured by the server owner.</p>
       </div>
       <form class="login-form" id="loginForm">
         <label for="password">Password</label>
-        <input id="password" name="password" type="password" autocomplete="current-password" autofocus required>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
         <button id="loginButton" type="submit">Continue</button>
         <div class="msg" id="loginMessage" role="alert" aria-live="polite"></div>
       </form>
+      <div class="login-divider"><span>or sign in with your phone</span></div>
+      <div class="device-login">
+        <div class="qr-frame">
+          <img id="deviceQRCode" alt="QR code for signing in with another device" hidden>
+          <div class="qr-placeholder" id="qrPlaceholder">Generating QR code…</div>
+        </div>
+        <div class="device-login-copy">
+          <p>Scan with a device already signed in to Cinemator.</p>
+          <strong class="device-code" id="deviceCode"></strong>
+          <span class="device-expiry" id="deviceExpiry"></span>
+        </div>
+        <div class="msg" id="deviceMessage" role="status" aria-live="polite"></div>
+      </div>
     </section>
   </main>
   <script src="/login.js"></script>
