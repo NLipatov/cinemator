@@ -202,6 +202,29 @@ func TestAuthenticationFlowProtectsApplication(t *testing.T) {
 
 }
 
+func TestSignInRequestRequiresSameHostOrigin(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("correct horse"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	auth, err := newAuthenticator(string(hash), testSessionSecret)
+	if err != nil {
+		t.Fatalf("newAuthenticator() error = %v", err)
+	}
+	server := HttpServer{mgr: fakeTorrentManager{}, settings: settings.NewSettings(), auth: auth}
+	handler := server.handler()
+
+	for _, origin := range []string{"", "https://other.test"} {
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/sign-in-requests", nil)
+		req.Host = "cinemator.test"
+		req.Header.Set("Origin", origin)
+		rec := serveRequest(handler, req, nil)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("origin %q status = %d, want %d", origin, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
 func TestSignInRequestFlow(t *testing.T) {
 	hash, err := bcrypt.GenerateFromPassword([]byte("correct horse"), bcrypt.MinCost)
 	if err != nil {

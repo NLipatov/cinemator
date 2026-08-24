@@ -40,13 +40,18 @@ func (s *HttpServer) handleStartSignInRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	origin, ok := requestOrigin(r)
+	if !ok {
+		http.Error(w, "valid origin required", http.StatusBadRequest)
+		return
+	}
 	if !s.auth.signInAttempts.Allow() {
 		w.Header().Set("Retry-After", strconv.Itoa(int(signInRequestInterval/time.Second)))
 		http.Error(w, "too many sign-in requests", http.StatusTooManyRequests)
 		return
 	}
 
-	deviceToken, request, err := s.auth.startSignInRequest(requestOrigin(r), time.Now())
+	deviceToken, request, err := s.auth.startSignInRequest(origin, time.Now())
 	if err != nil {
 		http.Error(w, "failed to create sign-in request", http.StatusInternalServerError)
 		return
@@ -257,17 +262,13 @@ func newSignInToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(data), nil
 }
 
-func requestOrigin(r *http.Request) string {
+func requestOrigin(r *http.Request) (string, bool) {
 	if parsed, err := url.Parse(r.Header.Get("Origin")); err == nil &&
 		(parsed.Scheme == "http" || parsed.Scheme == "https") &&
 		parsed.Host != "" && strings.EqualFold(parsed.Host, r.Host) {
-		return parsed.Scheme + "://" + parsed.Host
+		return parsed.Scheme + "://" + parsed.Host, true
 	}
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
-	}
-	return scheme + "://" + r.Host
+	return "", false
 }
 
 type qrPNGWriter struct {
