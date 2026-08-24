@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.0](https://github.com/NLipatov/cinemator/compare/0.4.0...0.5.0) (2026-08-24)
+
+
+### Features
+
+* **auth:** add QR sign-in approval ([439d58a](https://github.com/NLipatov/cinemator/commit/439d58adaf0f7aa1918c168ce3898098ca1ad3fa))
+* **auth:** add QR sign-in approval ([b85717b](https://github.com/NLipatov/cinemator/commit/b85717b51f3cc9c2937d9c38f07e329f1690f163))
+
+
+### Bug Fixes
+
+* **auth:** harden QR sign-in requests ([ad413a6](https://github.com/NLipatov/cinemator/commit/ad413a684fb5ffa831ec307a030c1e091401d8da))
+* **auth:** require public origin for QR sign-in ([f4b8955](https://github.com/NLipatov/cinemator/commit/f4b895506f401df2ebd74ad7cd4c2455d86fd509))
+
 ## [0.4.0](https://github.com/NLipatov/cinemator/compare/0.3.0...0.4.0) (2026-08-21)
 
 
