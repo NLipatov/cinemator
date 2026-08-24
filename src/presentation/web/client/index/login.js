@@ -123,6 +123,7 @@ async function waitForSignInSession() {
 async function startSignInRequest() {
   if (startingSignInRequest) return;
   startingSignInRequest = true;
+  let retryDelay = 5000;
   window.clearTimeout(retryTimer);
   sessionRequestController?.abort();
   sessionRequestController = undefined;
@@ -136,7 +137,13 @@ async function startSignInRequest() {
   deviceMessage.className = 'msg';
   try {
     const response = await fetch('/api/auth/sign-in-requests', { method: 'POST' });
-    if (!response.ok) throw new Error('QR sign-in is temporarily unavailable');
+    if (!response.ok) {
+      const retryAfter = Number(response.headers.get('Retry-After'));
+      if (response.status === 429 && Number.isFinite(retryAfter) && retryAfter > 0) {
+        retryDelay = retryAfter * 1000;
+      }
+      throw new Error('QR sign-in is temporarily unavailable');
+    }
     signInRequest = await response.json();
     deviceCode.textContent = `Code ${signInRequest.code}`;
     showQRCode(signInRequest.qrCode);
@@ -146,7 +153,7 @@ async function startSignInRequest() {
     qrPlaceholder.textContent = 'QR code unavailable';
     deviceMessage.textContent = error.message || 'QR sign-in is temporarily unavailable';
     deviceMessage.className = 'msg error';
-    retryTimer = window.setTimeout(startSignInRequest, 5000);
+    retryTimer = window.setTimeout(startSignInRequest, retryDelay);
   } finally {
     startingSignInRequest = false;
   }

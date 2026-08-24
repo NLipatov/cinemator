@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base32"
 	"encoding/base64"
 	"image"
 	"image/color"
@@ -22,6 +23,7 @@ const (
 	signInRequestInterval = time.Second
 	signInRequestBurst    = 10
 	signInTokenBytes      = 32
+	signInCodeAlphabet    = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 	qrQuietZoneModules    = 4
 	qrModulePixels        = 8
 )
@@ -32,6 +34,7 @@ type signInRequest struct {
 	code          string
 	expiresAt     time.Time
 	approved      chan struct{}
+	sessionWaiter chan struct{}
 }
 
 func (s *HttpServer) handleStartSignInRequest(w http.ResponseWriter, r *http.Request) {
@@ -103,6 +106,14 @@ func (s *HttpServer) handleSignInRequestSession(w http.ResponseWriter, r *http.R
 	request, ok := s.auth.signInRequestForDevice(r.PathValue("deviceToken"), time.Now())
 	if !ok {
 		http.Error(w, "sign-in request expired", http.StatusGone)
+		return
+	}
+	select {
+	case request.sessionWaiter <- struct{}{}:
+		defer func() { <-request.sessionWaiter }()
+	default:
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, "sign-in session already waiting", http.StatusTooManyRequests)
 		return
 	}
 
@@ -193,12 +204,17 @@ func (a *authenticator) startSignInRequest(origin string, now time.Time) (string
 	if err != nil {
 		return "", nil, err
 	}
+	code, err := newSignInCode()
+	if err != nil {
+		return "", nil, err
+	}
 	request := &signInRequest{
 		approvalToken: approvalToken,
 		approvalURL:   origin + "/sign-in-approvals/" + url.PathEscape(approvalToken),
-		code:          strings.ToUpper(approvalToken[:4] + "-" + approvalToken[4:8]),
+		code:          code,
 		expiresAt:     now.Add(signInRequestTTL),
 		approved:      make(chan struct{}),
+		sessionWaiter: make(chan struct{}, 1),
 	}
 
 	a.signInMu.Lock()
@@ -260,6 +276,15 @@ func newSignInToken() (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+func newSignInCode() (string, error) {
+	data := make([]byte, 5)
+	if _, err := rand.Read(data); err != nil {
+		return "", err
+	}
+	code := base32.NewEncoding(signInCodeAlphabet).WithPadding(base32.NoPadding).EncodeToString(data)
+	return code[:4] + "-" + code[4:], nil
 }
 
 func requestOrigin(r *http.Request) (string, bool) {

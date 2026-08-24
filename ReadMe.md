@@ -91,7 +91,7 @@ Store it alongside the password hash:
 CINEMATOR_SESSION_SECRET='...'
 ```
 
-Leave `CINEMATOR_PASSWORD_HASH` empty to keep Cinemator public. When password protection is enabled, `CINEMATOR_SESSION_SECRET` must contain at least 32 bytes. Sessions are stateless and remain valid for seven days, so use the same password hash and session secret on every Cinemator instance behind the domain. Rotating the session secret signs everyone out. Password authentication is intended to be used over HTTPS.
+Leave `CINEMATOR_PASSWORD_HASH` empty to keep Cinemator public. When password protection is enabled, `CINEMATOR_SESSION_SECRET` must contain at least 32 bytes. Sessions are stateless and remain valid for seven days. Rotating the session secret signs everyone out. Cinemator runs as a single-instance service, and pending QR sign-in requests are lost when it restarts. Password authentication is intended to be used over HTTPS.
 
 ## 3) Start the services
 

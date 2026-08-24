@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -225,6 +224,18 @@ func TestSignInRequestRequiresSameHostOrigin(t *testing.T) {
 	}
 }
 
+func TestSignInCodeIsIndependentFromApprovalToken(t *testing.T) {
+	auth := authenticator{signInRequests: make(map[string]*signInRequest)}
+	_, request, err := auth.startSignInRequest("https://cinemator.test", time.Now())
+	if err != nil {
+		t.Fatalf("startSignInRequest() error = %v", err)
+	}
+	derivedCode := strings.ToUpper(request.approvalToken[:4] + "-" + request.approvalToken[4:8])
+	if request.code == derivedCode {
+		t.Fatal("display code reveals part of the approval token")
+	}
+}
+
 func TestSignInRequestFlow(t *testing.T) {
 	hash, err := bcrypt.GenerateFromPassword([]byte("correct horse"), bcrypt.MinCost)
 	if err != nil {
@@ -384,7 +395,7 @@ func TestSignInRequestFlow(t *testing.T) {
 	}
 }
 
-func TestSignInRequestConcurrentApproval(t *testing.T) {
+func TestSignInRequestLimitsConcurrentSessionWaiters(t *testing.T) {
 	hash, err := bcrypt.GenerateFromPassword([]byte("correct horse"), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("GenerateFromPassword() error = %v", err)
@@ -397,40 +408,48 @@ func TestSignInRequestConcurrentApproval(t *testing.T) {
 	handler := server.handler()
 
 	for attempt := 0; attempt < 20; attempt++ {
-		deviceToken, request, err := auth.startSignInRequest("https://cinemator.test", time.Now())
-		if err != nil {
-			t.Fatalf("startSignInRequest() error = %v", err)
-		}
-
-		const waiterCount = 4
-		start := make(chan struct{})
-		responses := make(chan *httptest.ResponseRecorder, waiterCount)
-		var wait sync.WaitGroup
-		wait.Add(waiterCount)
-		for range waiterCount {
-			go func() {
-				defer wait.Done()
-				<-start
-				path := "/api/auth/sign-in-requests/" + deviceToken + "/session"
-				responses <- serveRequest(handler, httptest.NewRequest(http.MethodPost, path, nil), nil)
-			}()
-		}
-		close(start)
-
-		if !auth.approveSignInRequest(request.approvalToken, time.Now()) {
-			t.Fatalf("attempt %d: approval was not recorded", attempt)
-		}
-		if !auth.approveSignInRequest(request.approvalToken, time.Now()) {
-			t.Fatalf("attempt %d: repeated approval was not idempotent", attempt)
-		}
-		wait.Wait()
-		close(responses)
-
-		for response := range responses {
-			if response.Code != http.StatusNoContent || len(response.Result().Cookies()) != 1 {
-				t.Fatalf("attempt %d: session response = %d %q", attempt, response.Code, response.Body.String())
+		func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			deviceToken, request, err := auth.startSignInRequest("https://cinemator.test", time.Now())
+			if err != nil {
+				t.Fatalf("startSignInRequest() error = %v", err)
 			}
-		}
+
+			responses := make(chan *httptest.ResponseRecorder, 2)
+			path := "/api/auth/sign-in-requests/" + deviceToken + "/session"
+			for range 2 {
+				go func() {
+					req := httptest.NewRequest(http.MethodPost, path, nil).WithContext(ctx)
+					responses <- serveRequest(handler, req, nil)
+				}()
+			}
+
+			select {
+			case limited := <-responses:
+				if limited.Code != http.StatusTooManyRequests || limited.Header().Get("Retry-After") != "1" {
+					t.Fatalf("attempt %d: concurrent session response = %d, Retry-After %q", attempt, limited.Code, limited.Header().Get("Retry-After"))
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("attempt %d: concurrent session requests both remained open", attempt)
+			}
+
+			if !auth.approveSignInRequest(request.approvalToken, time.Now()) {
+				t.Fatalf("attempt %d: approval was not recorded", attempt)
+			}
+			if !auth.approveSignInRequest(request.approvalToken, time.Now()) {
+				t.Fatalf("attempt %d: repeated approval was not idempotent", attempt)
+			}
+
+			select {
+			case approved := <-responses:
+				if approved.Code != http.StatusNoContent || len(approved.Result().Cookies()) != 1 {
+					t.Fatalf("attempt %d: approved session response = %d %q", attempt, approved.Code, approved.Body.String())
+				}
+			case <-time.After(time.Second):
+				t.Fatalf("attempt %d: session request did not finish after approval", attempt)
+			}
+		}()
 	}
 }
 
