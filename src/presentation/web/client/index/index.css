@@ -698,17 +698,18 @@ button:disabled {
 .login-body {
   display: grid;
   place-items: center;
-  padding-top: calc(var(--header-height) + 1.5rem);
+  padding-top: calc(var(--header-height) + 1rem);
 }
 
-.login-shell {
-  width: min(100%, 24rem);
+.login-shell,
+.device-shell {
+  width: min(100%, 28rem);
 }
 
-.login-card {
+.login-content,
+.device-approval {
   display: grid;
-  gap: 1rem;
-  padding: clamp(1rem, 4vw, 1.4rem);
+  gap: clamp(0.75rem, 2vh, 1rem);
 }
 
 .login-copy {
@@ -722,7 +723,7 @@ button:disabled {
 }
 
 .login-copy h1 {
-  font-size: 1.2rem;
+  font-size: clamp(1.2rem, 3vh, 1.5rem);
   letter-spacing: -0.015em;
 }
 
@@ -735,6 +736,108 @@ button:disabled {
 .login-form {
   display: grid;
   gap: 0.65rem;
+}
+
+.login-divider {
+  display: grid;
+  grid-template-columns: minmax(1rem, 1fr) auto minmax(1rem, 1fr);
+  align-items: center;
+  gap: 0.75rem;
+  color: var(--color-muted);
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+.login-divider::before,
+.login-divider::after {
+  content: "";
+  height: 0.0625rem;
+  background: var(--color-border);
+}
+
+.device-login {
+  display: grid;
+  justify-items: center;
+  gap: 0.55rem;
+  text-align: center;
+}
+
+.qr-frame,
+.qr-frame img,
+.qr-placeholder {
+  width: clamp(11rem, 28vh, 15rem);
+  height: clamp(11rem, 28vh, 15rem);
+}
+
+.qr-frame {
+  overflow: hidden;
+  display: grid;
+  place-items: center;
+  background: #ffffff;
+  border-radius: var(--radius-small);
+}
+
+.qr-frame img {
+  display: block;
+}
+
+.qr-placeholder {
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  color: #636366;
+  font-size: 0.82rem;
+}
+
+.device-login-copy {
+  display: grid;
+  justify-items: center;
+  gap: 0.2rem;
+}
+
+.device-login-copy p {
+  margin: 0;
+  color: var(--color-muted);
+  font-size: 0.84rem;
+  line-height: 1.4;
+}
+
+.device-code,
+.approval-code {
+  font-family: var(--font-mono);
+  letter-spacing: 0.08em;
+}
+
+.device-code {
+  font-size: 0.82rem;
+}
+
+.device-expiry {
+  min-height: 1.2em;
+  color: var(--color-muted);
+  font-size: 0.76rem;
+}
+
+.device-body {
+  display: grid;
+  place-items: center;
+  padding-top: calc(var(--header-height) + 1rem);
+}
+
+.device-approval {
+  text-align: center;
+}
+
+.device-approval .login-copy {
+  justify-items: center;
+}
+
+.approval-code {
+  padding: 1rem;
+  background: var(--color-surface-soft);
+  border: 0.0625rem solid var(--color-border);
+  border-radius: var(--radius-medium);
+  font-size: clamp(1.35rem, 7vw, 2rem);
 }
 
 @supports ((-webkit-backdrop-filter: blur(1px)) or (backdrop-filter: blur(1px))) {

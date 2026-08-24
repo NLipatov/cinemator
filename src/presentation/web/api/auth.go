@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -29,10 +30,13 @@ const (
 )
 
 type authenticator struct {
-	passwordHash  []byte
-	sessionKey    []byte
-	loginAttempts *rate.Limiter
-	loginChecks   chan struct{}
+	passwordHash   []byte
+	sessionKey     []byte
+	loginAttempts  *rate.Limiter
+	loginChecks    chan struct{}
+	signInAttempts *rate.Limiter
+	signInMu       sync.Mutex
+	signInRequests map[string]*signInRequest
 }
 
 func newAuthenticator(passwordHash, sessionSecret string) (*authenticator, error) {
@@ -50,6 +54,11 @@ func newAuthenticator(passwordHash, sessionSecret string) (*authenticator, error
 		sessionKey:    []byte(sessionSecret),
 		loginAttempts: rate.NewLimiter(rate.Every(loginAttemptInterval), loginAttemptBurst),
 		loginChecks:   make(chan struct{}, maxConcurrentLoginChecks),
+		signInAttempts: rate.NewLimiter(
+			rate.Every(signInRequestInterval),
+			signInRequestBurst,
+		),
+		signInRequests: make(map[string]*signInRequest),
 	}, nil
 }
 

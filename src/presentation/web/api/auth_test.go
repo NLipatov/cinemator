@@ -1,9 +1,12 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -197,6 +200,215 @@ func TestAuthenticationFlowProtectsApplication(t *testing.T) {
 		t.Fatalf("logout cookie = %#v, want expired cookie", logoutCookies)
 	}
 
+}
+
+func TestSignInRequestFlow(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("correct horse"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	auth, err := newAuthenticator(string(hash), testSessionSecret)
+	if err != nil {
+		t.Fatalf("newAuthenticator() error = %v", err)
+	}
+	server := HttpServer{mgr: fakeTorrentManager{}, settings: settings.NewSettings(), auth: auth}
+	handler := server.handler()
+
+	type startedSignInRequest struct {
+		DeviceToken string    `json:"deviceToken"`
+		Code        string    `json:"code"`
+		QRCode      string    `json:"qrCode"`
+		ExpiresAt   time.Time `json:"expiresAt"`
+	}
+	start := func(t *testing.T) (startedSignInRequest, *signInRequest) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/sign-in-requests", nil)
+		req.Host = "cinemator.test"
+		req.Header.Set("Origin", "https://cinemator.test")
+		rec := serveRequest(handler, req, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("start status = %d, want %d; body = %q", rec.Code, http.StatusOK, rec.Body.String())
+		}
+		var started startedSignInRequest
+		if err := json.NewDecoder(rec.Body).Decode(&started); err != nil {
+			t.Fatalf("decode start response: %v", err)
+		}
+		if started.DeviceToken == "" || started.Code == "" || started.QRCode == "" || !started.ExpiresAt.After(time.Now()) {
+			t.Fatalf("start response = %#v", started)
+		}
+
+		auth.signInMu.Lock()
+		request, ok := auth.signInRequests[started.DeviceToken]
+		auth.signInMu.Unlock()
+		if !ok {
+			t.Fatal("sign-in request was not stored")
+		}
+		wantURL := "https://cinemator.test/sign-in-approvals/" + request.approvalToken
+		if request.approvalURL != wantURL {
+			t.Fatalf("approval URL = %q, want %q", request.approvalURL, wantURL)
+		}
+		return started, request
+	}
+	sessionPath := func(deviceToken string) string {
+		return "/api/auth/sign-in-requests/" + deviceToken + "/session"
+	}
+
+	started, request := start(t)
+	qr := serveRequest(handler, httptest.NewRequest(http.MethodGet, started.QRCode, nil), nil)
+	if qr.Code != http.StatusOK || qr.Header().Get("Content-Type") != "image/png" {
+		t.Fatalf("QR response = %d %q", qr.Code, qr.Header().Get("Content-Type"))
+	}
+	if !strings.HasPrefix(qr.Body.String(), "\x89PNG\r\n\x1a\n") {
+		t.Fatal("QR response is not a PNG")
+	}
+
+	approvalPath := "/api/auth/sign-in-approvals/" + request.approvalToken
+	if rec := serveRequest(handler, httptest.NewRequest(http.MethodGet, approvalPath, nil), nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated approval status = %d, want %d", rec.Code, http.StatusUnauthorized)
+	}
+
+	login := serveRequest(
+		handler,
+		httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"correct horse"}`)),
+		nil,
+	)
+	if login.Code != http.StatusNoContent || len(login.Result().Cookies()) != 1 {
+		t.Fatalf("approver login = %d %q", login.Code, login.Body.String())
+	}
+	approverSession := login.Result().Cookies()[0]
+
+	details := serveRequest(handler, httptest.NewRequest(http.MethodGet, approvalPath, nil), approverSession)
+	if details.Code != http.StatusOK || !strings.Contains(details.Body.String(), `"code":"`+started.Code+`"`) {
+		t.Fatalf("approval details = %d %q", details.Code, details.Body.String())
+	}
+
+	sessionResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		sessionResult <- serveRequest(
+			handler,
+			httptest.NewRequest(http.MethodPost, sessionPath(started.DeviceToken), nil),
+			nil,
+		)
+	}()
+
+	allow := serveRequest(
+		handler,
+		httptest.NewRequest(http.MethodPost, approvalPath, nil),
+		approverSession,
+	)
+	if allow.Code != http.StatusNoContent {
+		t.Fatalf("allow status = %d, want %d; body = %q", allow.Code, http.StatusNoContent, allow.Body.String())
+	}
+
+	var approved *httptest.ResponseRecorder
+	select {
+	case approved = <-sessionResult:
+	case <-time.After(time.Second):
+		t.Fatal("session request did not finish after approval")
+	}
+	if approved.Code != http.StatusNoContent || len(approved.Result().Cookies()) != 1 {
+		t.Fatalf("approved session response = %d %q", approved.Code, approved.Body.String())
+	}
+	deviceSession := approved.Result().Cookies()[0]
+	if deviceSession.Value == approverSession.Value {
+		t.Fatal("device reused the approver session")
+	}
+	app := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/api/downloads", nil), deviceSession)
+	if app.Code != http.StatusOK {
+		t.Fatalf("device session status = %d, want %d", app.Code, http.StatusOK)
+	}
+
+	retry := serveRequest(
+		handler,
+		httptest.NewRequest(http.MethodPost, sessionPath(started.DeviceToken), nil),
+		nil,
+	)
+	if retry.Code != http.StatusNoContent || len(retry.Result().Cookies()) != 1 {
+		t.Fatalf("retried session response = %d %q", retry.Code, retry.Body.String())
+	}
+
+	interrupted, interruptedRequest := start(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	interruptedResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, sessionPath(interrupted.DeviceToken), nil).WithContext(ctx)
+		interruptedResult <- serveRequest(handler, req, nil)
+	}()
+	cancel()
+	select {
+	case <-interruptedResult:
+	case <-time.After(time.Second):
+		t.Fatal("session request did not stop after disconnect")
+	}
+	if !auth.approveSignInRequest(interruptedRequest.approvalToken, time.Now()) {
+		t.Fatal("disconnected sign-in request could not be approved")
+	}
+	reconnected := serveRequest(
+		handler,
+		httptest.NewRequest(http.MethodPost, sessionPath(interrupted.DeviceToken), nil),
+		nil,
+	)
+	if reconnected.Code != http.StatusNoContent || len(reconnected.Result().Cookies()) != 1 {
+		t.Fatalf("reconnected session response = %d %q", reconnected.Code, reconnected.Body.String())
+	}
+
+	expired, expiredRequest := start(t)
+	auth.signInMu.Lock()
+	expiredRequest.expiresAt = time.Now().Add(-time.Second)
+	auth.signInMu.Unlock()
+	if rec := serveRequest(handler, httptest.NewRequest(http.MethodPost, sessionPath(expired.DeviceToken), nil), nil); rec.Code != http.StatusGone {
+		t.Fatalf("expired session status = %d, want %d", rec.Code, http.StatusGone)
+	}
+}
+
+func TestSignInRequestConcurrentApproval(t *testing.T) {
+	hash, err := bcrypt.GenerateFromPassword([]byte("correct horse"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("GenerateFromPassword() error = %v", err)
+	}
+	auth, err := newAuthenticator(string(hash), testSessionSecret)
+	if err != nil {
+		t.Fatalf("newAuthenticator() error = %v", err)
+	}
+	server := HttpServer{mgr: fakeTorrentManager{}, settings: settings.NewSettings(), auth: auth}
+	handler := server.handler()
+
+	for attempt := 0; attempt < 20; attempt++ {
+		deviceToken, request, err := auth.startSignInRequest("https://cinemator.test", time.Now())
+		if err != nil {
+			t.Fatalf("startSignInRequest() error = %v", err)
+		}
+
+		const waiterCount = 4
+		start := make(chan struct{})
+		responses := make(chan *httptest.ResponseRecorder, waiterCount)
+		var wait sync.WaitGroup
+		wait.Add(waiterCount)
+		for range waiterCount {
+			go func() {
+				defer wait.Done()
+				<-start
+				path := "/api/auth/sign-in-requests/" + deviceToken + "/session"
+				responses <- serveRequest(handler, httptest.NewRequest(http.MethodPost, path, nil), nil)
+			}()
+		}
+		close(start)
+
+		if !auth.approveSignInRequest(request.approvalToken, time.Now()) {
+			t.Fatalf("attempt %d: approval was not recorded", attempt)
+		}
+		if !auth.approveSignInRequest(request.approvalToken, time.Now()) {
+			t.Fatalf("attempt %d: repeated approval was not idempotent", attempt)
+		}
+		wait.Wait()
+		close(responses)
+
+		for response := range responses {
+			if response.Code != http.StatusNoContent || len(response.Result().Cookies()) != 1 {
+				t.Fatalf("attempt %d: session response = %d %q", attempt, response.Code, response.Body.String())
+			}
+		}
+	}
 }
 
 func TestAuthenticationLoginLimits(t *testing.T) {
