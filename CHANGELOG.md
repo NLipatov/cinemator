@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/NLipatov/cinemator/compare/0.5.0...0.5.1) (2026-08-31)
+
+
+### Bug Fixes
+
+* **torrent:** release deleted file storage ([#24](https://github.com/NLipatov/cinemator/issues/24)) ([cc6e4ee](https://github.com/NLipatov/cinemator/commit/cc6e4ee317be5eed8cf792804b4b02f868144366))
+
 ## [0.5.0](https://github.com/NLipatov/cinemator/compare/0.4.0...0.5.0) (2026-08-24)
 
 
