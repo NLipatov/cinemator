@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/NLipatov/cinemator/compare/0.6.0...0.6.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **streaming:** continue hls preparation without viewers ([#28](https://github.com/NLipatov/cinemator/issues/28)) ([a76ce72](https://github.com/NLipatov/cinemator/commit/a76ce72b3eea6a162b31cda0a0722029f6f8f9e8))
+
 ## [0.6.0](https://github.com/NLipatov/cinemator/compare/0.5.1...0.6.0) (2026-09-01)
 
 
