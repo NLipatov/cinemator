@@ -385,6 +385,14 @@ func (m *Manager) activateCachedStream(ctx context.Context, key streamKey, paths
 			completed: true,
 		}
 		m.mu.Lock()
+		if deletionDone := m.deletions[key.InfoHash]; deletionDone != nil {
+			m.mu.Unlock()
+			m.finishStreamOperation(key, operationDone)
+			if err := waitForDone(ctx, deletionDone); err != nil {
+				return false, err
+			}
+			continue
+		}
 		m.active[key] = s
 		m.mu.Unlock()
 		m.finishStreamOperation(key, operationDone)
