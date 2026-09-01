@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	idlePauseTimeout   = 15 * time.Minute
-	webseedStopTimeout = 5 * time.Second
-	streamReadyVersion = "2\n"
+	idlePauseTimeout    = 15 * time.Minute
+	webseedStopTimeout  = 5 * time.Second
+	webseedPollInterval = 100 * time.Millisecond
+	streamReadyVersion  = "2\n"
 )
 
 func (m *Manager) cleanup(ctx context.Context, key streamKey) error {
@@ -395,7 +396,7 @@ func (m *Manager) dropTorrentAfterWebseedsStop(ctx context.Context, t *torrent.T
 			t.AllowDataDownload()
 		}
 	}()
-	ticker := time.NewTicker(10 * time.Millisecond)
+	ticker := time.NewTicker(webseedPollInterval)
 	defer ticker.Stop()
 	for {
 		var status strings.Builder

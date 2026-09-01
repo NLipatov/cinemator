@@ -470,8 +470,9 @@ func (m *Manager) ListDownloads(ctx context.Context) ([]Download, error) {
 		return nil, err
 	}
 	statuses := m.downloadStatuses()
+	hlsSizes := hlsDiskSizes(m.cfg.HLSPath)
 	for i := range downloads {
-		downloads[i].DiskSize += hlsDiskSize(m.cfg.HLSPath, downloads[i].ID)
+		downloads[i].DiskSize += hlsSizes[downloads[i].ID]
 		if downloads[i].Status == DownloadStatusExpired {
 			continue
 		}
@@ -637,6 +638,26 @@ func (m *Manager) removeDownloadHlsDirs(id string) error {
 	return nil
 }
 
+func hlsDiskSizes(root string) map[string]int64 {
+	sizes := make(map[string]int64)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return sizes
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		rawID, _, found := strings.Cut(entry.Name(), "_")
+		id, err := cleanInfoHash(rawID)
+		if !found || err != nil {
+			continue
+		}
+		sizes[id] += pathDiskSize(filepath.Join(root, entry.Name()))
+	}
+	return sizes
+}
+
 func hlsDiskSize(root, id string) int64 {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -645,20 +666,25 @@ func hlsDiskSize(root, id string) int64 {
 	prefix := id + "_"
 	var total int64
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
-			continue
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), prefix) {
+			total += pathDiskSize(filepath.Join(root, entry.Name()))
 		}
-		_ = filepath.WalkDir(filepath.Join(root, entry.Name()), func(_ string, entry os.DirEntry, err error) error {
-			if err != nil || entry.IsDir() {
-				return nil
-			}
-			info, err := entry.Info()
-			if err == nil {
-				total += allocatedFileSize(info)
-			}
-			return nil
-		})
 	}
+	return total
+}
+
+func pathDiskSize(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err == nil {
+			total += allocatedFileSize(info)
+		}
+		return nil
+	})
 	return total
 }
 
