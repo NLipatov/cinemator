@@ -12,7 +12,7 @@ FROM alpine:latest
 RUN apk add --no-cache ffmpeg
 WORKDIR /app
 COPY --from=builder /app/cinemator /app/cinemator
-COPY presentation/web/client/index /app/presentation/web/client/index
-COPY presentation/web/client/static /app/presentation/web/client/static
+COPY web/client/index /app/web/client/index
+COPY web/client/static /app/web/client/static
 EXPOSE 8000
 ENTRYPOINT ["./cinemator"]

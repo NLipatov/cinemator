@@ -1,17 +1,18 @@
 package main
 
 import (
-	"cinemator/presentation/settings"
-	"cinemator/presentation/web/api"
 	"log"
+
+	"cinemator/config"
+	"cinemator/web"
 )
 
 // version is replaced with the release tag through -ldflags.
 var version = "dev-build"
 
 func main() {
-	serverSettings := settings.NewSettings()
-	server, newServerErr := api.NewHttpServer(serverSettings, version)
+	serverConfig := config.Load()
+	server, newServerErr := web.NewServer(serverConfig, version)
 	if newServerErr != nil {
 		log.Fatalf("failed to init server: %v", newServerErr)
 	}
