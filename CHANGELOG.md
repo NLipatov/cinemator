@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/NLipatov/cinemator/compare/0.5.1...0.6.0) (2026-09-01)
+
+
+### Features
+
+* **torrent:** persist completed hls streams ([#26](https://github.com/NLipatov/cinemator/issues/26)) ([99460e8](https://github.com/NLipatov/cinemator/commit/99460e88f0851d0c9d24c221f40db99c8961b14e))
+
 ## [0.5.1](https://github.com/NLipatov/cinemator/compare/0.5.0...0.5.1) (2026-08-31)
 
 
