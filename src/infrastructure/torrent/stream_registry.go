@@ -13,9 +13,11 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 )
 
-const idlePauseTimeout = 15 * time.Minute
-
-const streamReadyVersion = "1\n"
+const (
+	idlePauseTimeout   = 15 * time.Minute
+	webseedStopTimeout = 5 * time.Second
+	streamReadyVersion = "1\n"
+)
 
 func (m *manager) CleanupStreams() {
 	now := time.Now()
@@ -311,9 +313,12 @@ func (m *manager) finishDownloadDeletion(hash string, done chan struct{}) {
 }
 
 func (m *manager) releaseTorrent(hash string, t *torrent.Torrent) <-chan struct{} {
+	if t == nil {
+		return nil
+	}
 	m.mu.Lock()
 	shouldDrop := m.releaseTorrentLocked(hash)
-	if !shouldDrop || t == nil {
+	if !shouldDrop {
 		m.mu.Unlock()
 		return nil
 	}
@@ -326,11 +331,19 @@ func (m *manager) releaseTorrent(hash string, t *torrent.Torrent) <-chan struct{
 		refs := m.torrents[hash]
 		m.mu.Unlock()
 		current, exists := m.client.Torrent(t.InfoHash())
+		payloadCanBeDeleted := !exists
 		if refs == 0 && exists && current == t {
 			log.Printf("Dropping torrent: %s", hash)
-			m.dropTorrentAfterWebseedsStop(t)
+			dropCtx, cancel := context.WithTimeout(context.Background(), webseedStopTimeout)
+			err := m.dropTorrentAfterWebseedsStop(dropCtx, t)
+			cancel()
+			if err != nil {
+				log.Printf("Failed to drop torrent %s: %v", hash, err)
+			} else {
+				payloadCanBeDeleted = true
+			}
 		}
-		if refs == 0 && m.hasReadyHLS(hash) && m.downloads != nil {
+		if refs == 0 && payloadCanBeDeleted && m.hasReadyHLS(hash) && m.downloads != nil {
 			if err := m.downloads.deletePayload(context.Background(), hash); err != nil {
 				log.Printf("Failed to delete completed torrent payload: %s, err=%v", hash, err)
 			} else {
@@ -369,29 +382,56 @@ func (m *manager) dropTorrent(ctx context.Context, hash string) error {
 		return nil
 	}
 
-	dropDone := make(chan struct{})
+	dropResult := make(chan error, 1)
 	go func() {
 		log.Printf("Dropping torrent: %s", hash)
-		m.dropTorrentAfterWebseedsStop(t)
+		dropCtx, cancel := context.WithTimeout(ctx, webseedStopTimeout)
+		err := m.dropTorrentAfterWebseedsStop(dropCtx, t)
+		cancel()
 		m.finishTorrentOperation(hash, operationDone)
-		close(dropDone)
+		dropResult <- err
 	}()
-	return waitForDone(ctx, dropDone)
+	select {
+	case err := <-dropResult:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
-func (m *manager) dropTorrentAfterWebseedsStop(t *torrent.Torrent) {
+func (m *manager) dropTorrentAfterWebseedsStop(ctx context.Context, t *torrent.Torrent) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	// anacrolix removes webseed requests asynchronously. Dropping the torrent
 	// before that cleanup finishes can trip its client-wide consistency check.
 	t.DisallowDataDownload()
+	dropped := false
+	defer func() {
+		if !dropped {
+			t.AllowDataDownload()
+		}
+	}()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		var status strings.Builder
 		m.client.WriteStatus(&status)
 		if !torrentStatusHasActiveWebseedRequests(status.String(), t.InfoHash().HexString()) {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for webseed requests to stop: %w", ctx.Err())
+		case <-ticker.C:
+		}
 	}
 	t.Drop()
+	dropped = true
+	return nil
 }
 
 func torrentStatusHasActiveWebseedRequests(status, hash string) bool {

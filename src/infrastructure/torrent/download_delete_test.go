@@ -3,6 +3,7 @@ package torrent
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -47,7 +48,6 @@ func TestDeleteDownloadHonorsContextWhileStreamStops(t *testing.T) {
 		client:    client,
 		active:    map[streamKey]*streamInfo{key: s},
 		streamOps: make(map[streamKey]chan struct{}),
-		torrents:  map[string]int{id: 1},
 		downloads: downloads,
 		settings:  settings.NewSettings(),
 	}
@@ -118,7 +118,6 @@ func TestRetainTorrentDoesNotAddDuringConcurrentDownloadDeletion(t *testing.T) {
 			},
 		},
 		streamOps: make(map[streamKey]chan struct{}),
-		torrents:  map[string]int{id: 1},
 		downloads: downloads,
 		settings:  settings.NewSettings(),
 	}
@@ -169,6 +168,89 @@ func TestRetainTorrentDoesNotAddDuringConcurrentDownloadDeletion(t *testing.T) {
 	}
 	if addedDuringDeletion {
 		t.Fatal("retainTorrent() added the torrent while its download was being deleted")
+	}
+}
+
+func TestActivateCachedStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
+	root := t.TempDir()
+	id := strings.Repeat("b", 40)
+	key := streamKey{InfoHash: id, Index: 0, Audio: 0, Subtitle: -1}
+	paths := key.paths(filepath.Join(root, "hls"))
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+
+	deletionDone := make(chan struct{})
+	m := &manager{
+		active:    make(map[streamKey]*streamInfo),
+		streamOps: make(map[streamKey]chan struct{}),
+		deletions: map[string]chan struct{}{id: deletionDone},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observed := &doneObservedContext{
+		Context:   ctx,
+		requested: make(chan struct{}),
+	}
+	type result struct {
+		activated bool
+		err       error
+	}
+	resultReady := make(chan result, 1)
+	go func() {
+		activated, err := m.activateCachedStream(observed, key, paths)
+		resultReady <- result{activated: activated, err: err}
+	}()
+
+	select {
+	case <-observed.requested:
+	case <-time.After(time.Second):
+		t.Fatal("activateCachedStream() did not wait for the deletion")
+	}
+	select {
+	case got := <-resultReady:
+		t.Fatalf("activateCachedStream() passed the deletion barrier: %#v", got)
+	default:
+	}
+
+	m.finishDownloadDeletion(id, deletionDone)
+	select {
+	case got := <-resultReady:
+		if got.err != nil || !got.activated {
+			t.Fatalf("activateCachedStream() = %v, %v; want true, nil", got.activated, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("activateCachedStream() did not continue after deletion finished")
+	}
+}
+
+func TestDropTorrentAfterWebseedsStopHonorsCanceledContext(t *testing.T) {
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	id := strings.Repeat("c", 40)
+	tor, err := client.AddMagnet("magnet:?xt=urn:btih:" + id)
+	if err != nil {
+		t.Fatalf("AddMagnet() error = %v", err)
+	}
+	m := &manager{client: client}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = m.dropTorrentAfterWebseedsStop(ctx, tor)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dropTorrentAfterWebseedsStop() error = %v, want context canceled", err)
+	}
+	if _, exists := client.Torrent(metainfo.NewHashFromHex(id)); !exists {
+		t.Fatal("dropTorrentAfterWebseedsStop() dropped torrent after context cancellation")
 	}
 }
 

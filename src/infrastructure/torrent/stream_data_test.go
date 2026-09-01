@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	torrentlib "github.com/anacrolix/torrent"
 )
 
 func TestStreamKeyDirNameAndParse(t *testing.T) {
@@ -120,6 +122,39 @@ func TestCleanupPreservesCompletedStreamOutput(t *testing.T) {
 	}
 	if m.active[key] != nil {
 		t.Fatal("cleanup() left completed stream active")
+	}
+}
+
+func TestCleanupCachedStreamDoesNotReleaseTorrentReference(t *testing.T) {
+	id := strings.Repeat("d", 40)
+	key := streamKey{InfoHash: id, Index: 1, Audio: 0, Subtitle: -1}
+	paths := key.paths(t.TempDir())
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &manager{
+		active: map[streamKey]*streamInfo{
+			key: {paths: paths, lastView: time.Now(), completed: true},
+		},
+		streamOps: make(map[streamKey]chan struct{}),
+		torrents:  map[string]int{id: 1},
+	}
+	if err := m.cleanup(context.Background(), key); err != nil {
+		t.Fatalf("cleanup() error = %v", err)
+	}
+
+	m.mu.Lock()
+	refs := m.torrents[id]
+	m.mu.Unlock()
+	if refs != 1 {
+		t.Fatalf("torrent refs after cached cleanup = %d, want 1", refs)
 	}
 }
 
@@ -629,12 +664,14 @@ func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 func TestCleanupDoesNotBlockDifferentStreamKey(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	differentKey := streamKey{InfoHash: "hash", Index: 1, Audio: 1, Subtitle: -1}
+	ownedTorrent := new(torrentlib.Torrent)
 	canceled := make(chan struct{})
 	runDone := make(chan struct{})
 	s := &streamInfo{
 		cancel:  func() { close(canceled) },
 		runDone: runDone,
 		running: true,
+		torrent: ownedTorrent,
 	}
 	m := &manager{
 		active:   map[streamKey]*streamInfo{key: s},
@@ -655,7 +692,7 @@ func TestCleanupDoesNotBlockDifferentStreamKey(t *testing.T) {
 	differentStreamReady := make(chan struct{})
 	go func() {
 		m.mu.Lock()
-		m.active[differentKey] = &streamInfo{}
+		m.active[differentKey] = &streamInfo{torrent: ownedTorrent}
 		m.torrents[differentKey.InfoHash]++
 		m.mu.Unlock()
 		close(differentStreamReady)

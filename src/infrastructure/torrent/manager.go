@@ -291,6 +291,13 @@ func (m *manager) activateCachedStream(ctx context.Context, key streamKey, paths
 			return false, err
 		}
 		m.mu.Lock()
+		if deletionDone := m.deletions[key.InfoHash]; deletionDone != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, deletionDone); err != nil {
+				return false, err
+			}
+			continue
+		}
 		if operationDone := m.streamOps[key]; operationDone != nil {
 			m.mu.Unlock()
 			if err := waitForDone(ctx, operationDone); err != nil {
