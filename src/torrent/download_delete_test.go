@@ -42,7 +42,6 @@ func TestDeleteDownloadHonorsContextWhileStreamStops(t *testing.T) {
 		cancel:  func() { close(cleanupStarted) },
 		paths:   key.paths(filepath.Join(root, "hls")),
 		runDone: runDone,
-		running: true,
 	}
 	m := &Manager{
 		client:    client,
@@ -114,7 +113,6 @@ func TestRetainTorrentDoesNotAddDuringConcurrentDownloadDeletion(t *testing.T) {
 				cancel:  func() { close(cleanupStarted) },
 				paths:   key.paths(filepath.Join(root, "hls")),
 				runDone: runDone,
-				running: true,
 			},
 		},
 		streamOps: make(map[streamKey]chan struct{}),
@@ -230,7 +228,7 @@ func TestActivateCachedStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
 	}
 }
 
-func TestGetOrResumeStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
+func TestGetStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
 	id := strings.Repeat("c", 40)
 	key := streamKey{InfoHash: id, Index: 0, Audio: 0, Subtitle: -1}
 	stream := &streamInfo{completed: true}
@@ -253,18 +251,18 @@ func TestGetOrResumeStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
 	}
 	resultReady := make(chan result, 1)
 	go func() {
-		got, _, _, exists, err := m.getOrResumeStream(observed, key)
-		resultReady <- result{stream: got, exists: exists, err: err}
+		got, err := m.getStream(observed, key)
+		resultReady <- result{stream: got, exists: got != nil, err: err}
 	}()
 
 	select {
 	case <-observed.requested:
 	case <-time.After(time.Second):
-		t.Fatal("getOrResumeStream() did not wait for the deletion")
+		t.Fatal("getStream() did not wait for the deletion")
 	}
 	select {
 	case got := <-resultReady:
-		t.Fatalf("getOrResumeStream() passed the deletion barrier: %#v", got)
+		t.Fatalf("getStream() passed the deletion barrier: %#v", got)
 	default:
 	}
 
@@ -275,10 +273,10 @@ func TestGetOrResumeStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
 	select {
 	case got := <-resultReady:
 		if got.err != nil || got.exists || got.stream != nil {
-			t.Fatalf("getOrResumeStream() = stream %p, exists %v, error %v; want no stream", got.stream, got.exists, got.err)
+			t.Fatalf("getStream() = stream %p, exists %v, error %v; want no stream", got.stream, got.exists, got.err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("getOrResumeStream() did not continue after deletion finished")
+		t.Fatal("getStream() did not continue after deletion finished")
 	}
 }
 

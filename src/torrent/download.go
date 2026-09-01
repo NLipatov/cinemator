@@ -15,7 +15,6 @@ type DownloadStatus string
 const (
 	DownloadStatusReady     DownloadStatus = "ready"
 	DownloadStatusStreaming DownloadStatus = "streaming"
-	DownloadStatusPaused    DownloadStatus = "paused"
 	DownloadStatusExpired   DownloadStatus = "expired"
 )
 

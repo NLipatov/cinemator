@@ -14,30 +14,29 @@ import (
 )
 
 const (
-	idlePauseTimeout    = 15 * time.Minute
 	webseedStopTimeout  = 5 * time.Second
 	webseedPollInterval = 100 * time.Millisecond
 	streamReadyVersion  = "2\n"
 )
 
 func (m *Manager) cleanup(ctx context.Context, key streamKey) error {
-	return m.cleanupMatching(ctx, key, nil, 0, false)
+	return m.cleanupMatching(ctx, key, nil)
 }
 
-func (m *Manager) cleanupIfCurrentRun(key streamKey, expected *streamInfo, runID uint64) {
-	if err := m.cleanupMatching(context.Background(), key, expected, runID, true); err != nil {
+func (m *Manager) cleanupIfCurrent(key streamKey, expected *streamInfo) {
+	if err := m.cleanupMatching(context.Background(), key, expected); err != nil {
 		log.Printf("Failed to clean up stream: key=%v, err=%v", key, err)
 	}
 }
 
-func (m *Manager) cleanupMatching(ctx context.Context, key streamKey, expected *streamInfo, runID uint64, checkRun bool) error {
+func (m *Manager) cleanupMatching(ctx context.Context, key streamKey, expected *streamInfo) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
 		m.mu.Lock()
-		s, operationDone, started := m.cleanupMatchingLocked(key, expected, runID, checkRun)
+		s, operationDone, started := m.cleanupMatchingLocked(key, expected)
 		m.mu.Unlock()
 		if started {
 			go m.finishStreamCleanup(key, s, operationDone)
@@ -53,7 +52,7 @@ func (m *Manager) cleanupMatching(ctx context.Context, key streamKey, expected *
 	}
 }
 
-func (m *Manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, runID uint64, checkRun bool) (*streamInfo, chan struct{}, bool) {
+func (m *Manager) cleanupMatchingLocked(key streamKey, expected *streamInfo) (*streamInfo, chan struct{}, bool) {
 	if operationDone := m.streamOps[key]; operationDone != nil {
 		return nil, operationDone, false
 	}
@@ -65,9 +64,6 @@ func (m *Manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, run
 		return nil, nil, false
 	}
 	if expected != nil && s != expected {
-		return nil, nil, false
-	}
-	if checkRun && !s.isCurrentRun(runID) {
 		return nil, nil, false
 	}
 	if s.cancel != nil {
@@ -442,62 +438,6 @@ func (m *Manager) releaseTorrentLocked(hash string) bool {
 	return true
 }
 
-func (m *Manager) releaseStartupWaiter(key streamKey, s *streamInfo, runID uint64, requestCanceled bool) bool {
-	m.mu.Lock()
-	current, active := m.active[key]
-	s.mtx.Lock()
-	registered := s.startupWaiters > 0
-	if registered {
-		s.startupWaiters--
-	}
-	abandoned := registered && requestCanceled &&
-		active && current == s && runID == s.runID &&
-		s.startupWaiters == 0 && !s.viewerSeen
-	s.mtx.Unlock()
-
-	cleaned := false
-	var cleanedStream *streamInfo
-	var cleanupDone chan struct{}
-	if abandoned {
-		cleanedStream, cleanupDone, cleaned = m.cleanupMatchingLocked(key, s, runID, true)
-	}
-	m.mu.Unlock()
-	if cleaned {
-		go m.finishStreamCleanup(key, cleanedStream, cleanupDone)
-	}
-	return cleaned
-}
-
-func (m *Manager) pauseStream(key streamKey) {
-	m.mu.Lock()
-	if m.streamOps[key] != nil {
-		m.mu.Unlock()
-		return
-	}
-	s, ok := m.active[key]
-	if !ok {
-		m.mu.Unlock()
-		return
-	}
-	if s.paused || s.completed || !s.running {
-		m.mu.Unlock()
-		return
-	}
-	operationDone := m.reserveStreamOperationLocked(key)
-	if s.cancel != nil {
-		s.cancel()
-		s.cancel = nil
-	}
-	s.paused = true
-	s.running = false
-	file := s.file
-	m.mu.Unlock()
-	file.SetPriority(torrent.PiecePriorityNone)
-	m.finishStreamOperation(key, operationDone)
-	m.notifyDownloadsChanged()
-	log.Printf("Paused stream due to inactivity: key=%v", key)
-}
-
 func resetStreamOutput(paths streamPaths) error {
 	if err := os.RemoveAll(paths.outDir); err != nil {
 		return err
@@ -569,42 +509,42 @@ func (m *Manager) TouchStream(_ context.Context, dirName string) {
 	if s, ok := m.active[key]; ok {
 		s.mtx.Lock()
 		s.lastView = time.Now()
-		s.viewerSeen = true
 		s.mtx.Unlock()
 	}
 	m.mu.Unlock()
+}
+
+func (m *Manager) cleanupInactiveCompletedStreams(now time.Time) {
+	type inactiveStream struct {
+		key    streamKey
+		stream *streamInfo
+	}
+
+	m.mu.Lock()
+	var inactive []inactiveStream
+	for key, s := range m.active {
+		s.mtx.Lock()
+		shouldCleanup := s.completed && now.Sub(s.lastView) > m.cfg.ViewerTimeout
+		s.mtx.Unlock()
+		if shouldCleanup {
+			inactive = append(inactive, inactiveStream{key: key, stream: s})
+		}
+	}
+	m.mu.Unlock()
+
+	for _, item := range inactive {
+		log.Printf("Viewer timeout detected, deactivating completed stream: key=%v", item.key)
+		if err := m.cleanupMatching(context.Background(), item.key, item.stream); err != nil {
+			log.Printf("Failed to clean up completed stream: key=%v, err=%v", item.key, err)
+		}
+	}
 }
 
 func (m *Manager) viewerWatcher() {
 	ticker := time.NewTicker(time.Minute / 3)
 	defer ticker.Stop()
 	for range ticker.C {
-		now := time.Now()
-		m.mu.Lock()
-		for key, s := range m.active {
-			s.mtx.Lock()
-			playable := false
-			select {
-			case <-s.playable:
-				playable = true
-			default:
-			}
-			idle := playable && s.running && !s.completed && now.Sub(s.lastView) > idlePauseTimeout
-			noViewers := now.Sub(s.lastView) > m.cfg.ViewerTimeout
-			s.mtx.Unlock()
-			if idle && !s.paused {
-				go m.pauseStream(key)
-			}
-			if noViewers {
-				log.Printf("Viewer timeout detected, cleaning up stream: key=%v", key)
-				go func(key streamKey) {
-					if err := m.cleanup(context.Background(), key); err != nil {
-						log.Printf("Failed to clean up stream: key=%v, err=%v", key, err)
-					}
-				}(key)
-			}
-		}
-		m.mu.Unlock()
+		m.cleanupInactiveCompletedStreams(time.Now())
 		m.enforceCacheLimit()
 		m.cleanupExpiredDownloads(context.Background())
 	}
