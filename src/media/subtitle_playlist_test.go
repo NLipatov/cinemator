@@ -101,15 +101,17 @@ func TestBuildNormalizedSubtitlePlaylistDoesNotEndWhileSegmentIsMissing(t *testi
 	writeTestVTT(t, dir, "subs_00000.vtt", "00:01.000", "00:02.000")
 
 	tests := []struct {
-		name     string
-		segments []playlistSegment
+		name            string
+		segments        []playlistSegment
+		wantCueDuration float64
 	}{
 		{
 			name:     "first segment",
 			segments: []playlistSegment{{URI: "missing.vtt", Duration: 1}},
 		},
 		{
-			name: "later segment",
+			name:            "later segment",
+			wantCueDuration: 1,
 			segments: []playlistSegment{
 				{URI: "subs_00000.vtt", Duration: 2},
 				{URI: "missing.vtt", Duration: 1},
@@ -128,8 +130,21 @@ func TestBuildNormalizedSubtitlePlaylistDoesNotEndWhileSegmentIsMissing(t *testi
 			if complete {
 				t.Fatal("buildNormalizedSubtitlePlaylist() reported complete inputs")
 			}
-			if strings.Contains(playlist, "#EXT-X-ENDLIST") {
+			segments, ended, err := parseMediaPlaylist([]byte(playlist))
+			if err != nil {
+				t.Fatalf("parseMediaPlaylist() error = %v", err)
+			}
+			if ended {
 				t.Fatalf("incomplete subtitle playlist includes ENDLIST:\n%s", playlist)
+			}
+			if tt.wantCueDuration > 0 {
+				for _, segment := range segments {
+					if segment.URI == "subs_00000.vtt" {
+						assertDuration(t, segment.Duration, tt.wantCueDuration)
+						return
+					}
+				}
+				t.Fatalf("subtitle playlist does not include the available cue:\n%s", playlist)
 			}
 		})
 	}

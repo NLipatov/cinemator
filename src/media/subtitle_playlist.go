@@ -175,7 +175,7 @@ func buildNormalizedSubtitlePlaylist(
 		nextStart := segments[i].End
 		if i+1 < len(segments) {
 			nextStart = segments[i+1].Start
-		} else if rawEnded && videoEnded && videoDuration > segments[i].Start {
+		} else if rawEnded && videoEnded && complete && videoDuration > segments[i].Start {
 			nextStart = videoDuration
 		}
 		segments[i].Duration = math.Max(0.001, nextStart-segments[i].Start)
