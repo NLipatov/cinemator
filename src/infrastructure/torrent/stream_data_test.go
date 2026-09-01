@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -44,6 +45,81 @@ func TestStreamKeyPaths(t *testing.T) {
 	}
 	if got.masterPlaylist != filepath.Join(wantDir, "master.m3u8") {
 		t.Fatalf("masterPlaylist = %q", got.masterPlaylist)
+	}
+	if got.readyMarker != filepath.Join(wantDir, ".ready") {
+		t.Fatalf("readyMarker = %q", got.readyMarker)
+	}
+}
+
+func TestCompletedStreamOutputCanBeReopened(t *testing.T) {
+	root := t.TempDir()
+	key := streamKey{InfoHash: "hash", Index: 2, Audio: 0, Subtitle: -1}
+	paths := key.paths(root)
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := streamOutputReady(paths)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready {
+		t.Fatal("stream without completion marker reported ready")
+	}
+	m := &manager{
+		active:    make(map[streamKey]*streamInfo),
+		streamOps: make(map[streamKey]chan struct{}),
+	}
+	activated, err := m.activateCachedStream(context.Background(), key, paths)
+	if err != nil || activated {
+		t.Fatalf("activateCachedStream() = %v, %v; want false, nil", activated, err)
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+	ready, err = streamOutputReady(paths)
+	if err != nil || !ready {
+		t.Fatalf("streamOutputReady() = %v, %v; want true, nil", ready, err)
+	}
+
+	activated, err = m.activateCachedStream(context.Background(), key, paths)
+	if err != nil || !activated {
+		t.Fatalf("activateCachedStream() = %v, %v; want true, nil", activated, err)
+	}
+	s := m.active[key]
+	if s == nil || !s.completed || s.source != nil || s.torrent != nil {
+		t.Fatalf("cached stream = %#v, want completed stream without torrent source", s)
+	}
+}
+
+func TestCleanupPreservesCompletedStreamOutput(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	paths := key.paths(t.TempDir())
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+	s := &streamInfo{paths: paths, lastView: time.Now(), completed: true}
+	m := &manager{
+		active:    map[streamKey]*streamInfo{key: s},
+		streamOps: make(map[streamKey]chan struct{}),
+	}
+	if err := m.cleanup(context.Background(), key); err != nil {
+		t.Fatalf("cleanup() error = %v", err)
+	}
+	ready, err := streamOutputReady(paths)
+	if err != nil || !ready {
+		t.Fatalf("completed output after cleanup = %v, %v; want ready", ready, err)
+	}
+	if m.active[key] != nil {
+		t.Fatal("cleanup() left completed stream active")
 	}
 }
 
@@ -615,6 +691,7 @@ func TestResetStreamOutputRemovesStaleHLSFiles(t *testing.T) {
 		paths.masterPlaylist,
 		paths.videoPlaylist,
 		paths.subtitlePlaylist,
+		paths.readyMarker,
 		filepath.Join(paths.outDir, "chunk_00001.ts"),
 		filepath.Join(paths.outDir, "subs_00001.vtt"),
 	}
@@ -634,5 +711,29 @@ func TestResetStreamOutputRemovesStaleHLSFiles(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stale file %s still exists: %v", path, err)
 		}
+	}
+}
+
+func TestTorrentStatusHasActiveWebseedRequests(t *testing.T) {
+	const status = `first
+Infohash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+webseeds:
+- https://example.test/first/
+  active requests: 2 of [0-8)
+
+second
+Infohash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+webseeds:
+- https://example.test/second/
+`
+
+	if !torrentStatusHasActiveWebseedRequests(status, strings.Repeat("a", 40)) {
+		t.Fatal("active webseed request was not detected")
+	}
+	if torrentStatusHasActiveWebseedRequests(status, strings.Repeat("b", 40)) {
+		t.Fatal("inactive torrent reported an active webseed request")
+	}
+	if torrentStatusHasActiveWebseedRequests(status, strings.Repeat("c", 40)) {
+		t.Fatal("missing torrent reported an active webseed request")
 	}
 }

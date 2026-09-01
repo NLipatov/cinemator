@@ -112,5 +112,6 @@ func (m *manager) enforceCacheLimit() {
 		m.finishStreamOperation(key, operationDone)
 		total -= it.size
 		log.Printf("enforceCacheLimit: removed %s (freed %d bytes)", it.path, it.size)
+		m.notifyDownloadsChanged()
 	}
 }

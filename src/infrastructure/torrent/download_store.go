@@ -28,6 +28,13 @@ type downloadStore struct {
 	mu   sync.Mutex
 }
 
+type cachedMediaInfo struct {
+	VideoCodec  string                 `json:"videoCodec"`
+	NeedFilter  bool                   `json:"needFilter"`
+	AudioTracks []domain.AudioTrack    `json:"audioTracks"`
+	Subtitles   []domain.SubtitleTrack `json:"subtitles"`
+}
+
 func newDownloadStore(downloadRoot string) (*downloadStore, error) {
 	if err := os.MkdirAll(downloadRoot, 0755); err != nil {
 		return nil, err
@@ -249,6 +256,112 @@ func (s *downloadStore) delete(ctx context.Context, id string) error {
 	return nil
 }
 
+func (s *downloadStore) deletePayload(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entries, err := os.ReadDir(s.downloadDir(id))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if entry.Name() == downloadStoreDirName {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(s.downloadDir(id), entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *downloadStore) loadMediaInfo(ctx context.Context, id string, fileIndex int) (domain.MediaInfo, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return domain.MediaInfo{}, false, err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return domain.MediaInfo{}, false, err
+	}
+	if fileIndex < 0 {
+		return domain.MediaInfo{}, false, fmt.Errorf("bad file index")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	data, err := os.ReadFile(s.mediaInfoPath(id, fileIndex))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return domain.MediaInfo{}, false, nil
+		}
+		return domain.MediaInfo{}, false, err
+	}
+	var cached cachedMediaInfo
+	if err := json.Unmarshal(data, &cached); err != nil {
+		return domain.MediaInfo{}, false, err
+	}
+	return domain.MediaInfo{
+		VideoCodec:  cached.VideoCodec,
+		NeedFilter:  cached.NeedFilter,
+		AudioTracks: cached.AudioTracks,
+		Subtitles:   cached.Subtitles,
+	}, true, nil
+}
+
+func (s *downloadStore) saveMediaInfo(ctx context.Context, id string, fileIndex int, info domain.MediaInfo) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+	if fileIndex < 0 {
+		return fmt.Errorf("bad file index")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dir := filepath.Join(s.downloadDir(id), downloadStoreDirName)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(cachedMediaInfo{
+		VideoCodec:  info.VideoCodec,
+		NeedFilter:  info.NeedFilter,
+		AudioTracks: info.AudioTracks,
+		Subtitles:   info.Subtitles,
+	}, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+
+	path := s.mediaInfoPath(id, fileIndex)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 func (s *downloadStore) readLocked(id string) (domain.Download, error) {
 	data, err := os.ReadFile(s.metadataPath(id))
 	if err != nil {
@@ -305,6 +418,10 @@ func (s *downloadStore) downloadDir(id string) string {
 
 func (s *downloadStore) metadataPath(id string) string {
 	return filepath.Join(s.downloadDir(id), downloadStoreDirName, "metadata.json")
+}
+
+func (s *downloadStore) mediaInfoPath(id string, fileIndex int) string {
+	return filepath.Join(s.downloadDir(id), downloadStoreDirName, fmt.Sprintf("media-%d.json", fileIndex))
 }
 
 func (s *downloadStore) diskSizeLocked(id string) int64 {

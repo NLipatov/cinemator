@@ -2,9 +2,11 @@ package torrent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -12,6 +14,8 @@ import (
 )
 
 const idlePauseTimeout = 15 * time.Minute
+
+const streamReadyVersion = "1\n"
 
 func (m *manager) CleanupStreams() {
 	now := time.Now()
@@ -92,12 +96,25 @@ func (m *manager) cleanupMatchingLocked(key streamKey, expected *streamInfo, run
 }
 
 func (m *manager) finishStreamCleanup(key streamKey, s *streamInfo, operationDone chan struct{}) {
-	s.source.Close()
+	if s.source != nil {
+		s.source.Close()
+	}
 	if s.runDone != nil {
 		<-s.runDone
 	}
 	log.Printf("Cleaning up stream: key=%v, dir=%s", key, s.paths.outDir)
-	if err := os.RemoveAll(s.paths.outDir); err != nil {
+	ready, err := streamOutputReady(s.paths)
+	if err != nil {
+		log.Printf("Failed to inspect stream output: %s, err=%v", s.paths.outDir, err)
+	}
+	if s.completed && ready {
+		s.mtx.Lock()
+		lastView := s.lastView
+		s.mtx.Unlock()
+		if err := os.Chtimes(s.paths.outDir, lastView, lastView); err != nil {
+			log.Printf("Failed to update HLS cache access time: %s, err=%v", s.paths.outDir, err)
+		}
+	} else if err := os.RemoveAll(s.paths.outDir); err != nil {
 		log.Printf("Failed to cleanup directory: %s, err=%v", s.paths.outDir, err)
 	}
 
@@ -311,7 +328,14 @@ func (m *manager) releaseTorrent(hash string, t *torrent.Torrent) <-chan struct{
 		current, exists := m.client.Torrent(t.InfoHash())
 		if refs == 0 && exists && current == t {
 			log.Printf("Dropping torrent: %s", hash)
-			t.Drop()
+			m.dropTorrentAfterWebseedsStop(t)
+		}
+		if refs == 0 && m.hasReadyHLS(hash) && m.downloads != nil {
+			if err := m.downloads.deletePayload(context.Background(), hash); err != nil {
+				log.Printf("Failed to delete completed torrent payload: %s, err=%v", hash, err)
+			} else {
+				m.notifyDownloadsChanged()
+			}
 		}
 		m.finishTorrentOperation(hash, operationDone)
 		close(done)
@@ -348,11 +372,40 @@ func (m *manager) dropTorrent(ctx context.Context, hash string) error {
 	dropDone := make(chan struct{})
 	go func() {
 		log.Printf("Dropping torrent: %s", hash)
-		t.Drop()
+		m.dropTorrentAfterWebseedsStop(t)
 		m.finishTorrentOperation(hash, operationDone)
 		close(dropDone)
 	}()
 	return waitForDone(ctx, dropDone)
+}
+
+func (m *manager) dropTorrentAfterWebseedsStop(t *torrent.Torrent) {
+	// anacrolix removes webseed requests asynchronously. Dropping the torrent
+	// before that cleanup finishes can trip its client-wide consistency check.
+	t.DisallowDataDownload()
+	for {
+		var status strings.Builder
+		m.client.WriteStatus(&status)
+		if !torrentStatusHasActiveWebseedRequests(status.String(), t.InfoHash().HexString()) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Drop()
+}
+
+func torrentStatusHasActiveWebseedRequests(status, hash string) bool {
+	currentHash := ""
+	for _, line := range strings.Split(status, "\n") {
+		if strings.HasPrefix(line, "Infohash: ") {
+			currentHash = strings.TrimSpace(strings.TrimPrefix(line, "Infohash: "))
+			continue
+		}
+		if strings.EqualFold(currentHash, hash) && strings.Contains(line, "active requests:") {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *manager) releaseTorrentLocked(hash string) bool {
@@ -429,6 +482,61 @@ func resetStreamOutput(paths streamPaths) error {
 		return err
 	}
 	return os.MkdirAll(paths.outDir, 0755)
+}
+
+func markStreamOutputReady(paths streamPaths) error {
+	tmp := paths.readyMarker + ".tmp"
+	if err := os.WriteFile(tmp, []byte(streamReadyVersion), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, paths.readyMarker); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func streamOutputReady(paths streamPaths) (bool, error) {
+	marker, err := os.ReadFile(paths.readyMarker)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if string(marker) != streamReadyVersion {
+		return false, nil
+	}
+	info, err := os.Stat(paths.masterPlaylist)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	return !info.IsDir(), nil
+}
+
+func (m *manager) hasReadyHLS(hash string) bool {
+	entries, err := os.ReadDir(m.settings.HlsPath())
+	if err != nil {
+		return false
+	}
+	prefix := hash + "_"
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		key, err := parseStreamDir(entry.Name())
+		if err != nil {
+			continue
+		}
+		ready, err := streamOutputReady(key.paths(m.settings.HlsPath()))
+		if err == nil && ready {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *manager) TouchStream(_ context.Context, dirName string) {

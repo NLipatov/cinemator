@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,80 @@ func TestCleanInfoHashRejectsBadIDs(t *testing.T) {
 		if _, err := cleanInfoHash(id); !errors.Is(err, domain.ErrBadDownloadID) {
 			t.Fatalf("cleanInfoHash(%q) error = %v, want ErrBadDownloadID", id, err)
 		}
+	}
+}
+
+func TestDeletePayloadPreservesDownloadMetadata(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("b", 40)
+	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, nil); err != nil {
+		t.Fatal(err)
+	}
+	mediaInfo := domain.MediaInfo{
+		VideoCodec:  "hevc",
+		NeedFilter:  true,
+		AudioTracks: []domain.AudioTrack{{Index: 0, Codec: "aac", Language: "eng"}},
+		Subtitles:   []domain.SubtitleTrack{{Index: 0, Codec: "subrip", Language: "eng"}},
+	}
+	if err := store.saveMediaInfo(context.Background(), id, 0, mediaInfo); err != nil {
+		t.Fatalf("saveMediaInfo() error = %v", err)
+	}
+	payloadDir := filepath.Join(store.downloadDir(id), "movie")
+	if err := os.MkdirAll(payloadDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(payloadDir, "feature.mkv")
+	if err := os.WriteFile(payload, []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.deletePayload(context.Background(), id); err != nil {
+		t.Fatalf("deletePayload() error = %v", err)
+	}
+	if _, err := os.Stat(payload); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("payload still exists: %v", err)
+	}
+	if _, err := os.Stat(store.metadataPath(id)); err != nil {
+		t.Fatalf("metadata was removed: %v", err)
+	}
+	cached, found, err := store.loadMediaInfo(context.Background(), id, 0)
+	if err != nil || !found || !reflect.DeepEqual(cached, mediaInfo) {
+		t.Fatalf("loadMediaInfo() = %#v, %v, %v; want preserved media info", cached, found, err)
+	}
+	downloads, err := store.list(context.Background())
+	if err != nil || len(downloads) != 1 || downloads[0].ID != id {
+		t.Fatalf("list() = %#v, %v; want preserved download", downloads, err)
+	}
+}
+
+func TestGetMediaInfoUsesPersistentCacheWithoutTorrent(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("c", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	if _, err := store.upsert(context.Background(), id, magnet, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := domain.MediaInfo{
+		VideoCodec:  "h264",
+		AudioTracks: []domain.AudioTrack{{Index: 0, Codec: "aac"}},
+	}
+	if err := store.saveMediaInfo(context.Background(), id, 3, want); err != nil {
+		t.Fatal(err)
+	}
+	m := &manager{downloads: store}
+
+	got, err := m.GetMediaInfo(context.Background(), magnet, 3)
+	if err != nil {
+		t.Fatalf("GetMediaInfo() error = %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("GetMediaInfo() = %#v, want %#v", got, want)
 	}
 }
 

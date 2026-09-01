@@ -46,6 +46,7 @@ type streamPaths struct {
 	videoPlaylist    string
 	subtitlePlaylist string
 	masterPlaylist   string
+	readyMarker      string
 }
 
 func (s *streamInfo) beginRun() uint64 {
@@ -129,6 +130,7 @@ func (k streamKey) paths(root string) streamPaths {
 		videoPlaylist:    filepath.Join(outDir, "index.m3u8"),
 		subtitlePlaylist: filepath.Join(outDir, "subs.m3u8"),
 		masterPlaylist:   filepath.Join(outDir, "master.m3u8"),
+		readyMarker:      filepath.Join(outDir, ".ready"),
 	}
 }
 

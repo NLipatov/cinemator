@@ -100,6 +100,17 @@ func (m *manager) GetTorrentFiles(ctx context.Context, magnet string) ([]domain.
 }
 
 func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int) (domain.MediaInfo, error) {
+	_, hash, err := parseMagnet(magnet)
+	if err != nil {
+		return domain.MediaInfo{}, err
+	}
+	if info, cached, cacheErr := m.downloads.loadMediaInfo(ctx, hash, fileIndex); cacheErr != nil {
+		log.Printf("GetMediaInfo: failed to read cached media info: %v", cacheErr)
+	} else if cached {
+		m.touchDownload(ctx, hash)
+		return info, nil
+	}
+
 	t, hash, err := m.retainTorrent(ctx, magnet)
 	if err != nil {
 		return domain.MediaInfo{}, err
@@ -126,11 +137,54 @@ func (m *manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int
 		return domain.MediaInfo{}, err
 	}
 	defer source.Close()
-	return source.Probe(ctx)
+	info, err := source.Probe(ctx)
+	if err != nil {
+		return domain.MediaInfo{}, err
+	}
+	if err := m.downloads.saveMediaInfo(ctx, hash, fileIndex, info); err != nil {
+		log.Printf("GetMediaInfo: failed to cache media info: %v", err)
+	}
+	return info, nil
 }
 
 func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (string, error) {
-	t, hash, err := m.retainTorrent(ctx, magnet)
+	_, hash, err := parseMagnet(magnet)
+	if err != nil {
+		return "", err
+	}
+	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack}
+	paths := key.paths(m.settings.HlsPath())
+
+	if s, runID, resumed, exists, err := m.getOrResumeStream(ctx, key); exists {
+		if err != nil {
+			return "", err
+		}
+		m.touchDownload(ctx, hash)
+		if resumed {
+			m.notifyDownloadsChanged()
+		}
+		return m.waitForPlayableStream(ctx, key, s, runID)
+	}
+	if cached, err := m.activateCachedStream(ctx, key, paths); err != nil {
+		return "", err
+	} else if cached {
+		m.touchDownload(ctx, hash)
+		log.Printf("Reusing completed HLS stream: key=%v, playlist=%s", key, paths.masterPlaylist)
+		return paths.masterPlaylist, nil
+	}
+	// A concurrent request may have created the stream while the cache was checked.
+	if s, runID, resumed, exists, err := m.getOrResumeStream(ctx, key); exists {
+		if err != nil {
+			return "", err
+		}
+		m.touchDownload(ctx, hash)
+		if resumed {
+			m.notifyDownloadsChanged()
+		}
+		return m.waitForPlayableStream(ctx, key, s, runID)
+	}
+
+	t, _, err := m.retainTorrent(ctx, magnet)
 	if err != nil {
 		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
 		return "", err
@@ -154,8 +208,6 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	}
 	file := files[fileIndex]
 	m.touchDownload(ctx, hash)
-	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack}
-	paths := key.paths(m.settings.HlsPath())
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -230,6 +282,49 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		}
 		log.Printf("Stream ready: key=%v, playlist=%s", key, paths.masterPlaylist)
 		return playlist, nil
+	}
+}
+
+func (m *manager) activateCachedStream(ctx context.Context, key streamKey, paths streamPaths) (bool, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		m.mu.Lock()
+		if operationDone := m.streamOps[key]; operationDone != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, operationDone); err != nil {
+				return false, err
+			}
+			continue
+		}
+		if _, exists := m.active[key]; exists {
+			m.mu.Unlock()
+			return false, nil
+		}
+		operationDone := m.reserveStreamOperationLocked(key)
+		m.mu.Unlock()
+
+		ready, err := streamOutputReady(paths)
+		if err != nil {
+			m.finishStreamOperation(key, operationDone)
+			return false, err
+		}
+		if !ready {
+			m.finishStreamOperation(key, operationDone)
+			return false, nil
+		}
+
+		s := &streamInfo{
+			lastView:  time.Now(),
+			paths:     paths,
+			completed: true,
+		}
+		m.mu.Lock()
+		m.active[key] = s
+		m.mu.Unlock()
+		m.finishStreamOperation(key, operationDone)
+		return true, nil
 	}
 }
 
@@ -312,6 +407,7 @@ func (m *manager) ListDownloads(ctx context.Context) ([]domain.Download, error) 
 	}
 	statuses := m.downloadStatuses()
 	for i := range downloads {
+		downloads[i].DiskSize += hlsDiskSize(m.settings.HlsPath(), downloads[i].ID)
 		if downloads[i].Status == domain.DownloadStatusExpired {
 			continue
 		}
@@ -330,6 +426,7 @@ func (m *manager) ExtendDownload(ctx context.Context, id string, extension time.
 	if status, ok := m.downloadStatuses()[download.ID]; ok && download.Status != domain.DownloadStatusExpired {
 		download.Status = status
 	}
+	download.DiskSize += hlsDiskSize(m.settings.HlsPath(), download.ID)
 	m.notifyDownloadsChanged()
 	return download, nil
 }
@@ -476,6 +573,31 @@ func (m *manager) removeDownloadHlsDirs(id string) error {
 	return nil
 }
 
+func hlsDiskSize(root, id string) int64 {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0
+	}
+	prefix := id + "_"
+	var total int64
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		_ = filepath.WalkDir(filepath.Join(root, entry.Name()), func(_ string, entry os.DirEntry, err error) error {
+			if err != nil || entry.IsDir() {
+				return nil
+			}
+			info, err := entry.Info()
+			if err == nil {
+				total += allocatedFileSize(info)
+			}
+			return nil
+		})
+	}
+	return total
+}
+
 func (m *manager) launchConversion(
 	streamCtx context.Context,
 	key streamKey,
@@ -485,6 +607,14 @@ func (m *manager) launchConversion(
 	runDone := s.runDone
 	go func() {
 		err := m.runConversion(streamCtx, s, runID)
+		if err == nil {
+			err = markStreamOutputReady(s.paths)
+		}
+		if err == nil {
+			m.finishConversion(key, s, runID, nil)
+			close(runDone)
+			return
+		}
 		close(runDone)
 		m.finishConversion(key, s, runID, err)
 	}()
@@ -556,6 +686,11 @@ func (m *manager) runConversion(
 }
 
 func (m *manager) finishConversion(key streamKey, s *streamInfo, runID uint64, err error) {
+	var (
+		cancel context.CancelFunc
+		source *torrentSource
+		t      *torrent.Torrent
+	)
 	m.mu.Lock()
 	if current, ok := m.active[key]; !ok || current != s || !s.isCurrentRun(runID) {
 		m.mu.Unlock()
@@ -569,11 +704,27 @@ func (m *manager) finishConversion(key streamKey, s *streamInfo, runID uint64, e
 	if err == nil {
 		s.completed = true
 		s.paused = false
+		cancel = s.cancel
+		s.cancel = nil
+		source = s.source
+		s.source = nil
+		t = s.torrent
+		s.torrent = nil
+		s.file = nil
 		notifyCompleted = true
 	} else if errors.Is(err, context.Canceled) {
 		s.paused = true
 	}
 	m.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if source != nil {
+		source.Close()
+	}
+	if t != nil {
+		m.releaseTorrent(key.InfoHash, t)
+	}
 	if notifyCompleted {
 		m.notifyDownloadsChanged()
 	}
