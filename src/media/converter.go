@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -66,7 +65,11 @@ func (c *Converter) ConvertToHLS() error {
 	} else {
 		args = c.builder.buildShared(c.info)
 	}
-	log.Println("ffmpeg", strings.Join(args, " "))
+	if bitmap {
+		log.Printf("starting ffmpeg HLS conversion: bitmap subtitle track=%d", c.bitmapSubtitle)
+	} else {
+		log.Print("starting ffmpeg shared HLS conversion")
+	}
 
 	runCtx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
@@ -92,7 +95,7 @@ func (c *Converter) ConvertToHLS() error {
 				name: fmt.Sprintf("subtitle %d ffmpeg", subtitleIndex),
 				run: func() error {
 					subArgs := runner.subtitleArgs(subtitleIndex, rawPlaylist)
-					log.Println("ffmpeg (subtitle)", strings.Join(subArgs, " "))
+					log.Printf("starting ffmpeg subtitle conversion: track=%d", subtitleIndex)
 					err := runner.runFFmpeg(subArgs)
 					if err == nil {
 						close(subtitleCompleted)

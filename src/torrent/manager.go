@@ -395,6 +395,13 @@ func (m *Manager) activateCachedStream(ctx context.Context, key streamKey, paths
 func (m *Manager) getOrResumeStream(ctx context.Context, key streamKey) (*streamInfo, uint64, bool, bool, error) {
 	for {
 		m.mu.Lock()
+		if deletionDone := m.deletions[key.InfoHash]; deletionDone != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, deletionDone); err != nil {
+				return nil, 0, false, true, err
+			}
+			continue
+		}
 		if operationDone := m.streamOps[key]; operationDone != nil {
 			m.mu.Unlock()
 			if err := waitForDone(ctx, operationDone); err != nil {

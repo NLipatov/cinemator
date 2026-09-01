@@ -96,6 +96,45 @@ func TestBuildNormalizedSubtitlePlaylistPublishesPrerollBeforeFirstCue(t *testin
 	}
 }
 
+func TestBuildNormalizedSubtitlePlaylistDoesNotEndWhileSegmentIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	writeTestVTT(t, dir, "subs_00000.vtt", "00:01.000", "00:02.000")
+
+	tests := []struct {
+		name     string
+		segments []playlistSegment
+	}{
+		{
+			name:     "first segment",
+			segments: []playlistSegment{{URI: "missing.vtt", Duration: 1}},
+		},
+		{
+			name: "later segment",
+			segments: []playlistSegment{
+				{URI: "subs_00000.vtt", Duration: 2},
+				{URI: "missing.vtt", Duration: 1},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			playlist, ok, complete, err := buildNormalizedSubtitlePlaylist(tt.segments, true, 10, true, dir)
+			if err != nil {
+				t.Fatalf("buildNormalizedSubtitlePlaylist() error = %v", err)
+			}
+			if !ok {
+				t.Fatal("buildNormalizedSubtitlePlaylist() reported no segments")
+			}
+			if complete {
+				t.Fatal("buildNormalizedSubtitlePlaylist() reported complete inputs")
+			}
+			if strings.Contains(playlist, "#EXT-X-ENDLIST") {
+				t.Fatalf("incomplete subtitle playlist includes ENDLIST:\n%s", playlist)
+			}
+		})
+	}
+}
+
 func TestAppendSubtitlePrerollAvoidsSubMillisecondTail(t *testing.T) {
 	segments := appendSubtitlePreroll(nil, 8.0001)
 	if len(segments) != 2 {

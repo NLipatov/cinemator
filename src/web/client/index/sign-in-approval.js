@@ -86,6 +86,7 @@ async function approve() {
       return;
     }
     if (!response.ok) throw new Error('Could not update the sign-in request.');
+    expiresAt = undefined;
     title.textContent = 'Sign-in allowed';
     description.textContent = 'You can return to the other device.';
     code.hidden = true;

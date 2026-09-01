@@ -862,7 +862,7 @@
         forcedRecoveryAttempts = 0;
       }
 
-      if (Hls.isSupported()) {
+      if (typeof Hls !== 'undefined' && Hls.isSupported()) {
         hls = new Hls({ startPosition: resumeTime });
         hls.loadSource(src);
         hls.attachMedia(video);

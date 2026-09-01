@@ -158,7 +158,7 @@ func buildNormalizedSubtitlePlaylist(
 	if len(segments) == 0 {
 		if videoDuration > 0 {
 			segments = appendSubtitlePreroll(segments, videoDuration)
-			return renderSubtitlePlaylist(segments, rawEnded && videoEnded), true, complete, nil
+			return renderSubtitlePlaylist(segments, rawEnded && videoEnded && complete), true, complete, nil
 		}
 		if rawEnded && videoEnded && complete {
 			return "", false, complete, ErrSubtitleTrackEmpty
@@ -181,7 +181,7 @@ func buildNormalizedSubtitlePlaylist(
 		segments[i].Duration = math.Max(0.001, nextStart-segments[i].Start)
 	}
 
-	return renderSubtitlePlaylist(segments, rawEnded && videoEnded), true, complete, nil
+	return renderSubtitlePlaylist(segments, rawEnded && videoEnded && complete), true, complete, nil
 }
 
 func appendSubtitlePreroll(segments []normalizedSubtitleSegment, duration float64) []normalizedSubtitleSegment {

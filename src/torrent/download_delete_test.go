@@ -230,6 +230,58 @@ func TestActivateCachedStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
 	}
 }
 
+func TestGetOrResumeStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
+	id := strings.Repeat("c", 40)
+	key := streamKey{InfoHash: id, Index: 0, Audio: 0, Subtitle: -1}
+	stream := &streamInfo{completed: true}
+	deletionDone := make(chan struct{})
+	m := &Manager{
+		active:    map[streamKey]*streamInfo{key: stream},
+		streamOps: make(map[streamKey]chan struct{}),
+		deletions: map[string]chan struct{}{id: deletionDone},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observed := &doneObservedContext{
+		Context:   ctx,
+		requested: make(chan struct{}),
+	}
+	type result struct {
+		stream *streamInfo
+		exists bool
+		err    error
+	}
+	resultReady := make(chan result, 1)
+	go func() {
+		got, _, _, exists, err := m.getOrResumeStream(observed, key)
+		resultReady <- result{stream: got, exists: exists, err: err}
+	}()
+
+	select {
+	case <-observed.requested:
+	case <-time.After(time.Second):
+		t.Fatal("getOrResumeStream() did not wait for the deletion")
+	}
+	select {
+	case got := <-resultReady:
+		t.Fatalf("getOrResumeStream() passed the deletion barrier: %#v", got)
+	default:
+	}
+
+	m.mu.Lock()
+	delete(m.active, key)
+	m.mu.Unlock()
+	m.finishDownloadDeletion(id, deletionDone)
+	select {
+	case got := <-resultReady:
+		if got.err != nil || got.exists || got.stream != nil {
+			t.Fatalf("getOrResumeStream() = stream %p, exists %v, error %v; want no stream", got.stream, got.exists, got.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("getOrResumeStream() did not continue after deletion finished")
+	}
+}
+
 func TestDropTorrentAfterWebseedsStopHonorsCanceledContext(t *testing.T) {
 	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
 	if err != nil {
