@@ -24,8 +24,8 @@ func TestValidateSelectionRejectsOutOfRangeTracks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := validateSelection(info, tt.selection); err == nil {
-				t.Fatalf("validateSelection(%+v) error = nil, want error", tt.selection)
+			if err := ValidateSelection(info, tt.selection); err == nil {
+				t.Fatalf("ValidateSelection(%+v) error = nil, want error", tt.selection)
 			}
 		})
 	}
@@ -43,10 +43,17 @@ func TestValidateSelectionAllowsDefaultsAndVideoOnlyInput(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := validateSelection(tt.info, tt.selection); err != nil {
-				t.Fatalf("validateSelection(%+v) error = %v", tt.selection, err)
+			if err := ValidateSelection(tt.info, tt.selection); err != nil {
+				t.Fatalf("ValidateSelection(%+v) error = %v", tt.selection, err)
 			}
 		})
+	}
+}
+
+func TestConverterRejectsInvalidBitmapSubtitleIndexBeforeStartingFFmpeg(t *testing.T) {
+	converter := Converter{bitmapSubtitle: -2}
+	if err := converter.ConvertToHLS(); err == nil {
+		t.Fatal("ConvertToHLS() error = nil, want invalid bitmap subtitle index")
 	}
 }
 

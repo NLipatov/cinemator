@@ -42,11 +42,11 @@ func TestStreamKeyPaths(t *testing.T) {
 	if got.videoPlaylist != filepath.Join(wantDir, "index.m3u8") {
 		t.Fatalf("videoPlaylist = %q", got.videoPlaylist)
 	}
-	if got.subtitlePlaylist != filepath.Join(wantDir, "subs.m3u8") {
-		t.Fatalf("subtitlePlaylist = %q", got.subtitlePlaylist)
-	}
 	if got.masterPlaylist != filepath.Join(wantDir, "master.m3u8") {
 		t.Fatalf("masterPlaylist = %q", got.masterPlaylist)
+	}
+	if got.selectionMaster(1, 3) != filepath.Join(wantDir, "master_a1_s3.m3u8") {
+		t.Fatalf("selectionMaster = %q", got.selectionMaster(1, 3))
 	}
 	if got.readyMarker != filepath.Join(wantDir, ".ready") {
 		t.Fatalf("readyMarker = %q", got.readyMarker)
@@ -77,6 +77,13 @@ func TestCompletedStreamOutputCanBeReopened(t *testing.T) {
 	activated, err := m.activateCachedStream(context.Background(), key, paths)
 	if err != nil || activated {
 		t.Fatalf("activateCachedStream() = %v, %v; want false, nil", activated, err)
+	}
+	if err := os.WriteFile(paths.readyMarker, []byte("1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	ready, err = streamOutputReady(paths)
+	if err != nil || ready {
+		t.Fatalf("legacy streamOutputReady() = %v, %v; want false, nil", ready, err)
 	}
 	if err := markStreamOutputReady(paths); err != nil {
 		t.Fatal(err)
@@ -727,7 +734,7 @@ func TestResetStreamOutputRemovesStaleHLSFiles(t *testing.T) {
 	staleFiles := []string{
 		paths.masterPlaylist,
 		paths.videoPlaylist,
-		paths.subtitlePlaylist,
+		filepath.Join(paths.outDir, "subs_0.m3u8"),
 		paths.readyMarker,
 		filepath.Join(paths.outDir, "chunk_00001.ts"),
 		filepath.Join(paths.outDir, "subs_00001.vtt"),

@@ -76,7 +76,7 @@ func (n subtitlePlaylistNormalizer) refreshOnce() (bool, error) {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			if n.subtitleExtractionDone() {
-				return false, ErrSubtitleTrackEmpty
+				rawEnded = true
 			}
 		} else {
 			return false, err
@@ -156,12 +156,12 @@ func buildNormalizedSubtitlePlaylist(
 	}
 
 	if len(segments) == 0 {
-		if rawEnded && complete {
-			return "", false, complete, ErrSubtitleTrackEmpty
-		}
 		if videoDuration > 0 {
 			segments = appendSubtitlePreroll(segments, videoDuration)
-			return renderSubtitlePlaylist(segments, false), true, complete, nil
+			return renderSubtitlePlaylist(segments, rawEnded && videoEnded), true, complete, nil
+		}
+		if rawEnded && videoEnded && complete {
+			return "", false, complete, ErrSubtitleTrackEmpty
 		}
 		return "", false, complete, nil
 	}
@@ -346,9 +346,21 @@ func parseWebVTTTime(raw string) (float64, error) {
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, perm); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	defer tmp.Close()
+	if err := tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }

@@ -409,6 +409,33 @@ func TestReadMediaPlaylistWithWaitWaitsForSegment(t *testing.T) {
 	}
 }
 
+func TestHandleGetHlsChunkServesSelectionMasterWithoutMediaSegments(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CINEMATOR_HLS_PATH", root)
+	dir := filepath.Join(root, "stream")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	master := "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\nindex.m3u8\n"
+	if err := os.WriteFile(filepath.Join(dir, "master_a1_s0.m3u8"), []byte(master), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	server := HttpServer{mgr: fakeTorrentManager{}, settings: settings.NewSettings()}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/stream/master_a1_s0.m3u8", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	server.handleGetHlsChunk(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if rec.Body.String() != master {
+		t.Fatalf("master = %q, want %q", rec.Body.String(), master)
+	}
+}
+
 func readSSEBlock(t *testing.T, reader *bufio.Reader) string {
 	t.Helper()
 	var block strings.Builder

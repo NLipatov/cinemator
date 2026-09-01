@@ -3,7 +3,6 @@ package ffmpeg
 import (
 	"cinemator/domain"
 	"context"
-	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -145,10 +144,10 @@ func TestSubtitlePlaylistNormalizerPublishesPrerollBeforeRawPlaylist(t *testing.
 	}
 }
 
-func TestSubtitlePrerollMakesMasterReadyBeforeFirstCue(t *testing.T) {
+func TestSubtitlePrerollMakesRenditionReadyBeforeFirstCue(t *testing.T) {
 	dir := t.TempDir()
 	videoList := filepath.Join(dir, "index.m3u8")
-	subtitleList := filepath.Join(dir, "subs.m3u8")
+	subtitleList := filepath.Join(dir, "subs_0.m3u8")
 	master := filepath.Join(dir, "master.m3u8")
 	if err := os.WriteFile(videoList, []byte("#EXTM3U\n#EXTINF:3.5,\nchunk_00000.ts\n"), 0644); err != nil {
 		t.Fatal(err)
@@ -167,82 +166,79 @@ func TestSubtitlePrerollMakesMasterReadyBeforeFirstCue(t *testing.T) {
 
 	converter := Converter{
 		ctx:       context.Background(),
+		info:      domain.MediaInfo{Subtitles: []domain.SubtitleTrack{{Codec: "subrip"}}},
+		builder:   ArgsBuilder{OutDir: dir},
 		videoList: videoList,
-		subList:   subtitleList,
 		master:    master,
 	}
-	if err := converter.writeMasterAfterRenditionsReady(domain.MediaInfo{}, true); err != nil {
+	if err := converter.writeMasterAfterRenditionsReady(); err != nil {
 		t.Fatalf("writeMasterAfterRenditionsReady() error = %v", err)
 	}
 	data, err := os.ReadFile(master)
 	if err != nil {
 		t.Fatalf("read master playlist: %v", err)
 	}
-	if !strings.Contains(string(data), "SUBTITLES=\"subs\"") {
-		t.Fatalf("master playlist does not include subtitle rendition:\n%s", data)
+	if !strings.Contains(string(data), "index.m3u8") {
+		t.Fatalf("readiness master does not include video rendition:\n%s", data)
 	}
 }
 
-func TestConverterCreatesSubtitlePrerollFileBeforeNormalization(t *testing.T) {
+func TestConverterUsesTrackSpecificSubtitlePaths(t *testing.T) {
 	dir := t.TempDir()
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
 	converter := Converter{
-		ctx:        ctx,
-		builder:    ArgsBuilder{OutDir: dir},
-		rawSubList: filepath.Join(dir, "missing.raw.m3u8"),
-		subList:    filepath.Join(dir, "subs.m3u8"),
-		videoList:  filepath.Join(dir, "index.m3u8"),
+		builder:  ArgsBuilder{OutDir: dir},
+		inputURL: "input",
 	}
-
-	err := converter.writeNormalizedSubtitlePlaylist(nil)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("writeNormalizedSubtitlePlaylist() error = %v, want %v", err, context.Canceled)
-	}
-	data, err := os.ReadFile(filepath.Join(dir, subtitlePrerollFilename))
-	if err != nil {
-		t.Fatalf("read subtitle preroll: %v", err)
-	}
-	if string(data) != "WEBVTT\n\n" {
-		t.Fatalf("subtitle preroll = %q", data)
+	args := converter.subtitleArgs(2, filepath.Join(dir, "subs_2.raw.m3u8"))
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"0:s:2", "subs_2.raw.m3u8", "subs_2_%05d.vtt"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("subtitleArgs() does not contain %q: %v", want, args)
+		}
 	}
 }
 
-func TestBuildNormalizedSubtitlePlaylistRejectsEmptyTrack(t *testing.T) {
+func TestBuildNormalizedSubtitlePlaylistFillsEmptyTrack(t *testing.T) {
 	dir := t.TempDir()
 
-	_, ok, complete, err := buildNormalizedSubtitlePlaylist(nil, true, 300, true, dir)
-	if !errors.Is(err, ErrSubtitleTrackEmpty) {
-		t.Fatalf("buildNormalizedSubtitlePlaylist() error = %v, want %v", err, ErrSubtitleTrackEmpty)
+	playlist, ok, complete, err := buildNormalizedSubtitlePlaylist(nil, true, 300, true, dir)
+	if err != nil {
+		t.Fatalf("buildNormalizedSubtitlePlaylist() error = %v", err)
 	}
-	if ok {
-		t.Fatal("buildNormalizedSubtitlePlaylist() reported segments for an empty track")
+	if !ok {
+		t.Fatal("buildNormalizedSubtitlePlaylist() reported no filler segments")
 	}
 	if !complete {
 		t.Fatal("buildNormalizedSubtitlePlaylist() reported incomplete inputs")
 	}
+	if !strings.Contains(playlist, subtitlePrerollFilename) || !strings.Contains(playlist, "#EXT-X-ENDLIST") {
+		t.Fatalf("empty subtitle track is not a complete filler playlist:\n%s", playlist)
+	}
 }
 
-func TestBuildNormalizedSubtitlePlaylistRejectsCueLessSegments(t *testing.T) {
+func TestBuildNormalizedSubtitlePlaylistFillsCueLessSegments(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "subs_00000.vtt"), []byte("WEBVTT\n\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	rawSegments := []playlistSegment{{URI: "subs_00000.vtt", Duration: 1}}
-	_, ok, complete, err := buildNormalizedSubtitlePlaylist(rawSegments, true, 300, true, dir)
-	if !errors.Is(err, ErrSubtitleTrackEmpty) {
-		t.Fatalf("buildNormalizedSubtitlePlaylist() error = %v, want %v", err, ErrSubtitleTrackEmpty)
+	playlist, ok, complete, err := buildNormalizedSubtitlePlaylist(rawSegments, true, 300, true, dir)
+	if err != nil {
+		t.Fatalf("buildNormalizedSubtitlePlaylist() error = %v", err)
 	}
-	if ok {
-		t.Fatal("buildNormalizedSubtitlePlaylist() reported segments for a cue-less VTT segment")
+	if !ok {
+		t.Fatal("buildNormalizedSubtitlePlaylist() reported no filler segments")
 	}
 	if !complete {
 		t.Fatal("buildNormalizedSubtitlePlaylist() reported incomplete inputs")
 	}
+	if !strings.Contains(playlist, subtitlePrerollFilename) || !strings.Contains(playlist, "#EXT-X-ENDLIST") {
+		t.Fatalf("cue-less subtitle track is not a complete filler playlist:\n%s", playlist)
+	}
 }
 
-func TestSubtitlePlaylistNormalizerRejectsMissingRawPlaylistAfterSubtitleCompletes(t *testing.T) {
+func TestSubtitlePlaylistNormalizerWaitsForVideoAfterEmptySubtitleCompletes(t *testing.T) {
 	done := make(chan struct{})
 	close(done)
 	normalizer := subtitlePlaylistNormalizer{
@@ -251,9 +247,12 @@ func TestSubtitlePlaylistNormalizerRejectsMissingRawPlaylistAfterSubtitleComplet
 		subtitleCompleted: done,
 	}
 
-	_, err := normalizer.refreshOnce()
-	if !errors.Is(err, ErrSubtitleTrackEmpty) {
-		t.Fatalf("refreshOnce() error = %v, want %v", err, ErrSubtitleTrackEmpty)
+	completed, err := normalizer.refreshOnce()
+	if err != nil {
+		t.Fatalf("refreshOnce() error = %v", err)
+	}
+	if completed {
+		t.Fatal("refreshOnce() completed before the video timeline was available")
 	}
 }
 

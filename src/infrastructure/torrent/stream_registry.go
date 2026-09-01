@@ -16,7 +16,7 @@ import (
 const (
 	idlePauseTimeout   = 15 * time.Minute
 	webseedStopTimeout = 5 * time.Second
-	streamReadyVersion = "1\n"
+	streamReadyVersion = "2\n"
 )
 
 func (m *manager) CleanupStreams() {

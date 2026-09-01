@@ -366,7 +366,8 @@ func (s *HttpServer) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 	if strings.HasSuffix(clean, ".m3u8") {
 		var data []byte
 		var err error
-		if path.Base(clean) == "master.m3u8" {
+		playlistName := path.Base(clean)
+		if playlistName == "master.m3u8" || strings.HasPrefix(playlistName, "master_") {
 			data, err = readWithWait(r.Context(), fullPath, waitTimeout)
 		} else {
 			data, err = readMediaPlaylistWithWait(r.Context(), fullPath, waitTimeout)

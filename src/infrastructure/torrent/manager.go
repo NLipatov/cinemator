@@ -152,14 +152,72 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	if err != nil {
 		return "", err
 	}
-	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: audioTrack, Subtitle: subtitleTrack}
+
+	info, err := m.GetMediaInfo(ctx, magnet, fileIndex)
+	if err != nil {
+		return "", err
+	}
+	selection := ffmpeg.StreamSelection{
+		AudioTrackIndex:    audioTrack,
+		SubtitleTrackIndex: subtitleTrack,
+	}
+	if err := ffmpeg.ValidateSelection(info, selection); err != nil {
+		return "", err
+	}
+	bitmapSelected := subtitleTrack >= 0 && ffmpeg.IsBitmapSubtitle(info.Subtitles[subtitleTrack].Codec)
+	if bitmapSelected {
+		// Keep the source alive while the shared and burned-in renditions start.
+		guard, _, err := m.retainTorrent(ctx, magnet)
+		if err != nil {
+			return "", err
+		}
+		defer m.releaseTorrent(hash, guard)
+	}
+
+	baseKey := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
+	if _, err := m.prepareHLSRendition(ctx, magnet, baseKey, info, -1); err != nil {
+		return "", err
+	}
+
+	videoKey := baseKey
+	if bitmapSelected {
+		videoKey.Subtitle = subtitleTrack
+		if _, err := m.prepareHLSRendition(ctx, magnet, videoKey, info, subtitleTrack); err != nil {
+			return "", err
+		}
+	}
+
+	basePaths := baseKey.paths(m.settings.HlsPath())
+	videoPaths := videoKey.paths(m.settings.HlsPath())
+	masterPlaylist := videoPaths.selectionMaster(audioTrack, subtitleTrack)
+	if err := ffmpeg.WriteMasterPlaylist(
+		masterPlaylist,
+		videoPaths.videoPlaylist,
+		basePaths.outDir,
+		info,
+		selection,
+	); err != nil {
+		return "", fmt.Errorf("write selection master: %w", err)
+	}
+	m.touchDownload(ctx, hash)
+	log.Printf("Stream ready: key=%v, playlist=%s", videoKey, masterPlaylist)
+	return masterPlaylist, nil
+}
+
+func (m *manager) prepareHLSRendition(
+	ctx context.Context,
+	magnet string,
+	key streamKey,
+	info domain.MediaInfo,
+	bitmapSubtitle int,
+) (string, error) {
 	paths := key.paths(m.settings.HlsPath())
 
 	if s, runID, resumed, exists, err := m.getOrResumeStream(ctx, key); exists {
 		if err != nil {
 			return "", err
 		}
-		m.touchDownload(ctx, hash)
+		m.touchDownload(ctx, key.InfoHash)
 		if resumed {
 			m.notifyDownloadsChanged()
 		}
@@ -168,16 +226,16 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	if cached, err := m.activateCachedStream(ctx, key, paths); err != nil {
 		return "", err
 	} else if cached {
-		m.touchDownload(ctx, hash)
-		log.Printf("Reusing completed HLS stream: key=%v, playlist=%s", key, paths.masterPlaylist)
+		m.touchDownload(ctx, key.InfoHash)
+		log.Printf("Reusing completed HLS rendition: key=%v, playlist=%s", key, paths.masterPlaylist)
 		return paths.masterPlaylist, nil
 	}
-	// A concurrent request may have created the stream while the cache was checked.
+	// A concurrent request may have created the rendition while the cache was checked.
 	if s, runID, resumed, exists, err := m.getOrResumeStream(ctx, key); exists {
 		if err != nil {
 			return "", err
 		}
-		m.touchDownload(ctx, hash)
+		m.touchDownload(ctx, key.InfoHash)
 		if resumed {
 			m.notifyDownloadsChanged()
 		}
@@ -186,13 +244,13 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 
 	t, _, err := m.retainTorrent(ctx, magnet)
 	if err != nil {
-		log.Printf("PrepareHlsStream: AddMagnet failed: %v", err)
+		log.Printf("prepareHLSRendition: AddMagnet failed: %v", err)
 		return "", err
 	}
 	torrentRetained := true
 	defer func() {
 		if torrentRetained {
-			m.releaseTorrent(hash, t)
+			m.releaseTorrent(key.InfoHash, t)
 		}
 	}()
 
@@ -202,12 +260,12 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		return "", ctx.Err()
 	}
 	files := t.Files()
-	if fileIndex < 0 || fileIndex >= len(files) {
-		log.Printf("PrepareHlsStream: bad file index: %d", fileIndex)
+	if key.Index < 0 || key.Index >= len(files) {
+		log.Printf("prepareHLSRendition: bad file index: %d", key.Index)
 		return "", fmt.Errorf("bad file index")
 	}
-	file := files[fileIndex]
-	m.touchDownload(ctx, hash)
+	file := files[key.Index]
+	m.touchDownload(ctx, key.InfoHash)
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -253,14 +311,15 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 
 		streamCtx, cancel := context.WithCancel(context.Background())
 		s := &streamInfo{
-			cancel:    cancel,
-			torrent:   t,
-			file:      file,
-			lastView:  time.Now(),
-			paths:     paths,
-			source:    source,
-			selection: ffmpeg.StreamSelection{AudioTrackIndex: audioTrack, SubtitleTrackIndex: subtitleTrack},
-			running:   true,
+			cancel:         cancel,
+			torrent:        t,
+			file:           file,
+			lastView:       time.Now(),
+			paths:          paths,
+			source:         source,
+			mediaInfo:      info,
+			bitmapSubtitle: bitmapSubtitle,
+			running:        true,
 		}
 		runID := s.beginRun()
 		s.registerStartupWaiter()
@@ -280,7 +339,7 @@ func (m *manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 		if err != nil {
 			return "", err
 		}
-		log.Printf("Stream ready: key=%v, playlist=%s", key, paths.masterPlaylist)
+		log.Printf("HLS rendition ready: key=%v, playlist=%s", key, paths.masterPlaylist)
 		return playlist, nil
 	}
 }
@@ -644,9 +703,9 @@ func (m *manager) runConversion(
 		s.source.URL(),
 		s.paths.outDir,
 		s.paths.videoPlaylist,
-		s.paths.subtitlePlaylist,
 		s.paths.masterPlaylist,
-		s.selection,
+		s.mediaInfo,
+		s.bitmapSubtitle,
 	)
 	errCh := make(chan error, 1)
 	go func() {

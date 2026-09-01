@@ -13,17 +13,15 @@ import (
 	"time"
 )
 
-// Converter wraps "probe → decide arguments → run ffmpeg".
+// Converter creates one persisted HLS rendition set from an analyzed input.
 type Converter struct {
-	ctx        context.Context
-	inputURL   string
-	analyzer   SampleAnalyzer
-	builder    ArgsBuilder     // builds CLI args for ffmpeg
-	selection  StreamSelection // which audio/subtitle tracks to use
-	videoList  string
-	subList    string
-	rawSubList string
-	master     string
+	ctx            context.Context
+	inputURL       string
+	info           domain.MediaInfo
+	builder        ArgsBuilder
+	bitmapSubtitle int
+	videoList      string
+	master         string
 }
 
 type conversionTask struct {
@@ -38,46 +36,41 @@ type conversionTaskResult struct {
 
 func NewURLConverter(ctx context.Context,
 	inputURL string,
-	outDir, videoPlaylist, subtitlePlaylist, masterPlaylist string,
-	selection StreamSelection,
+	outDir, videoPlaylist, masterPlaylist string,
+	info domain.MediaInfo,
+	bitmapSubtitle int,
 ) *Converter {
 	return &Converter{
-		ctx:        ctx,
-		inputURL:   inputURL,
-		analyzer:   SampleAnalyzer{},
-		builder:    ArgsBuilder{OutDir: outDir, Playlist: videoPlaylist, Input: inputURL},
-		selection:  selection,
-		videoList:  videoPlaylist,
-		subList:    subtitlePlaylist,
-		rawSubList: filepath.Join(outDir, "subs.raw.m3u8"),
-		master:     masterPlaylist,
+		ctx:            ctx,
+		inputURL:       inputURL,
+		info:           info,
+		builder:        ArgsBuilder{OutDir: outDir, Input: inputURL},
+		bitmapSubtitle: bitmapSubtitle,
+		videoList:      videoPlaylist,
+		master:         masterPlaylist,
 	}
 }
 
-// ConvertToHLS probes the stream, builds arguments once and launches ffmpeg.
+// ConvertToHLS creates either the shared renditions or one burned-in bitmap rendition.
 func (c *Converter) ConvertToHLS() error {
-	// --- 1. probe the seekable input ----------------------------------
-	info, err := c.analyzer.AnalyzeURL(c.ctx, c.inputURL)
-	if err != nil {
-		return err
+	if c.bitmapSubtitle < -1 {
+		return fmt.Errorf("invalid bitmap subtitle index: %d", c.bitmapSubtitle)
 	}
-	if err := validateSelection(info, c.selection); err != nil {
-		return err
+	bitmap := c.bitmapSubtitle >= 0
+	if bitmap {
+		if c.bitmapSubtitle >= len(c.info.Subtitles) || !IsBitmapSubtitle(c.info.Subtitles[c.bitmapSubtitle].Codec) {
+			return fmt.Errorf("subtitle track %d is not a bitmap subtitle", c.bitmapSubtitle)
+		}
 	}
 
-	// --- 2. decide subtitle strategy ---------------------------------
-	hasSubtitle := c.selection.SubtitleTrackIndex >= 0 && c.selection.SubtitleTrackIndex < len(info.Subtitles)
-	textSubtitle := hasSubtitle && !isBitmapSubtitle(info.Subtitles[c.selection.SubtitleTrackIndex].Codec)
-
-	// --- 3. build the final ffmpeg CLI --------------------------------
-	videoSel := c.selection
-	if textSubtitle {
-		videoSel.SubtitleTrackIndex = -1
+	var args []string
+	if bitmap {
+		args = c.builder.BuildBitmap(c.info, c.bitmapSubtitle)
+	} else {
+		args = c.builder.BuildShared(c.info)
 	}
-	args := c.builder.Build(info, videoSel)
 	log.Println("ffmpeg", strings.Join(args, " "))
 
-	// --- 4. run conversion tasks --------------------------------------
 	runCtx, cancel := context.WithCancel(c.ctx)
 	defer cancel()
 	runner := *c
@@ -86,37 +79,50 @@ func (c *Converter) ConvertToHLS() error {
 	tasks := []conversionTask{
 		{name: "video ffmpeg", run: func() error { return runner.runFFmpeg(args) }},
 	}
-	if textSubtitle {
-		subtitleCompleted := make(chan struct{})
-		tasks = append(tasks, conversionTask{
-			name: "subtitle ffmpeg",
-			run: func() error {
-				subArgs := runner.subtitleArgs(runner.selection.SubtitleTrackIndex)
-				log.Println("ffmpeg (subtitle)", strings.Join(subArgs, " "))
-				err := runner.runFFmpeg(subArgs)
-				if err == nil {
-					close(subtitleCompleted)
-				}
+	if !bitmap {
+		textTracks := textSubtitleIndices(c.info)
+		if len(textTracks) > 0 {
+			preroll := filepath.Join(c.builder.OutDir, subtitlePrerollFilename)
+			if err := writeFileAtomic(preroll, []byte("WEBVTT\n\n"), 0644); err != nil {
 				return err
-			},
-		}, conversionTask{
-			name: "subtitle playlist",
-			run: func() error {
-				return runner.writeNormalizedSubtitlePlaylist(subtitleCompleted)
-			},
-		})
+			}
+		}
+		for _, subtitleIndex := range textTracks {
+			subtitleIndex := subtitleIndex
+			rawPlaylist := filepath.Join(c.builder.OutDir, fmt.Sprintf("subs_%d.raw.m3u8", subtitleIndex))
+			outPlaylist := filepath.Join(c.builder.OutDir, fmt.Sprintf("subs_%d.m3u8", subtitleIndex))
+			subtitleCompleted := make(chan struct{})
+			tasks = append(tasks, conversionTask{
+				name: fmt.Sprintf("subtitle %d ffmpeg", subtitleIndex),
+				run: func() error {
+					subArgs := runner.subtitleArgs(subtitleIndex, rawPlaylist)
+					log.Println("ffmpeg (subtitle)", strings.Join(subArgs, " "))
+					err := runner.runFFmpeg(subArgs)
+					if err == nil {
+						close(subtitleCompleted)
+					}
+					return err
+				},
+			}, conversionTask{
+				name: fmt.Sprintf("subtitle %d playlist", subtitleIndex),
+				run: func() error {
+					return runner.writeNormalizedSubtitlePlaylist(rawPlaylist, outPlaylist, subtitleCompleted)
+				},
+			})
+		}
 	}
 	tasks = append(tasks, conversionTask{
 		name: "master playlist",
 		run: func() error {
-			return runner.writeMasterAfterRenditionsReady(info, textSubtitle)
+			return runner.writeMasterAfterRenditionsReady()
 		},
 	})
 
 	return runConversionTasks(runCtx, cancel, tasks)
 }
 
-func validateSelection(info domain.MediaInfo, selection StreamSelection) error {
+// ValidateSelection checks track-relative indexes from the playback API.
+func ValidateSelection(info domain.MediaInfo, selection StreamSelection) error {
 	if selection.AudioTrackIndex < -1 {
 		return fmt.Errorf("invalid audio track index: %d", selection.AudioTrackIndex)
 	}
@@ -168,7 +174,7 @@ func (c *Converter) runFFmpeg(args []string) error {
 	return err
 }
 
-func (c *Converter) subtitleArgs(subIdx int) []string {
+func (c *Converter) subtitleArgs(subIdx int, rawPlaylist string) []string {
 	return []string{
 		"-fflags", "+genpts",
 		"-i", c.inputURL,
@@ -176,23 +182,19 @@ func (c *Converter) subtitleArgs(subIdx int) []string {
 		"-c:s", "webvtt",
 		"-f", "segment",
 		"-segment_time", "4",
-		"-segment_list", c.rawSubList,
+		"-segment_list", rawPlaylist,
 		"-segment_list_type", "m3u8",
 		"-segment_list_size", "0",
 		"-segment_format", "webvtt",
-		filepath.Join(c.builder.OutDir, "subs_%05d.vtt"),
+		filepath.Join(c.builder.OutDir, fmt.Sprintf("subs_%d_%%05d.vtt", subIdx)),
 	}
 }
 
-func (c *Converter) writeNormalizedSubtitlePlaylist(subtitleCompleted <-chan struct{}) error {
-	preroll := filepath.Join(c.builder.OutDir, subtitlePrerollFilename)
-	if err := writeFileAtomic(preroll, []byte("WEBVTT\n\n"), 0644); err != nil {
-		return err
-	}
+func (c *Converter) writeNormalizedSubtitlePlaylist(rawPlaylist, outPlaylist string, subtitleCompleted <-chan struct{}) error {
 	normalizer := subtitlePlaylistNormalizer{
 		ctx:               c.ctx,
-		rawPlaylist:       c.rawSubList,
-		outPlaylist:       c.subList,
+		rawPlaylist:       rawPlaylist,
+		outPlaylist:       outPlaylist,
 		videoList:         c.videoList,
 		segmentDir:        c.builder.OutDir,
 		subtitleCompleted: subtitleCompleted,
@@ -200,22 +202,27 @@ func (c *Converter) writeNormalizedSubtitlePlaylist(subtitleCompleted <-chan str
 	return normalizer.run()
 }
 
-func (c *Converter) writeMasterAfterRenditionsReady(info domain.MediaInfo, withSubs bool) error {
+func (c *Converter) writeMasterAfterRenditionsReady() error {
 	const readinessTimeout = 20 * time.Minute
 	if err := waitForPlaylistSegment(c.ctx, c.videoList, readinessTimeout); err != nil {
 		return err
 	}
-	if withSubs {
-		if err := waitForPlaylistSegment(c.ctx, c.subList, readinessTimeout); err != nil {
-			return fmt.Errorf("subtitle playlist not ready: %w", err)
+	if c.bitmapSubtitle < 0 {
+		for i := range c.info.AudioTracks {
+			playlist := filepath.Join(c.builder.OutDir, fmt.Sprintf("audio_%d.m3u8", i))
+			if err := waitForPlaylistSegment(c.ctx, playlist, readinessTimeout); err != nil {
+				return fmt.Errorf("audio playlist %d not ready: %w", i, err)
+			}
+		}
+		for _, i := range textSubtitleIndices(c.info) {
+			playlist := filepath.Join(c.builder.OutDir, fmt.Sprintf("subs_%d.m3u8", i))
+			if err := waitForPlaylistSegment(c.ctx, playlist, readinessTimeout); err != nil {
+				return fmt.Errorf("subtitle playlist %d not ready: %w", i, err)
+			}
 		}
 	}
 
-	lang := ""
-	if withSubs && c.selection.SubtitleTrackIndex >= 0 && c.selection.SubtitleTrackIndex < len(info.Subtitles) {
-		lang = info.Subtitles[c.selection.SubtitleTrackIndex].Language
-	}
-	masterData := buildMasterPlaylist(filepath.Base(c.videoList), filepath.Base(c.subList), withSubs, lang)
+	masterData := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF:BANDWIDTH=2000000\n" + filepath.Base(c.videoList) + "\n"
 	return writeFileAtomic(c.master, []byte(masterData), 0644)
 }
 
@@ -238,28 +245,12 @@ func waitForPlaylistSegment(ctx context.Context, path string, timeout time.Durat
 	}
 }
 
-func buildMasterPlaylist(videoList, subList string, withSubs bool, lang string) string {
-	var b strings.Builder
-	b.WriteString("#EXTM3U\n")
-	b.WriteString("#EXT-X-VERSION:3\n")
-	if withSubs {
-		attrs := []string{
-			"TYPE=SUBTITLES",
-			"GROUP-ID=\"subs\"",
-			"NAME=\"Subtitles\"",
-			"DEFAULT=YES",
-			"AUTOSELECT=YES",
-			"FORCED=NO",
-			fmt.Sprintf("URI=\"%s\"", subList),
+func textSubtitleIndices(info domain.MediaInfo) []int {
+	indices := make([]int, 0, len(info.Subtitles))
+	for i, track := range info.Subtitles {
+		if !IsBitmapSubtitle(track.Codec) {
+			indices = append(indices, i)
 		}
-		if lang != "" {
-			attrs = append(attrs, fmt.Sprintf("LANGUAGE=\"%s\"", lang))
-		}
-		b.WriteString("#EXT-X-MEDIA:" + strings.Join(attrs, ",") + "\n")
-		b.WriteString("#EXT-X-STREAM-INF:BANDWIDTH=2000000,SUBTITLES=\"subs\"\n")
-	} else {
-		b.WriteString("#EXT-X-STREAM-INF:BANDWIDTH=2000000\n")
 	}
-	b.WriteString(videoList + "\n")
-	return b.String()
+	return indices
 }

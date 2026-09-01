@@ -1,7 +1,7 @@
 package torrent
 
 import (
-	"cinemator/infrastructure/ffmpeg"
+	"cinemator/domain"
 	"context"
 	"fmt"
 	"path/filepath"
@@ -27,7 +27,8 @@ type streamInfo struct {
 	file           *torrent.File
 	lastView       time.Time
 	mtx            sync.Mutex
-	selection      ffmpeg.StreamSelection
+	mediaInfo      domain.MediaInfo
+	bitmapSubtitle int
 	paths          streamPaths
 	source         *torrentSource
 	runID          uint64
@@ -42,11 +43,10 @@ type streamInfo struct {
 }
 
 type streamPaths struct {
-	outDir           string
-	videoPlaylist    string
-	subtitlePlaylist string
-	masterPlaylist   string
-	readyMarker      string
+	outDir         string
+	videoPlaylist  string
+	masterPlaylist string
+	readyMarker    string
 }
 
 func (s *streamInfo) beginRun() uint64 {
@@ -126,12 +126,15 @@ func (k streamKey) dirName() string {
 func (k streamKey) paths(root string) streamPaths {
 	outDir := filepath.Join(root, k.dirName())
 	return streamPaths{
-		outDir:           outDir,
-		videoPlaylist:    filepath.Join(outDir, "index.m3u8"),
-		subtitlePlaylist: filepath.Join(outDir, "subs.m3u8"),
-		masterPlaylist:   filepath.Join(outDir, "master.m3u8"),
-		readyMarker:      filepath.Join(outDir, ".ready"),
+		outDir:         outDir,
+		videoPlaylist:  filepath.Join(outDir, "index.m3u8"),
+		masterPlaylist: filepath.Join(outDir, "master.m3u8"),
+		readyMarker:    filepath.Join(outDir, ".ready"),
 	}
+}
+
+func (p streamPaths) selectionMaster(audioTrack, subtitleTrack int) string {
+	return filepath.Join(p.outDir, fmt.Sprintf("master_a%d_s%d.m3u8", audioTrack, subtitleTrack))
 }
 
 func parseStreamDir(name string) (streamKey, error) {
