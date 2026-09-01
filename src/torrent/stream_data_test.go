@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"cinemator/config"
+
 	torrentlib "github.com/anacrolix/torrent"
 )
 
@@ -186,9 +188,8 @@ func TestParseStreamDirRejectsMalformedNames(t *testing.T) {
 
 func TestStreamInfoWaitPlayableReturnsSignalError(t *testing.T) {
 	want := errors.New("probe failed")
-	s := &streamInfo{}
-	runID := s.beginRun()
-	s.signalPlayable(runID, want)
+	s := &streamInfo{playable: make(chan struct{})}
+	s.signalPlayable(want)
 
 	if got := s.waitPlayable(context.Background()); !errors.Is(got, want) {
 		t.Fatalf("waitPlayable() = %v, want %v", got, want)
@@ -199,60 +200,45 @@ func TestStreamInfoWaitPlayableHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
 	defer cancel()
 
-	s := &streamInfo{}
-	s.beginRun()
+	s := &streamInfo{playable: make(chan struct{})}
 
 	if err := s.waitPlayable(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitPlayable() = %v, want deadline exceeded", err)
 	}
 }
 
-func TestStreamInfoIgnoresStaleRunPlayableSignal(t *testing.T) {
-	s := &streamInfo{}
-	staleRunID := s.beginRun()
-	currentRunID := s.beginRun()
-
-	if ok := s.signalPlayable(staleRunID, errors.New("stale failure")); ok {
-		t.Fatal("signalPlayable() accepted stale run")
+func TestStreamInfoSignalsPlayableOnce(t *testing.T) {
+	s := &streamInfo{playable: make(chan struct{})}
+	if ok := s.signalPlayable(nil); !ok {
+		t.Fatal("signalPlayable() rejected first signal")
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
-	defer cancel()
-	if err := s.waitPlayable(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waitPlayable() = %v, want current run to remain pending", err)
-	}
-
-	if ok := s.signalPlayable(currentRunID, nil); !ok {
-		t.Fatal("signalPlayable() rejected current run")
+	if ok := s.signalPlayable(errors.New("late failure")); ok {
+		t.Fatal("signalPlayable() accepted a second signal")
 	}
 	if err := s.waitPlayable(context.Background()); err != nil {
 		t.Fatalf("waitPlayable() = %v, want nil", err)
 	}
 }
 
-func TestFinishConversionIgnoresStaleRun(t *testing.T) {
+func TestFinishConversionIgnoresReplacedStream(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{running: true}
-	staleRunID := s.beginRun()
-	s.beginRun()
+	canceled := false
+	stale := &streamInfo{cancel: func() { canceled = true }}
+	current := &streamInfo{}
 
 	m := &Manager{
-		active: map[streamKey]*streamInfo{key: s},
+		active: map[streamKey]*streamInfo{key: current},
 	}
-	m.finishConversion(key, s, staleRunID, context.Canceled)
+	m.finishConversion(key, stale, nil)
 
-	if !s.running {
-		t.Fatal("finishConversion() marked current run as stopped")
-	}
-	if s.paused {
-		t.Fatal("finishConversion() marked current run as paused")
+	if m.active[key] != current || stale.completed || canceled {
+		t.Fatal("finishConversion() changed the replacement stream")
 	}
 }
 
 func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{running: true, paused: true}
-	runID := s.beginRun()
+	s := &streamInfo{}
 	events := newDownloadEventBroadcaster()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -262,14 +248,8 @@ func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
 		active: map[streamKey]*streamInfo{key: s},
 		events: events,
 	}
-	m.finishConversion(key, s, runID, nil)
+	m.finishConversion(key, s, nil)
 
-	if s.running {
-		t.Fatal("finishConversion() left successful run marked as running")
-	}
-	if s.paused {
-		t.Fatal("finishConversion() left successful run marked as paused")
-	}
 	if !s.completed {
 		t.Fatal("finishConversion() did not mark successful run as completed")
 	}
@@ -280,26 +260,30 @@ func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
 	}
 }
 
-func TestFinishConversionTreatsWrappedCancellationAsPause(t *testing.T) {
+func TestFinishConversionCleansFailedBackgroundPreparation(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{running: true}
-	runID := s.beginRun()
-	m := &Manager{active: map[streamKey]*streamInfo{key: s}}
-
-	m.finishConversion(key, s, runID, fmt.Errorf("ffmpeg canceled: %w", context.Canceled))
-
-	if s.running {
-		t.Fatal("finishConversion() left canceled run marked as running")
+	paths := key.paths(t.TempDir())
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
 	}
-	if !s.paused {
-		t.Fatal("finishConversion() did not mark canceled run as paused")
+	s := &streamInfo{paths: paths, runDone: make(chan struct{})}
+	close(s.runDone)
+	m := &Manager{
+		active:    map[streamKey]*streamInfo{key: s},
+		streamOps: make(map[streamKey]chan struct{}),
 	}
-	if m.active[key] != s {
-		t.Fatal("finishConversion() removed resumable stream after cancellation")
+
+	m.finishConversion(key, s, fmt.Errorf("ffmpeg canceled: %w", context.Canceled))
+
+	if m.active[key] != nil {
+		t.Fatal("finishConversion() left failed preparation active")
+	}
+	if _, err := os.Stat(paths.outDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed HLS output still exists: %v", err)
 	}
 }
 
-func TestCompletedStreamIsNotPausedOrReset(t *testing.T) {
+func TestGetStreamDoesNotResetCompletedHLS(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	paths := key.paths(t.TempDir())
 	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
@@ -310,9 +294,7 @@ func TestCompletedStreamIsNotPausedOrReset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	canceled := false
 	s := &streamInfo{
-		cancel:    func() { canceled = true },
 		paths:     paths,
 		completed: true,
 	}
@@ -320,115 +302,16 @@ func TestCompletedStreamIsNotPausedOrReset(t *testing.T) {
 		active: map[streamKey]*streamInfo{key: s},
 	}
 
-	m.pauseStream(key)
-	if canceled {
-		t.Fatal("pauseStream() canceled a completed stream")
-	}
-	if s.paused {
-		t.Fatal("pauseStream() marked a completed stream as paused")
-	}
-
-	_, _, resumed, exists, err := m.getOrResumeStream(context.Background(), key)
-	if err != nil || !exists || resumed {
-		t.Fatalf("getOrResumeStream() = exists %v, resumed %v, error %v", exists, resumed, err)
+	got, err := m.getStream(context.Background(), key)
+	if err != nil || got != s {
+		t.Fatalf("getStream() = stream %p, error %v", got, err)
 	}
 	if _, err := os.Stat(sentinel); err != nil {
-		t.Fatalf("getOrResumeStream() removed completed HLS cache: %v", err)
+		t.Fatalf("getStream() removed completed HLS cache: %v", err)
 	}
 }
 
-func TestGetOrResumeStreamReturnsResetFailure(t *testing.T) {
-	root := t.TempDir()
-	blocker := filepath.Join(root, "blocker")
-	if err := os.WriteFile(blocker, []byte("not a directory"), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{
-		paused: true,
-		paths: streamPaths{
-			outDir: filepath.Join(blocker, "stream"),
-		},
-	}
-	m := &Manager{active: map[streamKey]*streamInfo{key: s}}
-
-	got, _, resumed, exists, err := m.getOrResumeStream(context.Background(), key)
-	if !exists || got != s {
-		t.Fatalf("getOrResumeStream() stream = %p, exists = %v", got, exists)
-	}
-	if resumed {
-		t.Fatal("getOrResumeStream() reported a failed resume as successful")
-	}
-	if err == nil {
-		t.Fatal("getOrResumeStream() error = nil, want reset failure")
-	}
-}
-
-func TestResumeWaitDoesNotHoldManagerLock(t *testing.T) {
-	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{
-		paused:  true,
-		paths:   key.paths(t.TempDir()),
-		runDone: make(chan struct{}),
-	}
-	m := &Manager{active: map[streamKey]*streamInfo{key: s}}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	resumeResult := make(chan error, 1)
-	go func() {
-		_, _, _, _, err := m.getOrResumeStream(ctx, key)
-		resumeResult <- err
-	}()
-
-	operationObserved := make(chan struct{})
-	go func() {
-		for {
-			m.mu.Lock()
-			waiting := m.streamOps[key] != nil
-			m.mu.Unlock()
-			if waiting {
-				close(operationObserved)
-				return
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Millisecond):
-			}
-		}
-	}()
-	select {
-	case <-operationObserved:
-	case <-time.After(time.Second):
-		t.Fatal("resume did not enter the old-run wait")
-	}
-
-	differentKeyReady := make(chan struct{})
-	go func() {
-		m.mu.Lock()
-		m.active[streamKey{InfoHash: "other"}] = &streamInfo{}
-		m.mu.Unlock()
-		close(differentKeyReady)
-	}()
-	select {
-	case <-differentKeyReady:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("resume wait blocked unrelated manager state")
-	}
-
-	cancel()
-	select {
-	case err := <-resumeResult:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("getOrResumeStream() error = %v, want context canceled", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("getOrResumeStream() did not honor cancellation")
-	}
-}
-
-func TestGetOrResumeStreamWaitsForReservedStreamOperation(t *testing.T) {
+func TestGetStreamWaitsForReservedStreamOperation(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	s := &streamInfo{
 		completed: true,
@@ -447,139 +330,158 @@ func TestGetOrResumeStreamWaitsForReservedStreamOperation(t *testing.T) {
 		requested: make(chan struct{}),
 	}
 	type result struct {
-		stream  *streamInfo
-		resumed bool
-		exists  bool
-		err     error
+		stream *streamInfo
+		exists bool
+		err    error
 	}
 	resultReady := make(chan result, 1)
 	go func() {
-		got, _, resumed, exists, err := m.getOrResumeStream(observedCtx, key)
-		resultReady <- result{stream: got, resumed: resumed, exists: exists, err: err}
+		got, err := m.getStream(observedCtx, key)
+		resultReady <- result{stream: got, exists: got != nil, err: err}
 	}()
 
 	select {
 	case <-observedCtx.requested:
 	case <-time.After(time.Second):
-		t.Fatal("getOrResumeStream() did not wait for the reserved stream operation")
+		t.Fatal("getStream() did not wait for the reserved stream operation")
 	}
 	select {
 	case <-resultReady:
-		t.Fatal("getOrResumeStream() passed the reserved stream operation")
+		t.Fatal("getStream() passed the reserved stream operation")
 	default:
 	}
 
 	m.finishStreamOperation(key, operationDone)
 	select {
 	case got := <-resultReady:
-		if got.err != nil || !got.exists || got.resumed || got.stream != s {
-			t.Fatalf("getOrResumeStream() = stream %p, exists %v, resumed %v, error %v", got.stream, got.exists, got.resumed, got.err)
+		if got.err != nil || !got.exists || got.stream != s {
+			t.Fatalf("getStream() = stream %p, exists %v, error %v", got.stream, got.exists, got.err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("getOrResumeStream() did not proceed after the stream operation finished")
+		t.Fatal("getStream() did not proceed after the stream operation finished")
 	}
 }
 
-func TestCanceledLastStartupWaiterCleansAbandonedStream(t *testing.T) {
+func TestCanceledStartupWaiterKeepsBackgroundPreparation(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	paths := key.paths(t.TempDir())
 	if err := os.MkdirAll(paths.outDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	partialChunk := filepath.Join(paths.outDir, "chunk_00001.ts")
+	if err := os.WriteFile(partialChunk, []byte("partial"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	canceled := false
 	s := &streamInfo{
-		paths:   paths,
-		running: true,
+		paths:    paths,
+		playable: make(chan struct{}),
+		runDone:  make(chan struct{}),
 	}
-	runID := s.beginRun()
 	s.cancel = func() {
 		canceled = true
 		close(s.runDone)
 	}
-	s.registerStartupWaiter()
 	m := &Manager{active: map[streamKey]*streamInfo{key: s}}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := m.waitForPlayableStream(ctx, key, s, runID)
+	_, err := m.waitForPlayableStream(ctx, s)
 
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("waitForPlayableStream() error = %v, want %v", err, context.Canceled)
 	}
-	if !canceled {
-		t.Fatal("waitForPlayableStream() did not cancel abandoned conversion")
+	if canceled {
+		t.Fatal("waitForPlayableStream() canceled background preparation")
 	}
-	if _, ok := m.active[key]; ok {
-		t.Fatal("waitForPlayableStream() left abandoned stream active")
+	if m.active[key] != s {
+		t.Fatal("waitForPlayableStream() removed background preparation")
 	}
-	m.mu.Lock()
-	cleanupDone := m.streamOps[key]
-	m.mu.Unlock()
-	if err := waitForDone(context.Background(), cleanupDone); err != nil {
-		t.Fatalf("waiting for abandoned stream cleanup: %v", err)
-	}
-	if _, err := os.Stat(paths.outDir); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("abandoned HLS directory still exists: %v", err)
+	if _, err := os.Stat(partialChunk); err != nil {
+		t.Fatalf("partial HLS chunk was removed: %v", err)
 	}
 }
 
-func TestCanceledStartupWaiterKeepsStreamForAnotherWaiter(t *testing.T) {
+func TestInactiveBackgroundPreparationKeepsPartialHLS(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{paths: key.paths(t.TempDir()), running: true}
-	runID := s.beginRun()
-	s.registerStartupWaiter()
-	s.registerStartupWaiter()
-	m := &Manager{active: map[streamKey]*streamInfo{key: s}}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	if _, err := m.waitForPlayableStream(ctx, key, s, runID); !errors.Is(err, context.Canceled) {
-		t.Fatalf("first waitForPlayableStream() error = %v, want %v", err, context.Canceled)
+	paths := key.paths(t.TempDir())
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
 	}
-	if m.active[key] != s {
-		t.Fatal("canceled waiter removed stream owned by another waiter")
+	partialChunk := filepath.Join(paths.outDir, "chunk_00001.ts")
+	if err := os.WriteFile(partialChunk, []byte("partial"), 0644); err != nil {
+		t.Fatal(err)
 	}
-
-	s.signalPlayable(runID, nil)
-	if _, err := m.waitForPlayableStream(context.Background(), key, s, runID); err != nil {
-		t.Fatalf("second waitForPlayableStream() error = %v", err)
+	canceled := false
+	s := &streamInfo{
+		cancel:   func() { canceled = true },
+		lastView: time.Now().Add(-time.Hour),
+		paths:    paths,
 	}
-	if m.active[key] != s {
-		t.Fatal("successful waiter removed shared stream")
-	}
-}
-
-func TestCanceledStartupWaiterKeepsViewerOwnedStream(t *testing.T) {
-	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{paths: key.paths(t.TempDir()), running: true}
-	runID := s.beginRun()
-	s.registerStartupWaiter()
-	m := &Manager{active: map[streamKey]*streamInfo{key: s}}
-	m.TouchStream(context.Background(), key.dirName())
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	if _, err := m.waitForPlayableStream(ctx, key, s, runID); !errors.Is(err, context.Canceled) {
-		t.Fatalf("waitForPlayableStream() error = %v, want %v", err, context.Canceled)
-	}
-	if m.active[key] != s {
-		t.Fatal("canceled waiter removed viewer-owned stream")
-	}
-}
-
-func TestCleanupIfCurrentRunIgnoresStaleRun(t *testing.T) {
-	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{}
-	staleRunID := s.beginRun()
-	s.beginRun()
-
 	m := &Manager{
 		active: map[streamKey]*streamInfo{key: s},
+		cfg:    config.Config{ViewerTimeout: time.Minute},
 	}
-	m.cleanupIfCurrentRun(key, s, staleRunID)
 
-	if _, ok := m.active[key]; !ok {
-		t.Fatal("cleanupIfCurrentRun() removed current run for stale run ID")
+	m.cleanupInactiveCompletedStreams(time.Now())
+
+	if canceled {
+		t.Fatal("viewer timeout canceled background preparation")
+	}
+	if m.active[key] != s {
+		t.Fatal("viewer timeout removed background preparation")
+	}
+	if _, err := os.Stat(partialChunk); err != nil {
+		t.Fatalf("viewer timeout removed partial HLS: %v", err)
+	}
+}
+
+func TestInactiveCompletedStreamDeactivatesButKeepsReadyHLS(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	paths := key.paths(t.TempDir())
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+	s := &streamInfo{
+		completed: true,
+		lastView:  time.Now().Add(-time.Hour),
+		paths:     paths,
+	}
+	m := &Manager{
+		active:    map[streamKey]*streamInfo{key: s},
+		streamOps: make(map[streamKey]chan struct{}),
+		cfg:       config.Config{ViewerTimeout: time.Minute},
+	}
+
+	m.cleanupInactiveCompletedStreams(time.Now())
+
+	if m.active[key] != nil {
+		t.Fatal("viewer timeout left completed stream active")
+	}
+	ready, err := streamOutputReady(paths)
+	if err != nil || !ready {
+		t.Fatalf("completed HLS after viewer timeout = %v, %v; want ready", ready, err)
+	}
+}
+
+func TestCleanupIfCurrentIgnoresReplacement(t *testing.T) {
+	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
+	stale := &streamInfo{}
+	current := &streamInfo{}
+
+	m := &Manager{
+		active: map[streamKey]*streamInfo{key: current},
+	}
+	m.cleanupIfCurrent(key, stale)
+
+	if m.active[key] != current {
+		t.Fatal("cleanupIfCurrent() removed the replacement stream")
 	}
 }
 
@@ -596,7 +498,6 @@ func TestCleanupSerializesReplacementUntilConversionStops(t *testing.T) {
 		cancel:  func() { close(canceled) },
 		paths:   paths,
 		runDone: runDone,
-		running: true,
 	}
 	m := &Manager{active: map[streamKey]*streamInfo{key: s}}
 	cleanupDone := make(chan struct{})
@@ -677,7 +578,6 @@ func TestCleanupDoesNotBlockDifferentStreamKey(t *testing.T) {
 	s := &streamInfo{
 		cancel:  func() { close(canceled) },
 		runDone: runDone,
-		running: true,
 		torrent: ownedTorrent,
 	}
 	m := &Manager{
