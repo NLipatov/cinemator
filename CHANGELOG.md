@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/NLipatov/cinemator/compare/0.6.1...0.7.0) (2026-09-02)
+
+
+### Features
+
+* **streaming:** make hls preparation durable ([#30](https://github.com/NLipatov/cinemator/issues/30)) ([29158b9](https://github.com/NLipatov/cinemator/commit/29158b96a6aed7c1e6be2bf1b6ec17d33107c6bd))
+
 ## [0.6.1](https://github.com/NLipatov/cinemator/compare/0.6.0...0.6.1) (2026-09-01)
 
 
