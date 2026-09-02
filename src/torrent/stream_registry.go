@@ -268,6 +268,13 @@ func (m *Manager) reserveDownloadDeletion(ctx context.Context, hash string) (cha
 			}
 			continue
 		}
+		if done := m.preparationOps[hash]; done != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, done); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		done := make(chan struct{})
 		m.deletions[hash] = done
 		m.mu.Unlock()

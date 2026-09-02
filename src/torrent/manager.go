@@ -19,18 +19,19 @@ import (
 )
 
 type Manager struct {
-	client       *torrent.Client
-	active       map[streamKey]*streamInfo
-	preparations map[streamKey]*preparationJob
-	streamOps    map[streamKey]chan struct{} // Serializes output lifecycle changes for each stream.
-	torrents     map[string]int              // References held by preparing, active, and cleaning streams.
-	torrentOps   map[string]chan struct{}    // Serializes add and drop for each torrent.
-	deletions    map[string]chan struct{}    // Prevents new streams while a download is being deleted.
-	sources      *rangeServer
-	downloads    *downloadStore
-	events       *downloadEventBroadcaster
-	mu           sync.Mutex
-	cfg          config.Config
+	client         *torrent.Client
+	active         map[streamKey]*streamInfo
+	preparations   map[streamKey]*preparationJob
+	streamOps      map[streamKey]chan struct{} // Serializes output lifecycle changes for each stream.
+	torrents       map[string]int              // References held by preparing, active, and cleaning streams.
+	torrentOps     map[string]chan struct{}    // Serializes add and drop for each torrent.
+	preparationOps map[string]chan struct{}    // Serializes preparation selection for each torrent.
+	deletions      map[string]chan struct{}    // Prevents new streams while a download is being deleted.
+	sources        *rangeServer
+	downloads      *downloadStore
+	events         *downloadEventBroadcaster
+	mu             sync.Mutex
+	cfg            config.Config
 }
 
 type preparationJob struct {
@@ -62,17 +63,18 @@ func NewManager(appConfig config.Config) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		client:       client,
-		active:       make(map[streamKey]*streamInfo),
-		preparations: make(map[streamKey]*preparationJob),
-		streamOps:    make(map[streamKey]chan struct{}),
-		torrents:     make(map[string]int),
-		torrentOps:   make(map[string]chan struct{}),
-		deletions:    make(map[string]chan struct{}),
-		sources:      sources,
-		downloads:    downloads,
-		events:       newDownloadEventBroadcaster(),
-		cfg:          appConfig,
+		client:         client,
+		active:         make(map[streamKey]*streamInfo),
+		preparations:   make(map[streamKey]*preparationJob),
+		streamOps:      make(map[streamKey]chan struct{}),
+		torrents:       make(map[string]int),
+		torrentOps:     make(map[string]chan struct{}),
+		preparationOps: make(map[string]chan struct{}),
+		deletions:      make(map[string]chan struct{}),
+		sources:        sources,
+		downloads:      downloads,
+		events:         newDownloadEventBroadcaster(),
+		cfg:            appConfig,
 	}
 	go m.viewerWatcher()
 	go m.resumePreparations()
@@ -116,6 +118,11 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 		return err
 	}
 	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
+	operationDone, err := m.reservePreparationOperation(ctx, hash)
+	if err != nil {
+		return err
+	}
+	defer m.finishPreparationOperation(hash, operationDone)
 	ready, err := streamOutputReady(key.paths(m.cfg.HLSPath))
 	if err != nil {
 		return err
@@ -124,8 +131,11 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 		if err := m.downloads.selectPrepared(ctx, hash, fileIndex, time.Now()); err != nil {
 			return err
 		}
-		m.cleanupTransientPayload(hash, nil)
 		m.notifyDownloadsChanged()
+		if err := m.stopSupersededPreparation(ctx, key); err != nil {
+			return err
+		}
+		m.cleanupTransientPayload(hash, nil)
 		return nil
 	}
 	download, _, err := m.downloads.beginPreparation(ctx, hash, fileIndex)
@@ -133,8 +143,92 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 		return err
 	}
 	m.notifyDownloadsChanged()
+	if err := m.stopSupersededPreparation(ctx, key); err != nil {
+		return err
+	}
 	m.launchPreparation(download.Magnet, hash, fileIndex)
 	return nil
+}
+
+func (m *Manager) reservePreparationOperation(ctx context.Context, hash string) (chan struct{}, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		m.mu.Lock()
+		if deletionDone := m.deletions[hash]; deletionDone != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, deletionDone); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if m.preparationOps == nil {
+			m.preparationOps = make(map[string]chan struct{})
+		}
+		if operationDone := m.preparationOps[hash]; operationDone != nil {
+			m.mu.Unlock()
+			if err := waitForDone(ctx, operationDone); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		operationDone := make(chan struct{})
+		m.preparationOps[hash] = operationDone
+		m.mu.Unlock()
+		return operationDone, nil
+	}
+}
+
+func (m *Manager) finishPreparationOperation(hash string, operationDone chan struct{}) {
+	m.mu.Lock()
+	if m.preparationOps[hash] == operationDone {
+		delete(m.preparationOps, hash)
+		close(operationDone)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) stopSupersededPreparation(ctx context.Context, keep streamKey) error {
+	m.mu.Lock()
+	jobs := make([]*preparationJob, 0)
+	for key, job := range m.preparations {
+		if key.InfoHash == keep.InfoHash && key != keep {
+			job.cancel()
+			jobs = append(jobs, job)
+		}
+	}
+	m.mu.Unlock()
+	for _, job := range jobs {
+		if err := waitForDone(ctx, job.done); err != nil {
+			return err
+		}
+	}
+
+	for {
+		var (
+			key    streamKey
+			stream *streamInfo
+		)
+		m.mu.Lock()
+		for candidateKey, candidate := range m.active {
+			if candidateKey.InfoHash == keep.InfoHash && candidateKey != keep && !candidate.completed {
+				key = candidateKey
+				stream = candidate
+				break
+			}
+		}
+		m.mu.Unlock()
+		if stream == nil {
+			return nil
+		}
+		if err := m.cleanupMatching(ctx, key, stream); err != nil {
+			return err
+		}
+	}
 }
 
 func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
