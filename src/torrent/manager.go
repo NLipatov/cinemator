@@ -121,7 +121,7 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 		return err
 	}
 	if ready {
-		if err := m.downloads.finishPreparation(ctx, hash, fileIndex, time.Now()); err != nil {
+		if err := m.downloads.selectPrepared(ctx, hash, fileIndex, time.Now()); err != nil {
 			return err
 		}
 		m.cleanupTransientPayload(hash, nil)
@@ -202,6 +202,10 @@ func (m *Manager) resumePreparations() {
 	}
 	for _, download := range downloads {
 		if download.Status == DownloadStatusExpired {
+			continue
+		}
+		if download.Status == DownloadStatusFailed {
+			m.cleanupTransientPayload(download.ID, nil)
 			continue
 		}
 		if download.Status == DownloadStatusReady && download.SelectedFileIndex != nil {

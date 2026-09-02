@@ -279,6 +279,31 @@ func (s *downloadStore) beginPreparation(ctx context.Context, id string, fileInd
 	return download, true, nil
 }
 
+func (s *downloadStore) selectPrepared(ctx context.Context, id string, fileIndex int, selectedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	download, err := s.readLocked(id)
+	if err != nil {
+		return err
+	}
+	if !hasFileIndex(download.Files, fileIndex) {
+		return fmt.Errorf("bad file index")
+	}
+	if download.Status == DownloadStatusReady && download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex {
+		return nil
+	}
+	return s.writeReadyLocked(download, fileIndex, selectedAt)
+}
+
 func (s *downloadStore) finishPreparation(ctx context.Context, id string, fileIndex int, completedAt time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -304,7 +329,10 @@ func (s *downloadStore) finishPreparation(ctx context.Context, id string, fileIn
 	if download.Status == DownloadStatusReady && download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex {
 		return nil
 	}
+	return s.writeReadyLocked(download, fileIndex, completedAt)
+}
 
+func (s *downloadStore) writeReadyLocked(download Download, fileIndex int, completedAt time.Time) error {
 	completedAt = completedAt.UTC()
 	download.SelectedFileIndex = intPointer(fileIndex)
 	download.Status = DownloadStatusReady
