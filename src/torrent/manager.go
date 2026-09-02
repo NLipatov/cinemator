@@ -128,14 +128,12 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 		m.notifyDownloadsChanged()
 		return nil
 	}
-	download, shouldStart, err := m.downloads.beginPreparation(ctx, hash, fileIndex)
+	download, _, err := m.downloads.beginPreparation(ctx, hash, fileIndex)
 	if err != nil {
 		return err
 	}
 	m.notifyDownloadsChanged()
-	if shouldStart {
-		m.launchPreparation(download.Magnet, hash, fileIndex)
-	}
+	m.launchPreparation(download.Magnet, hash, fileIndex)
 	return nil
 }
 
@@ -147,7 +145,7 @@ func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
 	if m.preparations == nil {
 		m.preparations = make(map[streamKey]*preparationJob)
 	}
-	if m.deletions[hash] != nil || m.preparations[key] != nil {
+	if m.deletions[hash] != nil || m.preparations[key] != nil || m.active[key] != nil {
 		m.mu.Unlock()
 		cancel()
 		return
@@ -203,6 +201,9 @@ func (m *Manager) resumePreparations() {
 		return
 	}
 	for _, download := range downloads {
+		if download.Status == DownloadStatusExpired {
+			continue
+		}
 		if download.Status == DownloadStatusReady && download.SelectedFileIndex != nil {
 			if restoreErr := m.StartHLSPreparation(context.Background(), download.Magnet, *download.SelectedFileIndex); restoreErr != nil {
 				log.Printf("failed to reconcile ready HLS for %s: %v", download.ID, restoreErr)

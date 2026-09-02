@@ -1,11 +1,15 @@
 package torrent
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"cinemator/config"
 )
 
 func TestHLSDiskSizesAggregatesRenditionsByDownload(t *testing.T) {
@@ -94,5 +98,121 @@ func TestDefaultPreparationFileRequiresOneVideo(t *testing.T) {
 				t.Fatalf("defaultPreparationFile() = %d, %v; want %d, %v", got, ok, tt.want, tt.ok)
 			}
 		})
+	}
+}
+
+func TestResumePreparationsSkipsExpiredDownload(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatalf("newDownloadStore() error = %v", err)
+	}
+
+	id := strings.Repeat("c", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	download, err := store.upsert(context.Background(), id, magnet, []FileInfo{{Index: 0, Name: "feature.mkv"}})
+	if err != nil {
+		t.Fatalf("upsert() error = %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(-time.Hour)
+	download.ExpiresAt = expiresAt
+	if err := store.writeLockedForTest(download); err != nil {
+		t.Fatalf("write expired download: %v", err)
+	}
+
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		deletions:    map[string]chan struct{}{id: make(chan struct{})},
+		downloads:    store,
+		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	m.resumePreparations()
+
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatalf("list() error = %v", err)
+	}
+	if len(downloads) != 1 {
+		t.Fatalf("list() returned %d downloads, want 1", len(downloads))
+	}
+	got := downloads[0]
+	if got.Status != DownloadStatusExpired {
+		t.Fatalf("status = %q, want %q", got.Status, DownloadStatusExpired)
+	}
+	if !got.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("expiresAt = %v, want %v", got.ExpiresAt, expiresAt)
+	}
+	if got.SelectedFileIndex != nil {
+		t.Fatalf("selectedFileIndex = %d, want nil", *got.SelectedFileIndex)
+	}
+}
+
+func TestStartHLSPreparationRestartsMissingRuntimeJob(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatalf("newDownloadStore() error = %v", err)
+	}
+
+	id := strings.Repeat("d", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	if _, err := store.upsert(context.Background(), id, magnet, []FileInfo{{Index: 0, Name: "feature.mkv"}}); err != nil {
+		t.Fatalf("upsert() error = %v", err)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
+		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	}
+
+	operationDone := make(chan struct{})
+	key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		streamOps:    make(map[streamKey]chan struct{}),
+		torrents:     make(map[string]int),
+		torrentOps:   map[string]chan struct{}{id: operationDone},
+		deletions:    make(map[string]chan struct{}),
+		downloads:    store,
+		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	t.Cleanup(func() {
+		m.mu.Lock()
+		job := m.preparations[key]
+		if job != nil {
+			job.cancel()
+		}
+		m.mu.Unlock()
+		if job != nil {
+			select {
+			case <-job.done:
+			case <-time.After(time.Second):
+				t.Error("preparation job did not stop")
+			}
+		}
+		m.finishTorrentOperation(id, operationDone)
+	})
+
+	if err := m.StartHLSPreparation(context.Background(), magnet, 0); err != nil {
+		t.Fatalf("StartHLSPreparation() error = %v", err)
+	}
+	m.mu.Lock()
+	job := m.preparations[key]
+	m.mu.Unlock()
+	if job == nil {
+		t.Fatal("StartHLSPreparation() did not restore the missing runtime job")
+	}
+	if err := m.StartHLSPreparation(context.Background(), magnet, 0); err != nil {
+		t.Fatalf("second StartHLSPreparation() error = %v", err)
+	}
+	m.mu.Lock()
+	retriedJob := m.preparations[key]
+	m.mu.Unlock()
+	if retriedJob != job {
+		t.Fatal("second StartHLSPreparation() replaced the running job")
 	}
 }
