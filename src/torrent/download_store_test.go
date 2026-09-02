@@ -296,6 +296,46 @@ func TestDownloadStoreExpiredIDs(t *testing.T) {
 	}
 }
 
+func TestLegacyMultiVideoMigrationClearsObsoleteExpiry(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("newDownloadStore() error = %v", err)
+	}
+
+	id := strings.Repeat("d", 40)
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	download, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files)
+	if err != nil {
+		t.Fatalf("upsert() error = %v", err)
+	}
+	download.Status = DownloadStatus("streaming")
+	download.ExpiresAt = time.Now().Add(-time.Hour)
+	if err := store.writeLockedForTest(download); err != nil {
+		t.Fatalf("write legacy download: %v", err)
+	}
+
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatalf("list() error = %v", err)
+	}
+	if len(downloads) != 1 || downloads[0].Status != DownloadStatusAwaitingSelection {
+		t.Fatalf("downloads = %#v, want one awaiting-selection record", downloads)
+	}
+	if !downloads[0].ExpiresAt.IsZero() {
+		t.Fatalf("expiresAt = %v, want zero after migration", downloads[0].ExpiresAt)
+	}
+	ids, err := store.expiredIDs(context.Background(), time.Now())
+	if err != nil {
+		t.Fatalf("expiredIDs() error = %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("expiredIDs() = %#v, want none", ids)
+	}
+}
+
 func (s *downloadStore) writeLockedForTest(download Download) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

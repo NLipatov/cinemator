@@ -223,6 +223,9 @@ func (m *Manager) resumePreparations() {
 			continue
 		}
 		if download.Status == DownloadStatusFailed {
+			if err := m.removeIncompleteDownloadHlsDirs(download.ID); err != nil {
+				log.Printf("failed to remove incomplete HLS after restart: hash=%s, err=%v", download.ID, err)
+			}
 			m.ensureFailedHLSExpiry(download.ID)
 			m.cleanupTransientPayload(download.ID, nil)
 			continue
@@ -733,6 +736,51 @@ func (m *Manager) removeDownloadHlsDirs(id string) error {
 		}
 		if err := os.RemoveAll(filepath.Join(m.cfg.HLSPath, entry.Name())); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (m *Manager) removeIncompleteDownloadHlsDirs(id string) error {
+	entries, err := os.ReadDir(m.cfg.HLSPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	prefix := id + "_"
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		path := filepath.Join(m.cfg.HLSPath, entry.Name())
+		key, err := parseStreamDir(entry.Name())
+		if err != nil {
+			if err := os.RemoveAll(path); err != nil {
+				return err
+			}
+			continue
+		}
+
+		m.mu.Lock()
+		if m.deletions[id] != nil || m.preparations[key] != nil || m.active[key] != nil || m.streamOps[key] != nil {
+			m.mu.Unlock()
+			continue
+		}
+		operationDone := m.reserveStreamOperationLocked(key)
+		m.mu.Unlock()
+
+		cleanupErr := func() error {
+			defer m.finishStreamOperation(key, operationDone)
+			ready, err := streamOutputReady(key.paths(m.cfg.HLSPath))
+			if err != nil || ready {
+				return err
+			}
+			return os.RemoveAll(path)
+		}()
+		if cleanupErr != nil {
+			return cleanupErr
 		}
 	}
 	return nil

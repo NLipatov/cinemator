@@ -83,6 +83,42 @@ func TestDownloadHasReadyHLSRequiresCompletedOutput(t *testing.T) {
 	}
 }
 
+func TestRemoveIncompleteDownloadHLSSkipsReservedOutput(t *testing.T) {
+	root := t.TempDir()
+	id := strings.Repeat("b", 40)
+	key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	paths := key.paths(root)
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.videoPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	operationDone := make(chan struct{})
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		streamOps:    map[streamKey]chan struct{}{key: operationDone},
+		deletions:    make(map[string]chan struct{}),
+		cfg:          config.Config{HLSPath: root},
+	}
+	if err := m.removeIncompleteDownloadHlsDirs(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.outDir); err != nil {
+		t.Fatalf("reserved output was removed: %v", err)
+	}
+
+	m.finishStreamOperation(key, operationDone)
+	if err := m.removeIncompleteDownloadHlsDirs(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.outDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreserved incomplete output was not removed: %v", err)
+	}
+}
+
 func TestDefaultPreparationFileRequiresOneVideo(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -368,6 +404,13 @@ func TestResumePreparationsCleansFailedPayload(t *testing.T) {
 	if err := store.failPreparation(context.Background(), id, 1, errors.New("conversion failed")); err != nil {
 		t.Fatal(err)
 	}
+	incompletePaths := (streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}).paths(hlsRoot)
+	if err := resetStreamOutput(incompletePaths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(incompletePaths.videoPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	payloadPath := filepath.Join(downloadRoot, id, "payload.bin")
 	if err := os.WriteFile(payloadPath, []byte("payload"), 0644); err != nil {
 		t.Fatal(err)
@@ -412,5 +455,12 @@ func TestResumePreparationsCleansFailedPayload(t *testing.T) {
 	}
 	if downloads[0].ExpiresAt.Before(time.Now().Add(downloadDefaultTTL - time.Minute)) {
 		t.Fatalf("expiresAt = %v, want cached HLS retention", downloads[0].ExpiresAt)
+	}
+	if _, err := os.Stat(incompletePaths.outDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete HLS was not removed: %v", err)
+	}
+	ready, err := streamOutputReady(paths)
+	if err != nil || !ready {
+		t.Fatalf("completed cached HLS was removed: ready=%v, err=%v", ready, err)
 	}
 }

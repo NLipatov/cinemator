@@ -557,6 +557,7 @@ func (s *downloadStore) readLocked(id string) (Download, error) {
 	if download.SelectedFileIndex == nil && download.ReadyAt.IsZero() &&
 		(download.Status == DownloadStatusReady || download.Status == DownloadStatus("streaming")) {
 		download.Status = DownloadStatusAwaitingSelection
+		download.ExpiresAt = time.Time{}
 	}
 	return download, nil
 }
