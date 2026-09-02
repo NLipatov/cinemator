@@ -176,9 +176,7 @@ func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
 				return
 			}
 			log.Printf("HLS preparation failed: hash=%s, file=%d, err=%v", hash, fileIndex, err)
-			if storeErr := m.downloads.failPreparation(context.Background(), hash, fileIndex, err); storeErr != nil && !errors.Is(storeErr, ErrDownloadNotFound) {
-				log.Printf("failed to persist HLS preparation error: %v", storeErr)
-			}
+			m.recordPreparationFailure(hash, fileIndex, err)
 			m.cleanupTransientPayload(hash, nil)
 		}
 		m.notifyDownloadsChanged()
@@ -194,6 +192,26 @@ func (m *Manager) finishPreparationJob(key streamKey, job *preparationJob) {
 	m.mu.Unlock()
 }
 
+func (m *Manager) recordPreparationFailure(hash string, fileIndex int, preparationErr error) {
+	storeErr := m.downloads.failPreparation(context.Background(), hash, fileIndex, preparationErr)
+	if storeErr != nil {
+		if !errors.Is(storeErr, ErrDownloadNotFound) {
+			log.Printf("failed to persist HLS preparation error: hash=%s, file=%d, err=%v", hash, fileIndex, storeErr)
+		}
+		return
+	}
+	m.ensureFailedHLSExpiry(hash)
+}
+
+func (m *Manager) ensureFailedHLSExpiry(hash string) {
+	if !downloadHasReadyHLS(m.cfg.HLSPath, hash) {
+		return
+	}
+	if err := m.downloads.ensureFailedHLSExpiry(context.Background(), hash, time.Now()); err != nil && !errors.Is(err, ErrDownloadNotFound) {
+		log.Printf("failed to persist cached HLS expiry: hash=%s, err=%v", hash, err)
+	}
+}
+
 func (m *Manager) resumePreparations() {
 	downloads, err := m.downloads.list(context.Background())
 	if err != nil {
@@ -205,6 +223,7 @@ func (m *Manager) resumePreparations() {
 			continue
 		}
 		if download.Status == DownloadStatusFailed {
+			m.ensureFailedHLSExpiry(download.ID)
 			m.cleanupTransientPayload(download.ID, nil)
 			continue
 		}
@@ -739,6 +758,27 @@ func hlsDiskSizes(root string) map[string]int64 {
 	return sizes
 }
 
+func downloadHasReadyHLS(root, id string) bool {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		key, err := parseStreamDir(entry.Name())
+		if err != nil || key.InfoHash != id {
+			continue
+		}
+		ready, err := streamOutputReady(key.paths(root))
+		if err == nil && ready {
+			return true
+		}
+	}
+	return false
+}
+
 func defaultPreparationFile(files []FileInfo) (int, bool) {
 	selected := -1
 	for _, file := range files {
@@ -921,9 +961,7 @@ func (m *Manager) finishConversion(key streamKey, s *streamInfo, err error) {
 
 	if err != nil {
 		if key.Audio == -1 && key.Subtitle == -1 && m.downloads != nil {
-			if storeErr := m.downloads.failPreparation(context.Background(), key.InfoHash, key.Index, err); storeErr != nil && !errors.Is(storeErr, ErrDownloadNotFound) {
-				log.Printf("failed to persist HLS preparation error: key=%v, err=%v", key, storeErr)
-			}
+			m.recordPreparationFailure(key.InfoHash, key.Index, err)
 			m.notifyDownloadsChanged()
 		}
 		m.cleanupIfCurrent(key, s)

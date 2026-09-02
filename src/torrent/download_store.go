@@ -369,6 +369,31 @@ func (s *downloadStore) failPreparation(ctx context.Context, id string, fileInde
 	return s.writeLocked(download)
 }
 
+func (s *downloadStore) ensureFailedHLSExpiry(ctx context.Context, id string, failedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	download, err := s.readLocked(id)
+	if err != nil {
+		return err
+	}
+	if download.Status != DownloadStatusFailed || !download.ExpiresAt.IsZero() {
+		return nil
+	}
+	failedAt = failedAt.UTC()
+	download.ExpiresAt = failedAt.Add(downloadDefaultTTL)
+	download.UpdatedAt = failedAt
+	return s.writeLocked(download)
+}
+
 func (s *downloadStore) payloadDisposable(ctx context.Context, id string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err

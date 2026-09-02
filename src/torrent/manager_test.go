@@ -62,6 +62,27 @@ func TestHLSDiskSizesAggregatesRenditionsByDownload(t *testing.T) {
 	}
 }
 
+func TestDownloadHasReadyHLSRequiresCompletedOutput(t *testing.T) {
+	root := t.TempDir()
+	id := strings.Repeat("a", 40)
+	paths := (streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}).paths(root)
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if downloadHasReadyHLS(root, id) {
+		t.Fatal("incomplete HLS was treated as a retained artifact")
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+	if !downloadHasReadyHLS(root, id) {
+		t.Fatal("completed HLS was not detected")
+	}
+}
+
 func TestDefaultPreparationFileRequiresOneVideo(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -318,13 +339,33 @@ func TestResumePreparationsCleansFailedPayload(t *testing.T) {
 
 	id := strings.Repeat("f", 40)
 	magnet := "magnet:?xt=urn:btih:" + id
-	if _, err := store.upsert(context.Background(), id, magnet, []FileInfo{{Index: 0, Name: "feature.mkv"}}); err != nil {
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
 		t.Fatalf("upsert() error = %v", err)
 	}
 	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.failPreparation(context.Background(), id, 0, errors.New("conversion failed")); err != nil {
+	if err := store.finishPreparation(context.Background(), id, 0, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	paths := (streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}).paths(hlsRoot)
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.failPreparation(context.Background(), id, 1, errors.New("conversion failed")); err != nil {
 		t.Fatal(err)
 	}
 	payloadPath := filepath.Join(downloadRoot, id, "payload.bin")
@@ -368,5 +409,8 @@ func TestResumePreparationsCleansFailedPayload(t *testing.T) {
 	}
 	if len(downloads) != 1 || downloads[0].Status != DownloadStatusFailed {
 		t.Fatalf("downloads = %#v, want one failed record", downloads)
+	}
+	if downloads[0].ExpiresAt.Before(time.Now().Add(downloadDefaultTTL - time.Minute)) {
+		t.Fatalf("expiresAt = %v, want cached HLS retention", downloads[0].ExpiresAt)
 	}
 }
