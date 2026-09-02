@@ -279,6 +279,25 @@ func (s *downloadStore) beginPreparation(ctx context.Context, id string, fileInd
 	return download, true, nil
 }
 
+func (s *downloadStore) isPreparing(ctx context.Context, id string, fileIndex int) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	download, err := s.readLocked(id)
+	if err != nil {
+		return false, err
+	}
+	return download.Status == DownloadStatusPreparing &&
+		download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex, nil
+}
+
 func (s *downloadStore) selectPrepared(ctx context.Context, id string, fileIndex int, selectedAt time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err

@@ -193,6 +193,9 @@ func TestDeleteDownloadCancelsPreparationBeforeItRetainsTorrent(t *testing.T) {
 	if _, err := downloads.upsert(context.Background(), id, magnet, files); err != nil {
 		t.Fatal(err)
 	}
+	if _, _, err := downloads.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatal(err)
+	}
 	operationDone := make(chan struct{})
 
 	m := &Manager{

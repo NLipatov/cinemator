@@ -484,6 +484,62 @@ func TestStartHLSPreparationCleansSupersededPartialOutput(t *testing.T) {
 	}
 }
 
+func TestLaunchPreparationSkipsSupersededFile(t *testing.T) {
+	root := t.TempDir()
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := strings.Repeat("c", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	operationDone := make(chan struct{})
+	staleKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		torrentOps:   map[string]chan struct{}{id: operationDone},
+		deletions:    make(map[string]chan struct{}),
+		downloads:    store,
+		cfg:          config.Config{DownloadPath: downloadRoot},
+	}
+	t.Cleanup(func() {
+		m.mu.Lock()
+		job := m.preparations[staleKey]
+		if job != nil {
+			job.cancel()
+		}
+		m.mu.Unlock()
+		if job != nil {
+			<-job.done
+		}
+		m.finishTorrentOperation(id, operationDone)
+	})
+
+	m.launchPreparation(magnet, id, 0)
+	m.mu.Lock()
+	staleJob := m.preparations[staleKey]
+	m.mu.Unlock()
+	if staleJob != nil {
+		t.Fatal("stale startup snapshot resurrected the superseded file")
+	}
+}
+
 func TestStartHLSPreparationSelectsOlderCachedRendition(t *testing.T) {
 	root := t.TempDir()
 	hlsRoot := filepath.Join(root, "hls")

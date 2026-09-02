@@ -61,9 +61,14 @@ type fakeTorrentManager struct {
 	filesErr  error
 	events    <-chan struct{}
 	prepare   string
+	start     func() error
+	getFiles  func()
 }
 
 func (m fakeTorrentManager) GetTorrentFiles(context.Context, string) ([]torrent.FileInfo, error) {
+	if m.getFiles != nil {
+		m.getFiles()
+	}
 	return nil, m.filesErr
 }
 
@@ -72,6 +77,9 @@ func (m fakeTorrentManager) GetMediaInfo(context.Context, string, int) (media.Me
 }
 
 func (m fakeTorrentManager) StartHLSPreparation(context.Context, string, int) error {
+	if m.start != nil {
+		return m.start()
+	}
 	return nil
 }
 
@@ -257,6 +265,34 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 				t.Fatalf("Allow = %q, want %q", got, tt.wantAllow)
 			}
 		})
+	}
+}
+
+func TestHandlePrepareHlsStreamCreatesMissingDownload(t *testing.T) {
+	startAttempts := 0
+	filesRequested := false
+	mgr := fakeTorrentManager{
+		prepare: filepath.Join(t.TempDir(), "stream", "master.m3u8"),
+		start: func() error {
+			startAttempts++
+			if startAttempts == 1 {
+				return torrent.ErrDownloadNotFound
+			}
+			return nil
+		},
+		getFiles: func() { filesRequested = true },
+	}
+	server := Server{mgr: mgr, cfg: config.Load()}
+	req := httptest.NewRequest(http.MethodGet, "/api/hls/prepare?magnet=magnet&file=0", nil)
+	rec := httptest.NewRecorder()
+
+	server.handlePrepareHlsStream(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusFound, rec.Body.String())
+	}
+	if !filesRequested || startAttempts != 2 {
+		t.Fatalf("metadata requested = %v, start attempts = %d; want true, 2", filesRequested, startAttempts)
 	}
 }
 

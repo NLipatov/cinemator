@@ -232,6 +232,16 @@ func (m *Manager) stopSupersededPreparation(ctx context.Context, keep streamKey)
 }
 
 func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
+	current, err := m.downloads.isPreparing(context.Background(), hash, fileIndex)
+	if err != nil {
+		if !errors.Is(err, ErrDownloadNotFound) {
+			log.Printf("failed to validate HLS preparation: hash=%s, file=%d, err=%v", hash, fileIndex, err)
+		}
+		return
+	}
+	if !current {
+		return
+	}
 	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &preparationJob{cancel: cancel, done: make(chan struct{})}
@@ -331,7 +341,9 @@ func (m *Manager) resumePreparations() {
 			continue
 		}
 		if download.Status == DownloadStatusPreparing && download.SelectedFileIndex != nil {
-			m.launchPreparation(download.Magnet, download.ID, *download.SelectedFileIndex)
+			if err := m.resumePreparation(download); err != nil {
+				log.Printf("failed to resume HLS preparation for %s: %v", download.ID, err)
+			}
 			continue
 		}
 		if download.SelectedFileIndex == nil {
@@ -344,6 +356,19 @@ func (m *Manager) resumePreparations() {
 			}
 		}
 	}
+}
+
+func (m *Manager) resumePreparation(download Download) error {
+	operationDone, err := m.reservePreparationOperation(context.Background(), download.ID)
+	if err != nil {
+		return err
+	}
+	defer m.finishPreparationOperation(download.ID, operationDone)
+	if download.SelectedFileIndex == nil {
+		return nil
+	}
+	m.launchPreparation(download.Magnet, download.ID, *download.SelectedFileIndex)
+	return nil
 }
 
 func (m *Manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int) (media.MediaInfo, error) {

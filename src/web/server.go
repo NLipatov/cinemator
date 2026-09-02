@@ -266,7 +266,7 @@ func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if r.Method == http.MethodPost {
-		if err := s.mgr.StartHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
+		if err := s.ensureHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
 			http.Error(w, err.Error(), apiErrorStatus(err))
 			return
 		}
@@ -284,7 +284,7 @@ func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := s.mgr.StartHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
+	if err := s.ensureHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
 		http.Error(w, err.Error(), apiErrorStatus(err))
 		return
 	}
@@ -298,6 +298,17 @@ func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) 
 		w, r,
 		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/"+filepath.Base(playlist),
 		http.StatusFound)
+}
+
+func (s *Server) ensureHLSPreparation(ctx context.Context, magnet string, fileIndex int) error {
+	err := s.mgr.StartHLSPreparation(ctx, magnet, fileIndex)
+	if !errors.Is(err, torrent.ErrDownloadNotFound) {
+		return err
+	}
+	if _, err := s.mgr.GetTorrentFiles(ctx, magnet); err != nil {
+		return err
+	}
+	return s.mgr.StartHLSPreparation(ctx, magnet, fileIndex)
 }
 
 func parseExtendDays(r *http.Request) (int, error) {
