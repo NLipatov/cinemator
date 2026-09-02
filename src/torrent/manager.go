@@ -132,7 +132,7 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 			return err
 		}
 		m.notifyDownloadsChanged()
-		if err := m.stopSupersededPreparation(ctx, key); err != nil {
+		if err := m.stopSupersededPreparation(context.Background(), key); err != nil {
 			return err
 		}
 		m.cleanupTransientPayload(hash, nil)
@@ -143,7 +143,7 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 		return err
 	}
 	m.notifyDownloadsChanged()
-	if err := m.stopSupersededPreparation(ctx, key); err != nil {
+	if err := m.stopSupersededPreparation(context.Background(), key); err != nil {
 		return err
 	}
 	m.launchPreparation(download.Magnet, hash, fileIndex)

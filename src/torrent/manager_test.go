@@ -368,6 +368,106 @@ func TestStartHLSPreparationReplacesPreviousFile(t *testing.T) {
 	}
 }
 
+func TestStartHLSPreparationFinishesPersistedReplacementAfterCancellation(t *testing.T) {
+	root := t.TempDir()
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := strings.Repeat("f", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatal(err)
+	}
+
+	firstKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	secondKey := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
+	firstCanceled := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstJob := &preparationJob{
+		cancel: func() { close(firstCanceled) },
+		done:   make(chan struct{}),
+	}
+	torrentOperationDone := make(chan struct{})
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: map[streamKey]*preparationJob{firstKey: firstJob},
+		streamOps:    make(map[streamKey]chan struct{}),
+		torrents:     make(map[string]int),
+		torrentOps:   map[string]chan struct{}{id: torrentOperationDone},
+		deletions:    make(map[string]chan struct{}),
+		downloads:    store,
+		cfg:          config.Config{DownloadPath: downloadRoot},
+	}
+	go func() {
+		<-releaseFirst
+		m.mu.Lock()
+		delete(m.preparations, firstKey)
+		m.mu.Unlock()
+		close(firstJob.done)
+	}()
+	t.Cleanup(func() {
+		m.mu.Lock()
+		job := m.preparations[secondKey]
+		if job != nil {
+			job.cancel()
+		}
+		m.mu.Unlock()
+		if job != nil {
+			<-job.done
+		}
+		m.finishTorrentOperation(id, torrentOperationDone)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- m.StartHLSPreparation(ctx, magnet, 1)
+	}()
+	select {
+	case <-firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not stop the previous preparation")
+	}
+	cancel()
+
+	var (
+		startErr      error
+		returnedEarly bool
+	)
+	select {
+	case startErr = <-startDone:
+		returnedEarly = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if !returnedEarly {
+		select {
+		case startErr = <-startDone:
+		case <-time.After(time.Second):
+			t.Fatal("replacement did not finish after the previous preparation stopped")
+		}
+	}
+	if returnedEarly {
+		t.Fatalf("replacement returned before the previous preparation stopped: %v", startErr)
+	}
+	if startErr != nil {
+		t.Fatalf("StartHLSPreparation() error = %v", startErr)
+	}
+	m.mu.Lock()
+	secondJob := m.preparations[secondKey]
+	m.mu.Unlock()
+	if secondJob == nil {
+		t.Fatal("persisted replacement was not launched after request cancellation")
+	}
+}
+
 func TestStartHLSPreparationCleansSupersededPartialOutput(t *testing.T) {
 	root := t.TempDir()
 	hlsRoot := filepath.Join(root, "hls")
