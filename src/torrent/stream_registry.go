@@ -86,15 +86,10 @@ func (m *Manager) finishStreamCleanup(key streamKey, s *streamInfo, operationDon
 	if err != nil {
 		log.Printf("Failed to inspect stream output: %s, err=%v", s.paths.outDir, err)
 	}
-	if s.completed && ready {
-		s.mtx.Lock()
-		lastView := s.lastView
-		s.mtx.Unlock()
-		if err := os.Chtimes(s.paths.outDir, lastView, lastView); err != nil {
-			log.Printf("Failed to update HLS cache access time: %s, err=%v", s.paths.outDir, err)
+	if !s.completed || !ready {
+		if removeErr := os.RemoveAll(s.paths.outDir); removeErr != nil {
+			log.Printf("Failed to cleanup directory: %s, err=%v", s.paths.outDir, removeErr)
 		}
-	} else if err := os.RemoveAll(s.paths.outDir); err != nil {
-		log.Printf("Failed to cleanup directory: %s, err=%v", s.paths.outDir, err)
 	}
 
 	m.mu.Lock()
@@ -300,19 +295,22 @@ func (m *Manager) releaseTorrent(hash string, t *torrent.Torrent) <-chan struct{
 		return nil
 	}
 	m.mu.Unlock()
+	return m.cleanupTransientPayload(hash, t)
+}
 
+func (m *Manager) cleanupTransientPayload(hash string, released *torrent.Torrent) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		operationDone, _ := m.reserveTorrentOperation(context.Background(), hash)
 		m.mu.Lock()
 		refs := m.torrents[hash]
 		m.mu.Unlock()
-		current, exists := m.client.Torrent(t.InfoHash())
+		current, exists := m.client.Torrent(metainfo.NewHashFromHex(hash))
 		payloadCanBeDeleted := !exists
-		if refs == 0 && exists && current == t {
+		if refs == 0 && exists && (released == nil || current == released) {
 			log.Printf("Dropping torrent: %s", hash)
 			dropCtx, cancel := context.WithTimeout(context.Background(), webseedStopTimeout)
-			err := m.dropTorrentAfterWebseedsStop(dropCtx, t)
+			err := m.dropTorrentAfterWebseedsStop(dropCtx, current)
 			cancel()
 			if err != nil {
 				log.Printf("Failed to drop torrent %s: %v", hash, err)
@@ -320,9 +318,17 @@ func (m *Manager) releaseTorrent(hash string, t *torrent.Torrent) <-chan struct{
 				payloadCanBeDeleted = true
 			}
 		}
-		if refs == 0 && payloadCanBeDeleted && m.hasReadyHLS(hash) && m.downloads != nil {
+		payloadDisposable := false
+		if refs == 0 && payloadCanBeDeleted && m.downloads != nil {
+			var stateErr error
+			payloadDisposable, stateErr = m.downloads.payloadDisposable(context.Background(), hash)
+			if stateErr != nil && !errors.Is(stateErr, ErrDownloadNotFound) {
+				log.Printf("Failed to inspect HLS preparation state: %s, err=%v", hash, stateErr)
+			}
+		}
+		if payloadDisposable {
 			if err := m.downloads.deletePayload(context.Background(), hash); err != nil {
-				log.Printf("Failed to delete completed torrent payload: %s, err=%v", hash, err)
+				log.Printf("Failed to delete transient torrent payload: %s, err=%v", hash, err)
 			} else {
 				m.notifyDownloadsChanged()
 			}
@@ -478,28 +484,6 @@ func streamOutputReady(paths streamPaths) (bool, error) {
 	return !info.IsDir(), nil
 }
 
-func (m *Manager) hasReadyHLS(hash string) bool {
-	entries, err := os.ReadDir(m.cfg.HLSPath)
-	if err != nil {
-		return false
-	}
-	prefix := hash + "_"
-	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
-			continue
-		}
-		key, err := parseStreamDir(entry.Name())
-		if err != nil {
-			continue
-		}
-		ready, err := streamOutputReady(key.paths(m.cfg.HLSPath))
-		if err == nil && ready {
-			return true
-		}
-	}
-	return false
-}
-
 func (m *Manager) TouchStream(_ context.Context, dirName string) {
 	key, err := parseStreamDir(dirName)
 	if err != nil {
@@ -545,7 +529,6 @@ func (m *Manager) viewerWatcher() {
 	defer ticker.Stop()
 	for range ticker.C {
 		m.cleanupInactiveCompletedStreams(time.Now())
-		m.enforceCacheLimit()
 		m.cleanupExpiredDownloads(context.Background())
 	}
 }

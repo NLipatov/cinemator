@@ -54,3 +54,45 @@ func TestHLSDiskSizesAggregatesRenditionsByDownload(t *testing.T) {
 		t.Fatalf("hlsDiskSize() = %d, want %d", got, want[firstID])
 	}
 }
+
+func TestDefaultPreparationFileRequiresOneVideo(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []FileInfo
+		want  int
+		ok    bool
+	}{
+		{
+			name: "video with sidecars",
+			files: []FileInfo{
+				{Index: 0, Name: "movie.mkv"},
+				{Index: 1, Name: "movie.srt"},
+				{Index: 2, Name: "poster.jpg"},
+			},
+			want: 0,
+			ok:   true,
+		},
+		{
+			name: "multiple videos",
+			files: []FileInfo{
+				{Index: 3, Name: "episode-1.mkv"},
+				{Index: 4, Name: "episode-2.mkv"},
+			},
+			ok: false,
+		},
+		{
+			name:  "single extensionless file",
+			files: []FileInfo{{Index: 7, Name: "feature"}},
+			want:  7,
+			ok:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := defaultPreparationFile(tt.files)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("defaultPreparationFile() = %d, %v; want %d, %v", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}

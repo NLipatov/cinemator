@@ -71,6 +71,10 @@ func (m fakeTorrentManager) GetMediaInfo(context.Context, string, int) (media.Me
 	return media.MediaInfo{}, nil
 }
 
+func (m fakeTorrentManager) StartHLSPreparation(context.Context, string, int) error {
+	return nil
+}
+
 func (m fakeTorrentManager) PrepareHlsStream(context.Context, string, int, int, int) (string, error) {
 	return m.prepare, nil
 }
@@ -221,11 +225,17 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:       "unsupported method",
+			name:       "start background preparation",
 			method:     http.MethodPost,
 			target:     "/api/hls/prepare?magnet=magnet&file=0",
+			wantStatus: http.StatusAccepted,
+		},
+		{
+			name:       "unsupported method",
+			method:     http.MethodPut,
+			target:     "/api/hls/prepare?magnet=magnet&file=0",
 			wantStatus: http.StatusMethodNotAllowed,
-			wantAllow:  http.MethodGet,
+			wantAllow:  http.MethodGet + ", " + http.MethodPost,
 		},
 	}
 

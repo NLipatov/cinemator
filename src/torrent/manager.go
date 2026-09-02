@@ -68,6 +68,7 @@ func NewManager(appConfig config.Config) (*Manager, error) {
 		cfg:        appConfig,
 	}
 	go m.viewerWatcher()
+	go m.resumePreparations()
 	return m, nil
 }
 
@@ -93,8 +94,100 @@ func (m *Manager) GetTorrentFiles(ctx context.Context, magnet string) ([]FileInf
 		log.Printf("GetTorrentFiles: failed to write download metadata: %v", err)
 	} else {
 		m.notifyDownloadsChanged()
+		if fileIndex, ok := defaultPreparationFile(result); ok {
+			if err := m.StartHLSPreparation(context.Background(), magnet, fileIndex); err != nil {
+				log.Printf("GetTorrentFiles: failed to start HLS preparation: %v", err)
+			}
+		}
 	}
 	return result, nil
+}
+
+func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIndex int) error {
+	_, hash, err := parseMagnet(magnet)
+	if err != nil {
+		return err
+	}
+	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
+	ready, err := streamOutputReady(key.paths(m.cfg.HLSPath))
+	if err != nil {
+		return err
+	}
+	if ready {
+		if err := m.downloads.finishPreparation(ctx, hash, fileIndex, time.Now()); err != nil {
+			return err
+		}
+		m.cleanupTransientPayload(hash, nil)
+		m.notifyDownloadsChanged()
+		return nil
+	}
+	download, shouldStart, err := m.downloads.beginPreparation(ctx, hash, fileIndex)
+	if err != nil {
+		return err
+	}
+	m.notifyDownloadsChanged()
+	if shouldStart {
+		m.launchPreparation(download.Magnet, hash, fileIndex)
+	}
+	return nil
+}
+
+func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
+	go func() {
+		info, err := m.GetMediaInfo(context.Background(), magnet, fileIndex)
+		if err == nil {
+			key := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
+			_, err = m.prepareHLSRendition(context.Background(), magnet, key, info, -1)
+			if err == nil {
+				ready, readyErr := streamOutputReady(key.paths(m.cfg.HLSPath))
+				if readyErr != nil {
+					err = readyErr
+				} else if ready {
+					err = m.downloads.finishPreparation(context.Background(), hash, fileIndex, time.Now())
+					if err == nil {
+						m.cleanupTransientPayload(hash, nil)
+					}
+				}
+			}
+		}
+		if err != nil {
+			log.Printf("HLS preparation failed: hash=%s, file=%d, err=%v", hash, fileIndex, err)
+			if storeErr := m.downloads.failPreparation(context.Background(), hash, fileIndex, err); storeErr != nil && !errors.Is(storeErr, ErrDownloadNotFound) {
+				log.Printf("failed to persist HLS preparation error: %v", storeErr)
+			}
+			m.cleanupTransientPayload(hash, nil)
+		}
+		m.notifyDownloadsChanged()
+	}()
+}
+
+func (m *Manager) resumePreparations() {
+	downloads, err := m.downloads.list(context.Background())
+	if err != nil {
+		log.Printf("failed to restore HLS preparations: %v", err)
+		return
+	}
+	for _, download := range downloads {
+		if download.Status == DownloadStatusReady && download.SelectedFileIndex != nil {
+			if restoreErr := m.StartHLSPreparation(context.Background(), download.Magnet, *download.SelectedFileIndex); restoreErr != nil {
+				log.Printf("failed to reconcile ready HLS for %s: %v", download.ID, restoreErr)
+			}
+			continue
+		}
+		if download.Status == DownloadStatusPreparing && download.SelectedFileIndex != nil {
+			m.launchPreparation(download.Magnet, download.ID, *download.SelectedFileIndex)
+			continue
+		}
+		if download.SelectedFileIndex == nil {
+			fileIndex, ok := defaultPreparationFile(download.Files)
+			if !ok {
+				continue
+			}
+			if err := m.StartHLSPreparation(context.Background(), download.Magnet, fileIndex); err != nil {
+				log.Printf("failed to restore HLS preparation for %s: %v", download.ID, err)
+			}
+		}
+	}
 }
 
 func (m *Manager) GetMediaInfo(ctx context.Context, magnet string, fileIndex int) (media.MediaInfo, error) {
@@ -217,14 +310,14 @@ func (m *Manager) prepareHLSRendition(
 		m.touchDownload(ctx, key.InfoHash)
 		return m.waitForPlayableStream(ctx, s)
 	}
-	if cached, err := m.activateCachedStream(ctx, key, paths); err != nil {
+	if ready, err := m.activateCachedStream(ctx, key, paths); err != nil {
 		return "", err
-	} else if cached {
+	} else if ready {
 		m.touchDownload(ctx, key.InfoHash)
 		log.Printf("Reusing completed HLS rendition: key=%v, playlist=%s", key, paths.masterPlaylist)
 		return paths.masterPlaylist, nil
 	}
-	// A concurrent request may have created the rendition while the cache was checked.
+	// A concurrent request may have created the rendition while the ready output was checked.
 	if s, err := m.getStream(ctx, key); err != nil {
 		return "", err
 	} else if s != nil {
@@ -428,16 +521,9 @@ func (m *Manager) ListDownloads(ctx context.Context) ([]Download, error) {
 	if err != nil {
 		return nil, err
 	}
-	statuses := m.downloadStatuses()
 	hlsSizes := hlsDiskSizes(m.cfg.HLSPath)
 	for i := range downloads {
 		downloads[i].DiskSize += hlsSizes[downloads[i].ID]
-		if downloads[i].Status == DownloadStatusExpired {
-			continue
-		}
-		if status, ok := statuses[downloads[i].ID]; ok {
-			downloads[i].Status = status
-		}
 	}
 	return downloads, nil
 }
@@ -446,9 +532,6 @@ func (m *Manager) ExtendDownload(ctx context.Context, id string, extension time.
 	download, err := m.downloads.extend(ctx, id, extension)
 	if err != nil {
 		return Download{}, err
-	}
-	if status, ok := m.downloadStatuses()[download.ID]; ok && download.Status != DownloadStatusExpired {
-		download.Status = status
 	}
 	download.DiskSize += hlsDiskSize(m.cfg.HLSPath, download.ID)
 	m.notifyDownloadsChanged()
@@ -509,26 +592,6 @@ func (m *Manager) notifyDownloadsChanged() {
 		return
 	}
 	m.events.notify()
-}
-
-func (m *Manager) downloadStatuses() map[string]DownloadStatus {
-	statuses := make(map[string]DownloadStatus)
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for key, stream := range m.active {
-		status := DownloadStatusStreaming
-		stream.mtx.Lock()
-		if stream.completed {
-			status = DownloadStatusReady
-		}
-		stream.mtx.Unlock()
-
-		current, ok := statuses[key.InfoHash]
-		if !ok || current != DownloadStatusStreaming {
-			statuses[key.InfoHash] = status
-		}
-	}
-	return statuses
 }
 
 func (m *Manager) streamKeysForDownload(id string) []streamKey {
@@ -613,6 +676,26 @@ func hlsDiskSizes(root string) map[string]int64 {
 		sizes[id] += pathDiskSize(filepath.Join(root, entry.Name()))
 	}
 	return sizes
+}
+
+func defaultPreparationFile(files []FileInfo) (int, bool) {
+	selected := -1
+	for _, file := range files {
+		switch strings.ToLower(filepath.Ext(file.Name)) {
+		case ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ogv", ".ts", ".webm", ".wmv":
+			if selected >= 0 {
+				return 0, false
+			}
+			selected = file.Index
+		}
+	}
+	if selected >= 0 {
+		return selected, true
+	}
+	if len(files) == 1 {
+		return files[0].Index, true
+	}
+	return 0, false
 }
 
 func hlsDiskSize(root, id string) int64 {
@@ -763,6 +846,11 @@ func (m *Manager) finishConversion(key streamKey, s *streamInfo, err error) {
 	if source != nil {
 		source.Close()
 	}
+	if err == nil && key.Audio == -1 && key.Subtitle == -1 && m.downloads != nil {
+		if storeErr := m.downloads.finishPreparation(context.Background(), key.InfoHash, key.Index, time.Now()); storeErr != nil {
+			log.Printf("failed to persist completed HLS preparation: key=%v, err=%v", key, storeErr)
+		}
+	}
 	if t != nil {
 		m.releaseTorrent(key.InfoHash, t)
 	}
@@ -771,6 +859,12 @@ func (m *Manager) finishConversion(key streamKey, s *streamInfo, err error) {
 	}
 
 	if err != nil {
+		if key.Audio == -1 && key.Subtitle == -1 && m.downloads != nil {
+			if storeErr := m.downloads.failPreparation(context.Background(), key.InfoHash, key.Index, err); storeErr != nil && !errors.Is(storeErr, ErrDownloadNotFound) {
+				log.Printf("failed to persist HLS preparation error: key=%v, err=%v", key, storeErr)
+			}
+			m.notifyDownloadsChanged()
+		}
 		m.cleanupIfCurrent(key, s)
 	}
 }

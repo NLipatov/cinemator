@@ -255,14 +255,22 @@ func (s *Server) handleDownloadAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	magnet, fileIndex, err := parseMagnetAndFile(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if r.Method == http.MethodPost {
+		if err := s.mgr.StartHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
+			http.Error(w, err.Error(), apiErrorStatus(err))
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
@@ -274,6 +282,10 @@ func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) 
 	subtitleTrack, err := parseTrackIndex(r, "subtitle", -1, -1)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.mgr.StartHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
+		http.Error(w, err.Error(), apiErrorStatus(err))
 		return
 	}
 
@@ -338,6 +350,9 @@ func apiErrorStatus(err error) int {
 	}
 	if errors.Is(err, torrent.ErrDownloadNotFound) {
 		return http.StatusNotFound
+	}
+	if errors.Is(err, torrent.ErrDownloadNotReady) {
+		return http.StatusConflict
 	}
 	return http.StatusInternalServerError
 }

@@ -304,6 +304,66 @@ func TestDropTorrentAfterWebseedsStopHonorsCanceledContext(t *testing.T) {
 	}
 }
 
+func TestTerminalPreparationCleanupDeletesOnlyTorrentPayload(t *testing.T) {
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("e", 40)
+	files := []FileInfo{{Index: 0, Name: "feature.mkv", Size: 10}}
+	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(store.downloadDir(id), "feature.mkv")
+	if err := os.WriteFile(payload, []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{
+		client:     client,
+		torrents:   make(map[string]int),
+		torrentOps: make(map[string]chan struct{}),
+		downloads:  store,
+	}
+	<-m.cleanupTransientPayload(id, nil)
+	if _, err := os.Stat(payload); err != nil {
+		t.Fatalf("preparing torrent payload was removed: %v", err)
+	}
+	if err := store.failPreparation(context.Background(), id, 0, errors.New("ffmpeg failed")); err != nil {
+		t.Fatal(err)
+	}
+	<-m.cleanupTransientPayload(id, nil)
+	if _, err := os.Stat(payload); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed torrent payload still exists: %v", err)
+	}
+	if err := os.WriteFile(payload, []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
+		t.Fatalf("retry beginPreparation() = %v, %v", shouldStart, err)
+	}
+	if err := store.finishPreparation(context.Background(), id, 0, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	<-m.cleanupTransientPayload(id, nil)
+
+	if _, err := os.Stat(payload); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("torrent payload still exists: %v", err)
+	}
+	if _, err := os.Stat(store.metadataPath(id)); err != nil {
+		t.Fatalf("ready artifact metadata was removed: %v", err)
+	}
+}
+
 type doneObservedContext struct {
 	context.Context
 	once      sync.Once

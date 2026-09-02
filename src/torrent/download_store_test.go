@@ -37,8 +37,36 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 	if download.DiskSize != 0 {
 		t.Fatalf("download disk size = %d, want 0", download.DiskSize)
 	}
-	if download.Status != DownloadStatusReady {
-		t.Fatalf("download status = %q, want ready", download.Status)
+	if download.Status != DownloadStatusAwaitingSelection {
+		t.Fatalf("download status = %q, want awaiting selection", download.Status)
+	}
+	if !download.ExpiresAt.IsZero() {
+		t.Fatalf("download expiry = %v, want zero before HLS is ready", download.ExpiresAt)
+	}
+	preparing, shouldStart, err := store.beginPreparation(context.Background(), id, 1)
+	if err != nil {
+		t.Fatalf("beginPreparation() error = %v", err)
+	}
+	if !shouldStart || preparing.Status != DownloadStatusPreparing || preparing.SelectedFileIndex == nil || *preparing.SelectedFileIndex != 1 {
+		t.Fatalf("beginPreparation() = %#v, %v", preparing, shouldStart)
+	}
+	completedAt := time.Now().UTC().Truncate(time.Second)
+	if err := store.finishPreparation(context.Background(), id, 1, completedAt); err != nil {
+		t.Fatalf("finishPreparation() error = %v", err)
+	}
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatalf("list() after preparation error = %v", err)
+	}
+	if len(downloads) != 1 || downloads[0].Status != DownloadStatusReady {
+		t.Fatalf("list() after preparation = %#v, want one ready download", downloads)
+	}
+	download = downloads[0]
+	if !download.ReadyAt.Equal(completedAt) {
+		t.Fatalf("ready at = %v, want %v", download.ReadyAt, completedAt)
+	}
+	if want := completedAt.Add(downloadDefaultTTL); !download.ExpiresAt.Equal(want) {
+		t.Fatalf("expiry = %v, want %v", download.ExpiresAt, want)
 	}
 	if _, err := os.Stat(filepath.Join(store.root, id, downloadStoreDirName, "metadata.json")); err != nil {
 		t.Fatalf("metadata not written inside download dir: %v", err)
@@ -47,7 +75,7 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 		t.Fatalf("write payload file: %v", err)
 	}
 
-	downloads, err := store.list(context.Background())
+	downloads, err = store.list(context.Background())
 	if err != nil {
 		t.Fatalf("list() error = %v", err)
 	}
@@ -75,6 +103,34 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 	}
 	if len(downloads) != 0 {
 		t.Fatalf("list() after delete = %#v, want empty", downloads)
+	}
+}
+
+func TestDownloadStorePreparationFailureCanBeRetried(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("d", 40)
+	files := []FileInfo{{Index: 3, Name: "feature.mkv", Size: 10}}
+	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 3); err != nil || !shouldStart {
+		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	}
+	if err := store.failPreparation(context.Background(), id, 3, errors.New("ffmpeg failed")); err != nil {
+		t.Fatal(err)
+	}
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := downloads[0]; got.Status != DownloadStatusFailed || got.PreparationErr != "ffmpeg failed" {
+		t.Fatalf("failed download = %#v", got)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 3); err != nil || !shouldStart {
+		t.Fatalf("retry beginPreparation() = %v, %v", shouldStart, err)
 	}
 }
 
