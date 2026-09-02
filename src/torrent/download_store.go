@@ -324,6 +324,12 @@ func (s *downloadStore) finishPreparation(ctx context.Context, id string, fileIn
 		return fmt.Errorf("bad file index")
 	}
 	if download.SelectedFileIndex != nil && *download.SelectedFileIndex != fileIndex {
+		if download.Status == DownloadStatusFailed && download.ExpiresAt.IsZero() {
+			completedAt = completedAt.UTC()
+			download.ExpiresAt = completedAt.Add(downloadDefaultTTL)
+			download.UpdatedAt = completedAt
+			return s.writeLocked(download)
+		}
 		return nil
 	}
 	if download.Status == DownloadStatusReady && download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex {

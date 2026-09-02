@@ -134,6 +134,46 @@ func TestDownloadStorePreparationFailureCanBeRetried(t *testing.T) {
 	}
 }
 
+func TestFinishPreparationExpiresLateStaleOutput(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("c", 40)
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv", Size: 10},
+		{Index: 1, Name: "episode-2.mkv", Size: 10},
+	}
+	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
+		t.Fatalf("begin first preparation = %v, %v", shouldStart, err)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 1); err != nil || !shouldStart {
+		t.Fatalf("begin replacement preparation = %v, %v", shouldStart, err)
+	}
+	if err := store.failPreparation(context.Background(), id, 1, errors.New("replacement failed")); err != nil {
+		t.Fatal(err)
+	}
+
+	completedAt := time.Now().UTC().Truncate(time.Second)
+	if err := store.finishPreparation(context.Background(), id, 0, completedAt); err != nil {
+		t.Fatal(err)
+	}
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := downloads[0]
+	if got.Status != DownloadStatusFailed || got.SelectedFileIndex == nil || *got.SelectedFileIndex != 1 {
+		t.Fatalf("late completion replaced failed selection: %#v", got)
+	}
+	if want := completedAt.Add(downloadDefaultTTL); !got.ExpiresAt.Equal(want) {
+		t.Fatalf("expiry = %v, want %v", got.ExpiresAt, want)
+	}
+}
+
 func TestBeginPreparationClearsPreviousExpiry(t *testing.T) {
 	store, err := newDownloadStore(t.TempDir())
 	if err != nil {
