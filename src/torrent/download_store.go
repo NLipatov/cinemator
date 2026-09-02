@@ -62,8 +62,8 @@ func (s *downloadStore) upsert(ctx context.Context, id, magnet string, files []F
 	if errors.Is(err, ErrDownloadNotFound) {
 		download = Download{
 			ID:        id,
+			Status:    DownloadStatusAwaitingSelection,
 			CreatedAt: now,
-			ExpiresAt: now.Add(downloadDefaultTTL),
 		}
 	}
 
@@ -71,11 +71,21 @@ func (s *downloadStore) upsert(ctx context.Context, id, magnet string, files []F
 	download.Files = cloneFiles(files)
 	download.Size = totalFileSize(files)
 	download.Title = downloadTitle(files, id)
-	download.Status = DownloadStatusReady
 	download.UpdatedAt = now
 	download.LastAccessedAt = now
-	if download.ExpiresAt.IsZero() || download.ExpiresAt.Before(now) {
-		download.ExpiresAt = now.Add(downloadDefaultTTL)
+	if !download.ExpiresAt.IsZero() && download.ExpiresAt.Before(now) {
+		download.Status = DownloadStatusAwaitingSelection
+		download.SelectedFileIndex = nil
+		download.ReadyAt = time.Time{}
+		download.ExpiresAt = time.Time{}
+		download.PreparationErr = ""
+	}
+	if download.SelectedFileIndex != nil && !hasFileIndex(download.Files, *download.SelectedFileIndex) {
+		download.Status = DownloadStatusAwaitingSelection
+		download.SelectedFileIndex = nil
+		download.ReadyAt = time.Time{}
+		download.ExpiresAt = time.Time{}
+		download.PreparationErr = ""
 	}
 	if err := s.writeLocked(download); err != nil {
 		return Download{}, err
@@ -116,10 +126,8 @@ func (s *downloadStore) list(ctx context.Context) ([]Download, error) {
 			}
 			return nil, err
 		}
-		if now.After(download.ExpiresAt) {
+		if !download.ExpiresAt.IsZero() && now.After(download.ExpiresAt) {
 			download.Status = DownloadStatusExpired
-		} else if download.Status == DownloadStatusExpired {
-			download.Status = DownloadStatusReady
 		}
 		download.DiskSize = s.diskSizeLocked(entry.Name())
 		downloads = append(downloads, download)
@@ -193,10 +201,6 @@ func (s *downloadStore) touch(ctx context.Context, id string) error {
 	now := time.Now().UTC()
 	download.LastAccessedAt = now
 	download.UpdatedAt = now
-	if download.ExpiresAt.Before(now) {
-		download.ExpiresAt = now.Add(downloadDefaultTTL)
-	}
-	download.Status = DownloadStatusReady
 	return s.writeLocked(download)
 }
 
@@ -219,6 +223,9 @@ func (s *downloadStore) extend(ctx context.Context, id string, extension time.Du
 	if err != nil {
 		return Download{}, err
 	}
+	if download.Status != DownloadStatusReady || download.ExpiresAt.IsZero() {
+		return Download{}, ErrDownloadNotReady
+	}
 	now := time.Now().UTC()
 	base := download.ExpiresAt
 	if base.Before(now) {
@@ -226,16 +233,208 @@ func (s *downloadStore) extend(ctx context.Context, id string, extension time.Du
 	}
 	download.ExpiresAt = base.Add(extension)
 	download.UpdatedAt = now
-	if now.After(download.ExpiresAt) {
-		download.Status = DownloadStatusExpired
-	} else {
-		download.Status = DownloadStatusReady
-	}
+	download.Status = DownloadStatusReady
 	if err := s.writeLocked(download); err != nil {
 		return Download{}, err
 	}
 	download.DiskSize = s.diskSizeLocked(id)
 	return download, nil
+}
+
+func (s *downloadStore) beginPreparation(ctx context.Context, id string, fileIndex int) (Download, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return Download{}, false, err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return Download{}, false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	download, err := s.readLocked(id)
+	if err != nil {
+		return Download{}, false, err
+	}
+	if !hasFileIndex(download.Files, fileIndex) {
+		return Download{}, false, fmt.Errorf("bad file index")
+	}
+	if download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex &&
+		download.Status == DownloadStatusPreparing {
+		return download, false, nil
+	}
+
+	now := time.Now().UTC()
+	download.SelectedFileIndex = intPointer(fileIndex)
+	download.Status = DownloadStatusPreparing
+	download.ReadyAt = time.Time{}
+	download.ExpiresAt = time.Time{}
+	download.PreparationErr = ""
+	download.UpdatedAt = now
+	download.LastAccessedAt = now
+	if err := s.writeLocked(download); err != nil {
+		return Download{}, false, err
+	}
+	return download, true, nil
+}
+
+func (s *downloadStore) isPreparing(ctx context.Context, id string, fileIndex int) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	download, err := s.readLocked(id)
+	if err != nil {
+		return false, err
+	}
+	return download.Status == DownloadStatusPreparing &&
+		download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex, nil
+}
+
+func (s *downloadStore) selectPrepared(ctx context.Context, id string, fileIndex int, selectedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	download, err := s.readLocked(id)
+	if err != nil {
+		return err
+	}
+	if !hasFileIndex(download.Files, fileIndex) {
+		return fmt.Errorf("bad file index")
+	}
+	if download.Status == DownloadStatusReady && download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex {
+		return nil
+	}
+	return s.writeReadyLocked(download, fileIndex, selectedAt)
+}
+
+func (s *downloadStore) finishPreparation(ctx context.Context, id string, fileIndex int, completedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	download, err := s.readLocked(id)
+	if err != nil {
+		return err
+	}
+	if !hasFileIndex(download.Files, fileIndex) {
+		return fmt.Errorf("bad file index")
+	}
+	if download.SelectedFileIndex != nil && *download.SelectedFileIndex != fileIndex {
+		if download.Status == DownloadStatusFailed && download.ExpiresAt.IsZero() {
+			completedAt = completedAt.UTC()
+			download.ExpiresAt = completedAt.Add(downloadDefaultTTL)
+			download.UpdatedAt = completedAt
+			return s.writeLocked(download)
+		}
+		return nil
+	}
+	if download.Status == DownloadStatusReady && download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex {
+		return nil
+	}
+	return s.writeReadyLocked(download, fileIndex, completedAt)
+}
+
+func (s *downloadStore) writeReadyLocked(download Download, fileIndex int, completedAt time.Time) error {
+	completedAt = completedAt.UTC()
+	download.SelectedFileIndex = intPointer(fileIndex)
+	download.Status = DownloadStatusReady
+	download.ReadyAt = completedAt
+	download.ExpiresAt = completedAt.Add(downloadDefaultTTL)
+	download.PreparationErr = ""
+	download.UpdatedAt = completedAt
+	download.LastAccessedAt = completedAt
+	return s.writeLocked(download)
+}
+
+func (s *downloadStore) failPreparation(ctx context.Context, id string, fileIndex int, preparationErr error) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	download, err := s.readLocked(id)
+	if err != nil {
+		return err
+	}
+	if download.SelectedFileIndex == nil || *download.SelectedFileIndex != fileIndex || download.Status != DownloadStatusPreparing {
+		return nil
+	}
+	download.Status = DownloadStatusFailed
+	download.PreparationErr = preparationErr.Error()
+	download.UpdatedAt = time.Now().UTC()
+	return s.writeLocked(download)
+}
+
+func (s *downloadStore) ensureFailedHLSExpiry(ctx context.Context, id string, failedAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	download, err := s.readLocked(id)
+	if err != nil {
+		return err
+	}
+	if download.Status != DownloadStatusFailed || !download.ExpiresAt.IsZero() {
+		return nil
+	}
+	failedAt = failedAt.UTC()
+	download.ExpiresAt = failedAt.Add(downloadDefaultTTL)
+	download.UpdatedAt = failedAt
+	return s.writeLocked(download)
+}
+
+func (s *downloadStore) payloadDisposable(ctx context.Context, id string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	id, err := cleanInfoHash(id)
+	if err != nil {
+		return false, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	download, err := s.readLocked(id)
+	if err != nil {
+		return false, err
+	}
+	return download.Status == DownloadStatusReady || download.Status == DownloadStatusFailed, nil
 }
 
 func (s *downloadStore) delete(ctx context.Context, id string) error {
@@ -378,7 +577,12 @@ func (s *downloadStore) readLocked(id string) (Download, error) {
 		download.ID = id
 	}
 	if download.Status == "" {
-		download.Status = DownloadStatusReady
+		download.Status = DownloadStatusAwaitingSelection
+	}
+	if download.SelectedFileIndex == nil && download.ReadyAt.IsZero() &&
+		(download.Status == DownloadStatusReady || download.Status == DownloadStatus("streaming")) {
+		download.Status = DownloadStatusAwaitingSelection
+		download.ExpiresAt = time.Time{}
 	}
 	return download, nil
 }
@@ -529,4 +733,17 @@ func downloadTitle(files []FileInfo, id string) string {
 		return "Torrent " + id[:8]
 	}
 	return name
+}
+
+func hasFileIndex(files []FileInfo, index int) bool {
+	for _, file := range files {
+		if file.Index == index {
+			return true
+		}
+	}
+	return false
+}
+
+func intPointer(value int) *int {
+	return &value
 }

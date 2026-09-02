@@ -260,6 +260,40 @@ func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
 	}
 }
 
+func TestFinishConversionMakesBaseHLSTheReadyArtifact(t *testing.T) {
+	id := strings.Repeat("a", 40)
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := []FileInfo{{Index: 1, Name: "feature.mkv", Size: 10}}
+	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 1); err != nil || !shouldStart {
+		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	}
+
+	key := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
+	s := &streamInfo{}
+	m := &Manager{
+		active:    map[streamKey]*streamInfo{key: s},
+		downloads: store,
+	}
+	m.finishConversion(key, s, nil)
+
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(downloads) != 1 || downloads[0].Status != DownloadStatusReady {
+		t.Fatalf("downloads = %#v, want ready artifact", downloads)
+	}
+	if downloads[0].ReadyAt.IsZero() || downloads[0].ExpiresAt.Sub(downloads[0].ReadyAt) != downloadDefaultTTL {
+		t.Fatalf("ready interval = %v to %v", downloads[0].ReadyAt, downloads[0].ExpiresAt)
+	}
+}
+
 func TestFinishConversionCleansFailedBackgroundPreparation(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	paths := key.paths(t.TempDir())

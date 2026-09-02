@@ -1,11 +1,18 @@
 package torrent
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"cinemator/config"
+
+	torrentlib "github.com/anacrolix/torrent"
 )
 
 func TestHLSDiskSizesAggregatesRenditionsByDownload(t *testing.T) {
@@ -52,5 +59,771 @@ func TestHLSDiskSizesAggregatesRenditionsByDownload(t *testing.T) {
 	}
 	if got := hlsDiskSize(root, firstID); got != want[firstID] {
 		t.Fatalf("hlsDiskSize() = %d, want %d", got, want[firstID])
+	}
+}
+
+func TestDownloadHasReadyHLSRequiresCompletedOutput(t *testing.T) {
+	root := t.TempDir()
+	id := strings.Repeat("a", 40)
+	paths := (streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}).paths(root)
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if downloadHasReadyHLS(root, id) {
+		t.Fatal("incomplete HLS was treated as a retained artifact")
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+	if !downloadHasReadyHLS(root, id) {
+		t.Fatal("completed HLS was not detected")
+	}
+}
+
+func TestRemoveIncompleteDownloadHLSSkipsReservedOutput(t *testing.T) {
+	root := t.TempDir()
+	id := strings.Repeat("b", 40)
+	key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	paths := key.paths(root)
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.videoPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	operationDone := make(chan struct{})
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		streamOps:    map[streamKey]chan struct{}{key: operationDone},
+		deletions:    make(map[string]chan struct{}),
+		cfg:          config.Config{HLSPath: root},
+	}
+	if err := m.removeIncompleteDownloadHlsDirs(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.outDir); err != nil {
+		t.Fatalf("reserved output was removed: %v", err)
+	}
+
+	m.finishStreamOperation(key, operationDone)
+	if err := m.removeIncompleteDownloadHlsDirs(id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(paths.outDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unreserved incomplete output was not removed: %v", err)
+	}
+}
+
+func TestDefaultPreparationFileRequiresOneVideo(t *testing.T) {
+	tests := []struct {
+		name  string
+		files []FileInfo
+		want  int
+		ok    bool
+	}{
+		{
+			name: "video with sidecars",
+			files: []FileInfo{
+				{Index: 0, Name: "movie.mkv"},
+				{Index: 1, Name: "movie.srt"},
+				{Index: 2, Name: "poster.jpg"},
+			},
+			want: 0,
+			ok:   true,
+		},
+		{
+			name: "multiple videos",
+			files: []FileInfo{
+				{Index: 3, Name: "episode-1.mkv"},
+				{Index: 4, Name: "episode-2.mkv"},
+			},
+			ok: false,
+		},
+		{
+			name:  "single extensionless file",
+			files: []FileInfo{{Index: 7, Name: "feature"}},
+			want:  7,
+			ok:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := defaultPreparationFile(tt.files)
+			if got != tt.want || ok != tt.ok {
+				t.Fatalf("defaultPreparationFile() = %d, %v; want %d, %v", got, ok, tt.want, tt.ok)
+			}
+		})
+	}
+}
+
+func TestResumePreparationsSkipsExpiredDownload(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatalf("newDownloadStore() error = %v", err)
+	}
+
+	id := strings.Repeat("c", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	download, err := store.upsert(context.Background(), id, magnet, []FileInfo{{Index: 0, Name: "feature.mkv"}})
+	if err != nil {
+		t.Fatalf("upsert() error = %v", err)
+	}
+	expiresAt := time.Now().UTC().Add(-time.Hour)
+	download.ExpiresAt = expiresAt
+	if err := store.writeLockedForTest(download); err != nil {
+		t.Fatalf("write expired download: %v", err)
+	}
+
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		deletions:    map[string]chan struct{}{id: make(chan struct{})},
+		downloads:    store,
+		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	m.resumePreparations()
+
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatalf("list() error = %v", err)
+	}
+	if len(downloads) != 1 {
+		t.Fatalf("list() returned %d downloads, want 1", len(downloads))
+	}
+	got := downloads[0]
+	if got.Status != DownloadStatusExpired {
+		t.Fatalf("status = %q, want %q", got.Status, DownloadStatusExpired)
+	}
+	if !got.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("expiresAt = %v, want %v", got.ExpiresAt, expiresAt)
+	}
+	if got.SelectedFileIndex != nil {
+		t.Fatalf("selectedFileIndex = %d, want nil", *got.SelectedFileIndex)
+	}
+}
+
+func TestStartHLSPreparationRestartsMissingRuntimeJob(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatalf("newDownloadStore() error = %v", err)
+	}
+
+	id := strings.Repeat("d", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	if _, err := store.upsert(context.Background(), id, magnet, []FileInfo{{Index: 0, Name: "feature.mkv"}}); err != nil {
+		t.Fatalf("upsert() error = %v", err)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
+		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	}
+
+	operationDone := make(chan struct{})
+	key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		streamOps:    make(map[streamKey]chan struct{}),
+		torrents:     make(map[string]int),
+		torrentOps:   map[string]chan struct{}{id: operationDone},
+		deletions:    make(map[string]chan struct{}),
+		downloads:    store,
+		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	t.Cleanup(func() {
+		m.mu.Lock()
+		job := m.preparations[key]
+		if job != nil {
+			job.cancel()
+		}
+		m.mu.Unlock()
+		if job != nil {
+			select {
+			case <-job.done:
+			case <-time.After(time.Second):
+				t.Error("preparation job did not stop")
+			}
+		}
+		m.finishTorrentOperation(id, operationDone)
+	})
+
+	if err := m.StartHLSPreparation(context.Background(), magnet, 0); err != nil {
+		t.Fatalf("StartHLSPreparation() error = %v", err)
+	}
+	m.mu.Lock()
+	job := m.preparations[key]
+	m.mu.Unlock()
+	if job == nil {
+		t.Fatal("StartHLSPreparation() did not restore the missing runtime job")
+	}
+	if err := m.StartHLSPreparation(context.Background(), magnet, 0); err != nil {
+		t.Fatalf("second StartHLSPreparation() error = %v", err)
+	}
+	m.mu.Lock()
+	retriedJob := m.preparations[key]
+	m.mu.Unlock()
+	if retriedJob != job {
+		t.Fatal("second StartHLSPreparation() replaced the running job")
+	}
+}
+
+func TestStartHLSPreparationReplacesPreviousFile(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := strings.Repeat("a", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatal(err)
+	}
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	operationDone := make(chan struct{})
+	firstKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	secondKey := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
+	m := &Manager{
+		client:       client,
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		streamOps:    make(map[streamKey]chan struct{}),
+		torrents:     make(map[string]int),
+		torrentOps:   map[string]chan struct{}{id: operationDone},
+		deletions:    make(map[string]chan struct{}),
+		downloads:    store,
+		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	t.Cleanup(func() {
+		m.mu.Lock()
+		jobs := make([]*preparationJob, 0, len(m.preparations))
+		for _, job := range m.preparations {
+			job.cancel()
+			jobs = append(jobs, job)
+		}
+		m.mu.Unlock()
+		for _, job := range jobs {
+			select {
+			case <-job.done:
+			case <-time.After(time.Second):
+				t.Error("preparation job did not stop")
+			}
+		}
+		m.finishTorrentOperation(id, operationDone)
+	})
+
+	if err := m.StartHLSPreparation(context.Background(), magnet, 0); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	firstJob := m.preparations[firstKey]
+	m.mu.Unlock()
+	if firstJob == nil {
+		t.Fatal("first preparation was not started")
+	}
+	if err := m.StartHLSPreparation(context.Background(), magnet, 99); err == nil {
+		t.Fatal("invalid replacement was accepted")
+	}
+	select {
+	case <-firstJob.done:
+		t.Fatal("invalid replacement stopped the current preparation")
+	default:
+	}
+	if err := m.StartHLSPreparation(context.Background(), magnet, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-firstJob.done:
+	default:
+		t.Fatal("replacement left the previous preparation running")
+	}
+	m.mu.Lock()
+	remainingFirst := m.preparations[firstKey]
+	secondJob := m.preparations[secondKey]
+	m.mu.Unlock()
+	if remainingFirst != nil || secondJob == nil {
+		t.Fatalf("preparations after replacement = first %v, second %v", remainingFirst != nil, secondJob != nil)
+	}
+}
+
+func TestStartHLSPreparationFinishesPersistedReplacementAfterCancellation(t *testing.T) {
+	root := t.TempDir()
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := strings.Repeat("f", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatal(err)
+	}
+
+	firstKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	secondKey := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
+	firstCanceled := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	firstJob := &preparationJob{
+		cancel: func() { close(firstCanceled) },
+		done:   make(chan struct{}),
+	}
+	torrentOperationDone := make(chan struct{})
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: map[streamKey]*preparationJob{firstKey: firstJob},
+		streamOps:    make(map[streamKey]chan struct{}),
+		torrents:     make(map[string]int),
+		torrentOps:   map[string]chan struct{}{id: torrentOperationDone},
+		deletions:    make(map[string]chan struct{}),
+		downloads:    store,
+		cfg:          config.Config{DownloadPath: downloadRoot},
+	}
+	go func() {
+		<-releaseFirst
+		m.mu.Lock()
+		delete(m.preparations, firstKey)
+		m.mu.Unlock()
+		close(firstJob.done)
+	}()
+	t.Cleanup(func() {
+		m.mu.Lock()
+		job := m.preparations[secondKey]
+		if job != nil {
+			job.cancel()
+		}
+		m.mu.Unlock()
+		if job != nil {
+			<-job.done
+		}
+		m.finishTorrentOperation(id, torrentOperationDone)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	startDone := make(chan error, 1)
+	go func() {
+		startDone <- m.StartHLSPreparation(ctx, magnet, 1)
+	}()
+	select {
+	case <-firstCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("replacement did not stop the previous preparation")
+	}
+	cancel()
+
+	var (
+		startErr      error
+		returnedEarly bool
+	)
+	select {
+	case startErr = <-startDone:
+		returnedEarly = true
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseFirst)
+	if !returnedEarly {
+		select {
+		case startErr = <-startDone:
+		case <-time.After(time.Second):
+			t.Fatal("replacement did not finish after the previous preparation stopped")
+		}
+	}
+	if returnedEarly {
+		t.Fatalf("replacement returned before the previous preparation stopped: %v", startErr)
+	}
+	if startErr != nil {
+		t.Fatalf("StartHLSPreparation() error = %v", startErr)
+	}
+	m.mu.Lock()
+	secondJob := m.preparations[secondKey]
+	m.mu.Unlock()
+	if secondJob == nil {
+		t.Fatal("persisted replacement was not launched after request cancellation")
+	}
+}
+
+func TestStartHLSPreparationCleansSupersededPartialOutput(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := strings.Repeat("b", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+		{Index: 2, Name: "episode-3.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatal(err)
+	}
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+
+	firstKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	firstPaths := firstKey.paths(hlsRoot)
+	if err := resetStreamOutput(firstPaths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(firstPaths.videoPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	streamCtx, cancelStream := context.WithCancel(context.Background())
+	t.Cleanup(cancelStream)
+	runDone := make(chan struct{})
+	go func() {
+		<-streamCtx.Done()
+		close(runDone)
+	}()
+	firstStream := &streamInfo{
+		cancel:  cancelStream,
+		paths:   firstPaths,
+		runDone: runDone,
+	}
+	cachedKey := streamKey{InfoHash: id, Index: 2, Audio: -1, Subtitle: -1}
+	cachedPaths := cachedKey.paths(hlsRoot)
+	if err := resetStreamOutput(cachedPaths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cachedPaths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := markStreamOutputReady(cachedPaths); err != nil {
+		t.Fatal(err)
+	}
+	cachedStream := &streamInfo{paths: cachedPaths, completed: true}
+
+	operationDone := make(chan struct{})
+	secondKey := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
+	m := &Manager{
+		client: client,
+		active: map[streamKey]*streamInfo{
+			firstKey:  firstStream,
+			cachedKey: cachedStream,
+		},
+		preparations: make(map[streamKey]*preparationJob),
+		streamOps:    make(map[streamKey]chan struct{}),
+		torrents:     make(map[string]int),
+		torrentOps:   map[string]chan struct{}{id: operationDone},
+		deletions:    make(map[string]chan struct{}),
+		downloads:    store,
+		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	t.Cleanup(func() {
+		m.mu.Lock()
+		job := m.preparations[secondKey]
+		if job != nil {
+			job.cancel()
+		}
+		m.mu.Unlock()
+		if job != nil {
+			select {
+			case <-job.done:
+			case <-time.After(time.Second):
+				t.Error("replacement preparation did not stop")
+			}
+		}
+		m.finishTorrentOperation(id, operationDone)
+	})
+
+	if err := m.StartHLSPreparation(context.Background(), magnet, 1); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	remaining := m.active[firstKey]
+	remainingCached := m.active[cachedKey]
+	secondJob := m.preparations[secondKey]
+	m.mu.Unlock()
+	if remaining != nil {
+		t.Fatal("superseded conversion remained active")
+	}
+	if secondJob == nil {
+		t.Fatal("replacement preparation was not started")
+	}
+	if remainingCached != cachedStream {
+		t.Fatal("replacement deactivated a completed HLS")
+	}
+	if _, err := os.Stat(firstPaths.outDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("superseded partial HLS was not removed: %v", err)
+	}
+	if ready, err := streamOutputReady(cachedPaths); err != nil || !ready {
+		t.Fatalf("completed HLS after replacement = %v, %v; want ready", ready, err)
+	}
+}
+
+func TestLaunchPreparationSkipsSupersededFile(t *testing.T) {
+	root := t.TempDir()
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	id := strings.Repeat("c", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	operationDone := make(chan struct{})
+	staleKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	m := &Manager{
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		torrentOps:   map[string]chan struct{}{id: operationDone},
+		deletions:    make(map[string]chan struct{}),
+		downloads:    store,
+		cfg:          config.Config{DownloadPath: downloadRoot},
+	}
+	t.Cleanup(func() {
+		m.mu.Lock()
+		job := m.preparations[staleKey]
+		if job != nil {
+			job.cancel()
+		}
+		m.mu.Unlock()
+		if job != nil {
+			<-job.done
+		}
+		m.finishTorrentOperation(id, operationDone)
+	})
+
+	m.launchPreparation(magnet, id, 0)
+	m.mu.Lock()
+	staleJob := m.preparations[staleKey]
+	m.mu.Unlock()
+	if staleJob != nil {
+		t.Fatal("stale startup snapshot resurrected the superseded file")
+	}
+}
+
+func TestStartHLSPreparationSelectsOlderCachedRendition(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatalf("newDownloadStore() error = %v", err)
+	}
+
+	id := strings.Repeat("e", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatalf("upsert() error = %v", err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.finishPreparation(context.Background(), id, 0, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.failPreparation(context.Background(), id, 1, errors.New("conversion failed")); err != nil {
+		t.Fatal(err)
+	}
+
+	paths := (streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}).paths(hlsRoot)
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	m := &Manager{
+		client:     client,
+		torrents:   make(map[string]int),
+		torrentOps: make(map[string]chan struct{}),
+		deletions:  make(map[string]chan struct{}),
+		downloads:  store,
+		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	if err := m.StartHLSPreparation(context.Background(), magnet, 0); err != nil {
+		t.Fatalf("StartHLSPreparation() error = %v", err)
+	}
+
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatalf("list() error = %v", err)
+	}
+	got := downloads[0]
+	if got.Status != DownloadStatusReady {
+		t.Fatalf("status = %q, want %q", got.Status, DownloadStatusReady)
+	}
+	if got.SelectedFileIndex == nil || *got.SelectedFileIndex != 0 {
+		t.Fatalf("selectedFileIndex = %v, want 0", got.SelectedFileIndex)
+	}
+	if got.ExpiresAt.Before(time.Now().Add(downloadDefaultTTL - time.Minute)) {
+		t.Fatalf("expiresAt = %v, want a renewed lifetime", got.ExpiresAt)
+	}
+	selectedExpiry := got.ExpiresAt
+	if err := store.finishPreparation(context.Background(), id, 1, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	downloads, err = store.list(context.Background())
+	if err != nil {
+		t.Fatalf("list() after stale completion error = %v", err)
+	}
+	got = downloads[0]
+	if got.SelectedFileIndex == nil || *got.SelectedFileIndex != 0 || !got.ExpiresAt.Equal(selectedExpiry) {
+		t.Fatalf("stale completion replaced cached selection: %#v", got)
+	}
+}
+
+func TestResumePreparationsCleansFailedPayload(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	store, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatalf("newDownloadStore() error = %v", err)
+	}
+
+	id := strings.Repeat("f", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{
+		{Index: 0, Name: "episode-1.mkv"},
+		{Index: 1, Name: "episode-2.mkv"},
+	}
+	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatalf("upsert() error = %v", err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.finishPreparation(context.Background(), id, 0, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	paths := (streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}).paths(hlsRoot)
+	if err := resetStreamOutput(paths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths.masterPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := markStreamOutputReady(paths); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.failPreparation(context.Background(), id, 1, errors.New("conversion failed")); err != nil {
+		t.Fatal(err)
+	}
+	incompletePaths := (streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}).paths(hlsRoot)
+	if err := resetStreamOutput(incompletePaths); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(incompletePaths.videoPlaylist, []byte("#EXTM3U\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	payloadPath := filepath.Join(downloadRoot, id, "payload.bin")
+	if err := os.WriteFile(payloadPath, []byte("payload"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	m := &Manager{
+		client:     client,
+		torrents:   make(map[string]int),
+		torrentOps: make(map[string]chan struct{}),
+		deletions:  make(map[string]chan struct{}),
+		downloads:  store,
+		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	m.resumePreparations()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		_, err := os.Stat(payloadPath)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed payload was not cleaned during startup reconciliation")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatalf("list() error = %v", err)
+	}
+	if len(downloads) != 1 || downloads[0].Status != DownloadStatusFailed {
+		t.Fatalf("downloads = %#v, want one failed record", downloads)
+	}
+	if downloads[0].ExpiresAt.Before(time.Now().Add(downloadDefaultTTL - time.Minute)) {
+		t.Fatalf("expiresAt = %v, want cached HLS retention", downloads[0].ExpiresAt)
+	}
+	if _, err := os.Stat(incompletePaths.outDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("incomplete HLS was not removed: %v", err)
+	}
+	ready, err := streamOutputReady(paths)
+	if err != nil || !ready {
+		t.Fatalf("completed cached HLS was removed: ready=%v, err=%v", ready, err)
 	}
 }

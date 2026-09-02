@@ -2,6 +2,12 @@
 
 Cinemator (“cinema” + “torrent”) lets you instantly watch videos from any torrent magnet link.
 
+## Download lifecycle
+
+Adding a torrent with one video starts HLS preparation immediately. Torrents with multiple videos wait for a file selection. Preparation continues on the server after the browser closes, and playback can begin as soon as the first HLS segments are available.
+
+The torrent payload is temporary build input. Cinemator removes it after HLS preparation succeeds or fails. A completed HLS rendition is the retained media artifact: it remains available for seven days from completion, can be extended from the downloads list, and is removed only when it expires or is explicitly deleted. Cinemator does not impose an HLS size limit; available host storage is the operational limit.
+
 ---
 
 # Run it

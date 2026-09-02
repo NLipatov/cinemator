@@ -255,14 +255,22 @@ func (s *Server) handleDownloadAction(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
+	if r.Method != http.MethodGet && r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	magnet, fileIndex, err := parseMagnetAndFile(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if r.Method == http.MethodPost {
+		if err := s.ensureHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
+			http.Error(w, err.Error(), apiErrorStatus(err))
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
 		return
 	}
 
@@ -276,6 +284,10 @@ func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := s.ensureHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
+		http.Error(w, err.Error(), apiErrorStatus(err))
+		return
+	}
 
 	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack)
 	if err != nil {
@@ -286,6 +298,17 @@ func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) 
 		w, r,
 		"/api/hls/"+filepath.Base(filepath.Dir(playlist))+"/"+filepath.Base(playlist),
 		http.StatusFound)
+}
+
+func (s *Server) ensureHLSPreparation(ctx context.Context, magnet string, fileIndex int) error {
+	err := s.mgr.StartHLSPreparation(ctx, magnet, fileIndex)
+	if !errors.Is(err, torrent.ErrDownloadNotFound) {
+		return err
+	}
+	if _, err := s.mgr.GetTorrentFiles(ctx, magnet); err != nil {
+		return err
+	}
+	return s.mgr.StartHLSPreparation(ctx, magnet, fileIndex)
 }
 
 func parseExtendDays(r *http.Request) (int, error) {
@@ -338,6 +361,9 @@ func apiErrorStatus(err error) int {
 	}
 	if errors.Is(err, torrent.ErrDownloadNotFound) {
 		return http.StatusNotFound
+	}
+	if errors.Is(err, torrent.ErrDownloadNotReady) {
+		return http.StatusConflict
 	}
 	return http.StatusInternalServerError
 }

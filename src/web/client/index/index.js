@@ -193,7 +193,7 @@
 
     function formatExpiry(value) {
       const expires = new Date(value);
-      if (!Number.isFinite(expires.getTime())) return 'no expiry';
+      if (!Number.isFinite(expires.getTime()) || expires.getUTCFullYear() <= 1) return 'no expiry';
       const diffMs = expires.getTime() - Date.now();
       const absMs = Math.abs(diffMs);
       const units = [
@@ -209,6 +209,14 @@
     function formatDownloadSize(download) {
       const diskSize = Number.isFinite(download.diskSize) ? download.diskSize : 0;
       return `${formatBytes(diskSize)} / ${formatBytes(download.size)}`;
+    }
+
+    function formatDownloadState(download) {
+      if (download.status === 'ready') return formatExpiry(download.expiresAt);
+      if (download.status === 'preparing') return 'preparing';
+      if (download.status === 'failed') return download.preparationError || 'preparation failed';
+      if (download.status === 'expired') return 'expired';
+      return 'select a video';
     }
 
     function closeExtendMenus(except = null) {
@@ -326,17 +334,20 @@
         meta.className = 'download-meta';
         const metaText = document.createElement('span');
         metaText.className = 'download-meta-text';
-        metaText.textContent = `${formatDownloadSize(download)} · ${formatExpiry(download.expiresAt)}`;
+        metaText.textContent = `${formatDownloadSize(download)} · ${formatDownloadState(download)}`;
         meta.append(metaText);
         openBtn.append(main, meta);
 
         const actions = document.createElement('div');
         actions.className = 'download-actions';
 
-        const extendMenu = createExtendMenu(download.id);
-        if (download.id === restoreExtendID) {
-          openExtendMenu(extendMenu);
-          restoredExtendMenu = true;
+        let extendMenu = null;
+        if (download.status === 'ready') {
+          extendMenu = createExtendMenu(download.id);
+          if (download.id === restoreExtendID) {
+            openExtendMenu(extendMenu);
+            restoredExtendMenu = true;
+          }
         }
 
         const deleteBtn = document.createElement('button');
@@ -347,7 +358,8 @@
         deleteBtn.title = 'Delete';
         deleteBtn.setAttribute('aria-label', 'Delete');
 
-        actions.append(extendMenu, deleteBtn);
+        if (extendMenu) actions.appendChild(extendMenu);
+        actions.appendChild(deleteBtn);
 
         row.append(openBtn, actions);
         list.appendChild(row);
@@ -414,6 +426,9 @@
       setActiveDownload(download.id);
       $('magnet').value = download.magnet;
       setFileList(download.files);
+      if (Number.isInteger(download.selectedFileIndex)) {
+        $('filelist').value = String(download.selectedFileIndex);
+      }
       $('step-files').style.display = '';
       $('step-tracks').style.display = 'none';
       $('player-block').style.display = 'none';
@@ -600,6 +615,11 @@
       showMsg('fileMsg', 'Loading track info…', false, true);
       $('step-tracks').style.display = 'none';
       try {
+        const prepare = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}`, {
+          method: 'POST',
+          signal: request.signal,
+        });
+        if (!prepare.ok) throw new Error((await prepare.text()).trim() || 'Could not start preparation');
         const res = await apiFetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal });
         if (!res.ok) throw new Error((await res.text()).trim() || 'Could not load media info');
         const info = await res.json();

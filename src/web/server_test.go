@@ -61,14 +61,26 @@ type fakeTorrentManager struct {
 	filesErr  error
 	events    <-chan struct{}
 	prepare   string
+	start     func() error
+	getFiles  func()
 }
 
 func (m fakeTorrentManager) GetTorrentFiles(context.Context, string) ([]torrent.FileInfo, error) {
+	if m.getFiles != nil {
+		m.getFiles()
+	}
 	return nil, m.filesErr
 }
 
 func (m fakeTorrentManager) GetMediaInfo(context.Context, string, int) (media.MediaInfo, error) {
 	return media.MediaInfo{}, nil
+}
+
+func (m fakeTorrentManager) StartHLSPreparation(context.Context, string, int) error {
+	if m.start != nil {
+		return m.start()
+	}
+	return nil
 }
 
 func (m fakeTorrentManager) PrepareHlsStream(context.Context, string, int, int, int) (string, error) {
@@ -221,11 +233,17 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:       "unsupported method",
+			name:       "start background preparation",
 			method:     http.MethodPost,
 			target:     "/api/hls/prepare?magnet=magnet&file=0",
+			wantStatus: http.StatusAccepted,
+		},
+		{
+			name:       "unsupported method",
+			method:     http.MethodPut,
+			target:     "/api/hls/prepare?magnet=magnet&file=0",
 			wantStatus: http.StatusMethodNotAllowed,
-			wantAllow:  http.MethodGet,
+			wantAllow:  http.MethodGet + ", " + http.MethodPost,
 		},
 	}
 
@@ -247,6 +265,34 @@ func TestHandlePrepareHlsStreamValidatesRequest(t *testing.T) {
 				t.Fatalf("Allow = %q, want %q", got, tt.wantAllow)
 			}
 		})
+	}
+}
+
+func TestHandlePrepareHlsStreamCreatesMissingDownload(t *testing.T) {
+	startAttempts := 0
+	filesRequested := false
+	mgr := fakeTorrentManager{
+		prepare: filepath.Join(t.TempDir(), "stream", "master.m3u8"),
+		start: func() error {
+			startAttempts++
+			if startAttempts == 1 {
+				return torrent.ErrDownloadNotFound
+			}
+			return nil
+		},
+		getFiles: func() { filesRequested = true },
+	}
+	server := Server{mgr: mgr, cfg: config.Load()}
+	req := httptest.NewRequest(http.MethodGet, "/api/hls/prepare?magnet=magnet&file=0", nil)
+	rec := httptest.NewRecorder()
+
+	server.handlePrepareHlsStream(rec, req)
+
+	if rec.Code != http.StatusFound {
+		t.Fatalf("status = %d, want %d; body = %q", rec.Code, http.StatusFound, rec.Body.String())
+	}
+	if !filesRequested || startAttempts != 2 {
+		t.Fatalf("metadata requested = %v, start attempts = %d; want true, 2", filesRequested, startAttempts)
 	}
 }
 
