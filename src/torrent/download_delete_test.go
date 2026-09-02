@@ -169,6 +169,79 @@ func TestRetainTorrentDoesNotAddDuringConcurrentDownloadDeletion(t *testing.T) {
 	}
 }
 
+func TestDeleteDownloadCancelsPreparationBeforeItRetainsTorrent(t *testing.T) {
+	root := t.TempDir()
+	hlsRoot := filepath.Join(root, "hls")
+	downloadRoot := filepath.Join(root, "downloads")
+	if err := os.MkdirAll(hlsRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatalf("NewClient() error = %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	downloads, err := newDownloadStore(downloadRoot)
+	if err != nil {
+		t.Fatalf("newDownloadStore() error = %v", err)
+	}
+
+	id := strings.Repeat("d", 40)
+	magnet := "magnet:?xt=urn:btih:" + id
+	files := []FileInfo{{Index: 0, Name: "feature.mkv", Size: 10}}
+	if _, err := downloads.upsert(context.Background(), id, magnet, files); err != nil {
+		t.Fatal(err)
+	}
+	operationDone := make(chan struct{})
+
+	m := &Manager{
+		client:     client,
+		active:     make(map[streamKey]*streamInfo),
+		streamOps:  make(map[streamKey]chan struct{}),
+		torrents:   make(map[string]int),
+		torrentOps: map[string]chan struct{}{id: operationDone},
+		deletions:  make(map[string]chan struct{}),
+		downloads:  downloads,
+		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+	}
+	m.launchPreparation(magnet, id, 0)
+
+	deleteResult := make(chan error, 1)
+	go func() { deleteResult <- m.DeleteDownload(context.Background(), id) }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.mu.Lock()
+		deleting := m.deletions[id] != nil
+		m.mu.Unlock()
+		if deleting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("DeleteDownload() did not reserve deletion")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	m.finishTorrentOperation(id, operationDone)
+
+	select {
+	case err := <-deleteResult:
+		if err != nil {
+			t.Fatalf("DeleteDownload() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DeleteDownload() did not finish")
+	}
+
+	deadline = time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, exists := client.Torrent(metainfo.NewHashFromHex(id)); exists {
+			t.Fatal("background preparation re-added torrent after deletion")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestActivateCachedStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
 	root := t.TempDir()
 	id := strings.Repeat("b", 40)

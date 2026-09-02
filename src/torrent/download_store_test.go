@@ -134,6 +134,51 @@ func TestDownloadStorePreparationFailureCanBeRetried(t *testing.T) {
 	}
 }
 
+func TestBeginPreparationClearsPreviousExpiry(t *testing.T) {
+	store, err := newDownloadStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("e", 40)
+	files := []FileInfo{{Index: 0, Name: "feature.mkv", Size: 10}}
+	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
+		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	}
+	completedAt := time.Now().UTC().Add(-downloadDefaultTTL - time.Hour)
+	if err := store.finishPreparation(context.Background(), id, 0, completedAt); err != nil {
+		t.Fatal(err)
+	}
+
+	preparing, shouldStart, err := store.beginPreparation(context.Background(), id, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !shouldStart || preparing.Status != DownloadStatusPreparing {
+		t.Fatalf("beginPreparation() = %#v, %v; want preparing, true", preparing, shouldStart)
+	}
+	if !preparing.ExpiresAt.IsZero() {
+		t.Fatalf("preparing expiry = %v, want zero", preparing.ExpiresAt)
+	}
+
+	downloads, err := store.list(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(downloads) != 1 || downloads[0].Status != DownloadStatusPreparing {
+		t.Fatalf("list() = %#v, want one preparing download", downloads)
+	}
+	expired, err := store.expiredIDs(context.Background(), time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(expired) != 0 {
+		t.Fatalf("expiredIDs() = %v, want none", expired)
+	}
+}
+
 func TestCleanInfoHashRejectsBadIDs(t *testing.T) {
 	for _, id := range []string{"", "abc", strings.Repeat("x", 40), strings.Repeat("a", 39)} {
 		if _, err := cleanInfoHash(id); !errors.Is(err, ErrBadDownloadID) {

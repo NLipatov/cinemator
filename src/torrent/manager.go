@@ -19,17 +19,23 @@ import (
 )
 
 type Manager struct {
-	client     *torrent.Client
-	active     map[streamKey]*streamInfo
-	streamOps  map[streamKey]chan struct{} // Serializes output lifecycle changes for each stream.
-	torrents   map[string]int              // References held by preparing, active, and cleaning streams.
-	torrentOps map[string]chan struct{}    // Serializes add and drop for each torrent.
-	deletions  map[string]chan struct{}    // Prevents new streams while a download is being deleted.
-	sources    *rangeServer
-	downloads  *downloadStore
-	events     *downloadEventBroadcaster
-	mu         sync.Mutex
-	cfg        config.Config
+	client       *torrent.Client
+	active       map[streamKey]*streamInfo
+	preparations map[streamKey]*preparationJob
+	streamOps    map[streamKey]chan struct{} // Serializes output lifecycle changes for each stream.
+	torrents     map[string]int              // References held by preparing, active, and cleaning streams.
+	torrentOps   map[string]chan struct{}    // Serializes add and drop for each torrent.
+	deletions    map[string]chan struct{}    // Prevents new streams while a download is being deleted.
+	sources      *rangeServer
+	downloads    *downloadStore
+	events       *downloadEventBroadcaster
+	mu           sync.Mutex
+	cfg          config.Config
+}
+
+type preparationJob struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func NewManager(appConfig config.Config) (*Manager, error) {
@@ -56,16 +62,17 @@ func NewManager(appConfig config.Config) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		client:     client,
-		active:     make(map[streamKey]*streamInfo),
-		streamOps:  make(map[streamKey]chan struct{}),
-		torrents:   make(map[string]int),
-		torrentOps: make(map[string]chan struct{}),
-		deletions:  make(map[string]chan struct{}),
-		sources:    sources,
-		downloads:  downloads,
-		events:     newDownloadEventBroadcaster(),
-		cfg:        appConfig,
+		client:       client,
+		active:       make(map[streamKey]*streamInfo),
+		preparations: make(map[streamKey]*preparationJob),
+		streamOps:    make(map[streamKey]chan struct{}),
+		torrents:     make(map[string]int),
+		torrentOps:   make(map[string]chan struct{}),
+		deletions:    make(map[string]chan struct{}),
+		sources:      sources,
+		downloads:    downloads,
+		events:       newDownloadEventBroadcaster(),
+		cfg:          appConfig,
 	}
 	go m.viewerWatcher()
 	go m.resumePreparations()
@@ -133,17 +140,33 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 }
 
 func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
+	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
+	ctx, cancel := context.WithCancel(context.Background())
+	job := &preparationJob{cancel: cancel, done: make(chan struct{})}
+	m.mu.Lock()
+	if m.preparations == nil {
+		m.preparations = make(map[streamKey]*preparationJob)
+	}
+	if m.deletions[hash] != nil || m.preparations[key] != nil {
+		m.mu.Unlock()
+		cancel()
+		return
+	}
+	m.preparations[key] = job
+	m.mu.Unlock()
+
 	go func() {
-		info, err := m.GetMediaInfo(context.Background(), magnet, fileIndex)
+		defer cancel()
+		defer m.finishPreparationJob(key, job)
+		info, err := m.GetMediaInfo(ctx, magnet, fileIndex)
 		if err == nil {
-			key := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
-			_, err = m.prepareHLSRendition(context.Background(), magnet, key, info, -1)
+			_, err = m.prepareHLSRendition(ctx, magnet, key, info, -1)
 			if err == nil {
 				ready, readyErr := streamOutputReady(key.paths(m.cfg.HLSPath))
 				if readyErr != nil {
 					err = readyErr
 				} else if ready {
-					err = m.downloads.finishPreparation(context.Background(), hash, fileIndex, time.Now())
+					err = m.downloads.finishPreparation(ctx, hash, fileIndex, time.Now())
 					if err == nil {
 						m.cleanupTransientPayload(hash, nil)
 					}
@@ -151,6 +174,9 @@ func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
 			}
 		}
 		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return
+			}
 			log.Printf("HLS preparation failed: hash=%s, file=%d, err=%v", hash, fileIndex, err)
 			if storeErr := m.downloads.failPreparation(context.Background(), hash, fileIndex, err); storeErr != nil && !errors.Is(storeErr, ErrDownloadNotFound) {
 				log.Printf("failed to persist HLS preparation error: %v", storeErr)
@@ -159,6 +185,15 @@ func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
 		}
 		m.notifyDownloadsChanged()
 	}()
+}
+
+func (m *Manager) finishPreparationJob(key streamKey, job *preparationJob) {
+	m.mu.Lock()
+	if m.preparations[key] == job {
+		delete(m.preparations, key)
+	}
+	close(job.done)
+	m.mu.Unlock()
 }
 
 func (m *Manager) resumePreparations() {
@@ -552,6 +587,9 @@ func (m *Manager) DeleteDownload(ctx context.Context, id string) error {
 	}
 	defer m.finishDownloadDeletion(id, deletionDone)
 
+	if err := m.cancelPreparations(ctx, id); err != nil {
+		return err
+	}
 	keys := m.streamKeysForDownload(id)
 	for _, key := range keys {
 		if err := m.cleanup(ctx, key); err != nil {
@@ -572,6 +610,24 @@ func (m *Manager) DeleteDownload(ctx context.Context, id string) error {
 		return err
 	}
 	m.notifyDownloadsChanged()
+	return nil
+}
+
+func (m *Manager) cancelPreparations(ctx context.Context, id string) error {
+	m.mu.Lock()
+	jobs := make([]*preparationJob, 0)
+	for key, job := range m.preparations {
+		if key.InfoHash == id {
+			job.cancel()
+			jobs = append(jobs, job)
+		}
+	}
+	m.mu.Unlock()
+	for _, job := range jobs {
+		if err := waitForDone(ctx, job.done); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

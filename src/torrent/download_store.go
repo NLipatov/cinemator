@@ -269,6 +269,7 @@ func (s *downloadStore) beginPreparation(ctx context.Context, id string, fileInd
 	download.SelectedFileIndex = intPointer(fileIndex)
 	download.Status = DownloadStatusPreparing
 	download.ReadyAt = time.Time{}
+	download.ExpiresAt = time.Time{}
 	download.PreparationErr = ""
 	download.UpdatedAt = now
 	download.LastAccessedAt = now
