@@ -67,10 +67,7 @@
     let subtitleDelay = parseFloat(localStorage.getItem('subtitle-delay') || '0');
     let msgTimeout = null;
     let subtitleWaitTimer = null;
-    let playbackRecoveryInFlight = false;
-    let lastPlaybackRecoveryAt = 0;
     let lastStreamActivityAt = 0;
-    let playbackRecoveryAttempts = 0;
     let downloadCatalog = [];
     let downloadsLoading = false;
     let downloadsRefreshQueued = false;
@@ -81,8 +78,6 @@
     let activeDownloadID = null;
     let requestSeq = 0;
     let flowRequestController = null;
-    const recoveryThrottleMs = 5000;
-    const maxPlaybackRecoveryAttempts = 3;
     const downloadFallbackInitialMs = 5000;
     const downloadFallbackPollingMs = 30000;
     const extendOptions = [
@@ -677,7 +672,7 @@
       }
     };
 
-    async function startPlayback(resumeTime = 0, { keepPlayerVisible = false } = {}) {
+    async function startPlayback(resumeTime = 0) {
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
       const audio = $('audioSelect').value || '0';
@@ -691,15 +686,12 @@
       const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
       destroyVideoAndHls({ resetLayout: !wasPlaying });
-      $('player-block').style.display = keepPlayerVisible ? '' : 'none';
+      $('player-block').style.display = 'none';
       removeWarning();
       showWarning();
       showMsg('trackMsg', '');
-      showMsg('playerMsg', keepPlayerVisible ? 'Restoring stream...' : '', false, keepPlayerVisible);
+      showMsg('playerMsg', '');
       lastStreamActivityAt = Date.now();
-      if (!keepPlayerVisible) {
-        playbackRecoveryAttempts = 0;
-      }
 
       if (subtitleSelected) {
         clearSubtitleWait();
@@ -724,11 +716,7 @@
         if (isStale(requestId)) return;
         removeWarning();
         const msg = e.message || 'Could not start stream';
-        if (keepPlayerVisible) {
-          showMsg('playerMsg', msg, true);
-        } else {
-          showMsg('trackMsg', msg, true);
-        }
+        showMsg('trackMsg', msg, true);
         return;
       } finally {
         finishFlowRequest(request);
@@ -789,38 +777,9 @@
       }
     }
 
-    function restorePlayback() {
-      const video = $('video');
-      if (!video || $('player-block').style.display === 'none') return false;
-
-      const now = Date.now();
-      if (playbackRecoveryInFlight || now - lastPlaybackRecoveryAt < recoveryThrottleMs) {
-        return false;
-      }
-      if (playbackRecoveryAttempts >= maxPlaybackRecoveryAttempts) {
-        return false;
-      }
-
-      playbackRecoveryInFlight = true;
-      lastPlaybackRecoveryAt = now;
-      playbackRecoveryAttempts++;
-      const resumeTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-      startPlayback(resumeTime, { keepPlayerVisible: true }).finally(() => {
-        playbackRecoveryInFlight = false;
-      });
-      return true;
-    }
-
     function showPlaybackError(details) {
       removeWarning();
       showMsg('playerMsg', 'Playback error: ' + (details || 'Fatal error'), true);
-    }
-
-    function attachPlaybackErrorRecovery(video) {
-      video.addEventListener('error', () => {
-        if (restorePlayback()) return;
-        showPlaybackError('Native media error');
-      });
     }
 
     function playHls(src, enableSubtitles, resumeTime = 0) {
@@ -828,7 +787,7 @@
       video.style.opacity = 0;
       setTimeout(() => { video.style.opacity = 1; }, 120);
       lastStreamActivityAt = Date.now();
-      attachPlaybackErrorRecovery(video);
+      video.addEventListener('error', () => showPlaybackError('Native media error'));
 
       const reapplySubtitleDelay = () => applySubtitleDelay(video, subtitleDelay);
       if (enableSubtitles) {
@@ -844,7 +803,6 @@
       }
       function markStreamActive() {
         lastStreamActivityAt = Date.now();
-        playbackRecoveryAttempts = 0;
         showMsg('playerMsg', '');
         hideWarningOnce();
       }
@@ -883,7 +841,6 @@
             return;
           }
           if (data.fatal) {
-            if (restorePlayback()) return;
             showPlaybackError(data.details || 'Fatal error');
           }
         });
