@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/NLipatov/cinemator/compare/0.7.0...0.7.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* **streaming:** remove redundant playback recovery ([#32](https://github.com/NLipatov/cinemator/issues/32)) ([37da389](https://github.com/NLipatov/cinemator/commit/37da3895cab53debd4df5f69e4a596497382cbc5))
+
 ## [0.7.0](https://github.com/NLipatov/cinemator/compare/0.6.1...0.7.0) (2026-09-02)
 
 
