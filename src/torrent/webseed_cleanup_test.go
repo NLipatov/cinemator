@@ -16,7 +16,7 @@ import (
 	"github.com/anacrolix/torrent/storage"
 )
 
-func TestTerminalPreparationCleanupWaitsForCanceledWebseed(t *testing.T) {
+func TestTerminalPreparationCleanupWithDelayedWebseed(t *testing.T) {
 	requested := make(chan struct{}, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
@@ -29,11 +29,19 @@ func TestTerminalPreparationCleanupWaitsForCanceledWebseed(t *testing.T) {
 	root := t.TempDir()
 	clientConfig := torrentlib.TestingConfig(t)
 	clientConfig.DefaultStorage = storage.NewFileByInfoHash(root)
+	canceled, release := make(chan struct{}), make(chan struct{})
+	clientConfig.WebTransport = webseedTransportFunc(func(r *http.Request) (*http.Response, error) {
+		response, err := http.DefaultTransport.RoundTrip(r)
+		close(canceled)
+		<-release
+		return response, err
+	})
 	client, err := torrentlib.NewClient(clientConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { client.Close() })
+	t.Cleanup(func() { close(release) })
 	piece := bytes.Repeat([]byte{42}, 16<<10)
 	hash := sha1.Sum(piece)
 	info := metainfo.Info{Name: "movie.mp4", PieceLength: int64(len(piece)), Length: int64(len(piece)), Pieces: hash[:]}
@@ -79,4 +87,16 @@ func TestTerminalPreparationCleanupWaitsForCanceledWebseed(t *testing.T) {
 	if len(entries) != 1 || entries[0].Name() != downloadStoreDirName {
 		t.Fatalf("cleanup retained payload: %v", entries)
 	}
+	if err := waitForDone(ctx, canceled); err != nil {
+		t.Fatal("HTTP request did not return after cancellation:", err)
+	}
+	// Keep the canceled request registered through the next five-second scheduler
+	// tick. Its torrent is already gone, but sliceProcessor cannot remove it yet.
+	time.Sleep(6 * time.Second)
+}
+
+type webseedTransportFunc func(*http.Request) (*http.Response, error)
+
+func (f webseedTransportFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
