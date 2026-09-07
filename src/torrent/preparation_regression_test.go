@@ -2,6 +2,7 @@ package torrent
 
 import (
 	"context"
+	"crypto/sha1"
 	"errors"
 	"os"
 	"path/filepath"
@@ -112,15 +113,13 @@ func TestStartStreamWaitsForTorrentCleanup(t *testing.T) {
 			}
 			t.Cleanup(func() { client.Close() })
 			t.Cleanup(unblock)
-			info, err := bencode.Marshal(metainfo.Info{Name: "movie.mkv", Length: 1, PieceLength: 1, Pieces: make([]byte, 20)})
+			data := []byte{0}
+			pieceHash := sha1.Sum(data)
+			info, err := bencode.Marshal(metainfo.Info{Name: "movie.mkv", Length: 1, PieceLength: 1, Pieces: pieceHash[:]})
 			if err != nil {
 				t.Fatal(err)
 			}
 			meta := metainfo.MetaInfo{InfoBytes: info}
-			source, err := client.AddTorrent(&meta)
-			if err != nil {
-				t.Fatal(err)
-			}
 			id := meta.HashInfoBytes().HexString()
 			magnet := "magnet:?xt=urn:btih:" + id
 			if _, err := store.upsert(t.Context(), id, magnet, []FileInfo{{Index: 0, Name: "movie.mkv", Size: 1}}); err != nil {
@@ -130,7 +129,13 @@ func TestStartStreamWaitsForTorrentCleanup(t *testing.T) {
 				t.Fatal(err)
 			}
 			payload := filepath.Join(store.downloadDir(id), "movie.mkv")
-			if err := os.WriteFile(payload, []byte{0}, 0644); err != nil {
+			if err := os.WriteFile(payload, data, 0644); err != nil {
+				t.Fatal(err)
+			}
+			// Create valid data before background verification starts, so the file
+			// cannot be renamed to .part while cleanup is waiting to close storage.
+			source, err := client.AddTorrent(&meta)
+			if err != nil {
 				t.Fatal(err)
 			}
 			key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
