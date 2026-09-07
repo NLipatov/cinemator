@@ -217,6 +217,12 @@ func TestStartHLSPreparationRestartsMissingRuntimeJob(t *testing.T) {
 		t.Fatalf("newDownloadStore() error = %v", err)
 	}
 
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+
 	id := strings.Repeat("d", 40)
 	magnet := "magnet:?xt=urn:btih:" + id
 	if _, err := store.upsert(context.Background(), id, magnet, []FileInfo{{Index: 0, Name: "feature.mkv"}}); err != nil {
@@ -226,22 +232,20 @@ func TestStartHLSPreparationRestartsMissingRuntimeJob(t *testing.T) {
 		t.Fatalf("beginPreparation() = %v", err)
 	}
 
-	operationDone := make(chan struct{})
 	key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
 	m := &Manager{
-		active:     make(map[streamKey]*streamInfo),
-		streamOps:  make(map[streamKey]chan struct{}),
-		torrents:   make(map[string]int),
-		torrentOps: map[string]chan struct{}{id: operationDone},
-		deletions:  make(map[string]chan struct{}),
-		downloads:  store,
-		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		client:    client,
+		active:    make(map[streamKey]*streamInfo),
+		streamOps: make(map[streamKey]chan struct{}),
+		torrents:  make(map[string]int),
+		deletions: make(map[string]chan struct{}),
+		downloads: store,
+		cfg:       config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	t.Cleanup(func() {
 		if err := m.cleanup(context.Background(), key); err != nil {
 			t.Error(err)
 		}
-		m.finishTorrentOperation(id, operationDone)
 	})
 
 	if err := m.StartHLSPreparation(context.Background(), magnet, 0); err != nil {
@@ -288,18 +292,16 @@ func TestStartHLSPreparationReplacesPreviousFile(t *testing.T) {
 	}
 	t.Cleanup(func() { client.Close() })
 
-	operationDone := make(chan struct{})
 	firstKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
 	secondKey := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
 	m := &Manager{
-		client:     client,
-		active:     make(map[streamKey]*streamInfo),
-		streamOps:  make(map[streamKey]chan struct{}),
-		torrents:   make(map[string]int),
-		torrentOps: map[string]chan struct{}{id: operationDone},
-		deletions:  make(map[string]chan struct{}),
-		downloads:  store,
-		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		client:    client,
+		active:    make(map[streamKey]*streamInfo),
+		streamOps: make(map[streamKey]chan struct{}),
+		torrents:  make(map[string]int),
+		deletions: make(map[string]chan struct{}),
+		downloads: store,
+		cfg:       config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	t.Cleanup(func() {
 		for _, key := range m.streamKeysForDownload(id) {
@@ -307,7 +309,6 @@ func TestStartHLSPreparationReplacesPreviousFile(t *testing.T) {
 				t.Error(err)
 			}
 		}
-		m.finishTorrentOperation(id, operationDone)
 	})
 
 	if err := m.StartHLSPreparation(context.Background(), magnet, 0); err != nil {
@@ -353,6 +354,12 @@ func TestStartHLSPreparationFinishesPersistedReplacementAfterCancellation(t *tes
 		t.Fatal(err)
 	}
 
+	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { client.Close() })
+
 	id := strings.Repeat("f", 40)
 	magnet := "magnet:?xt=urn:btih:" + id
 	files := []FileInfo{
@@ -372,15 +379,14 @@ func TestStartHLSPreparationFinishesPersistedReplacementAfterCancellation(t *tes
 		cancel:  func() { close(firstCanceled) },
 		runDone: make(chan struct{}),
 	}
-	torrentOperationDone := make(chan struct{})
 	m := &Manager{
-		active:     map[streamKey]*streamInfo{firstKey: firstJob},
-		streamOps:  make(map[streamKey]chan struct{}),
-		torrents:   make(map[string]int),
-		torrentOps: map[string]chan struct{}{id: torrentOperationDone},
-		deletions:  make(map[string]chan struct{}),
-		downloads:  store,
-		cfg:        config.Config{HLSPath: filepath.Join(root, "hls"), DownloadPath: downloadRoot},
+		client:    client,
+		active:    map[streamKey]*streamInfo{firstKey: firstJob},
+		streamOps: make(map[streamKey]chan struct{}),
+		torrents:  make(map[string]int),
+		deletions: make(map[string]chan struct{}),
+		downloads: store,
+		cfg:       config.Config{HLSPath: filepath.Join(root, "hls"), DownloadPath: downloadRoot},
 	}
 	go func() {
 		<-releaseFirst
@@ -390,7 +396,6 @@ func TestStartHLSPreparationFinishesPersistedReplacementAfterCancellation(t *tes
 		if err := m.cleanup(context.Background(), secondKey); err != nil {
 			t.Error(err)
 		}
-		m.finishTorrentOperation(id, torrentOperationDone)
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -494,7 +499,6 @@ func TestStartHLSPreparationCleansSupersededPartialOutput(t *testing.T) {
 	}
 	cachedStream := &streamInfo{paths: cachedPaths, completed: true}
 
-	operationDone := make(chan struct{})
 	secondKey := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
 	m := &Manager{
 		client: client,
@@ -502,18 +506,16 @@ func TestStartHLSPreparationCleansSupersededPartialOutput(t *testing.T) {
 			firstKey:  firstStream,
 			cachedKey: cachedStream,
 		},
-		streamOps:  make(map[streamKey]chan struct{}),
-		torrents:   make(map[string]int),
-		torrentOps: map[string]chan struct{}{id: operationDone},
-		deletions:  make(map[string]chan struct{}),
-		downloads:  store,
-		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		streamOps: make(map[streamKey]chan struct{}),
+		torrents:  make(map[string]int),
+		deletions: make(map[string]chan struct{}),
+		downloads: store,
+		cfg:       config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	t.Cleanup(func() {
 		if err := m.cleanup(context.Background(), secondKey); err != nil {
 			t.Error(err)
 		}
-		m.finishTorrentOperation(id, operationDone)
 	})
 
 	if err := m.StartHLSPreparation(context.Background(), magnet, 1); err != nil {

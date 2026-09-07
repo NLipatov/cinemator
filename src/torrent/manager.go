@@ -218,7 +218,10 @@ func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
 	if _, err := m.startStream(context.Background(), magnet, key); err != nil {
 		m.recordPreparationFailure(hash, fileIndex, err)
 		m.cleanupTransientPayload(hash, nil)
-	} else if ready, err := streamOutputReady(key.paths(m.cfg.HLSPath)); err == nil && ready {
+	} else if ready, err := streamOutputReady(key.paths(m.cfg.HLSPath)); err != nil {
+		log.Printf("failed to inspect HLS preparation output: key=%v, err=%v", key, err)
+		m.recordPreparationFailure(hash, fileIndex, err)
+	} else if ready {
 		// The rendition may have completed between beginPreparation and startStream.
 		if err := m.downloads.finishPreparation(context.Background(), hash, fileIndex, time.Now()); err != nil {
 			log.Printf("failed to persist cached HLS preparation: key=%v, err=%v", key, err)
@@ -447,6 +450,16 @@ func (m *Manager) startStream(ctx context.Context, magnet string, key streamKey)
 		if m.deletions[key.InfoHash] != nil {
 			m.mu.Unlock()
 			m.finishStreamOperation(key, operationDone)
+			continue
+		}
+		// Cleanup reserves torrentOps before checking active streams under m.mu.
+		// Publish under the same lock only after that operation has finished.
+		if torrentDone := m.torrentOps[key.InfoHash]; torrentDone != nil {
+			m.mu.Unlock()
+			m.finishStreamOperation(key, operationDone)
+			if err := waitForDone(ctx, torrentDone); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		streamCtx, cancel := context.WithCancel(context.Background())

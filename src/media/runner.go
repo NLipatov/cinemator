@@ -19,13 +19,13 @@ func runCommand(ctx context.Context, stdin io.Reader, name string, args ...strin
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
 	runErr := cmd.Run()
-	if ctx.Err() != nil {
-		runErr = fmt.Errorf("%s canceled: %w", name, ctx.Err())
-	} else if runErr != nil {
-		runErr = fmt.Errorf("%s failed: %w", name, runErr)
-	}
 	if runErr == nil {
 		return outBuf.Bytes(), nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		runErr = fmt.Errorf("%s canceled: %w", name, ctxErr)
+	} else {
+		runErr = fmt.Errorf("%s failed: %w", name, runErr)
 	}
 	var parts []string
 	if errBuf.Len() > 0 {

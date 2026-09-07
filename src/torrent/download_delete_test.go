@@ -169,7 +169,7 @@ func TestRetainTorrentDoesNotAddDuringConcurrentDownloadDeletion(t *testing.T) {
 	}
 }
 
-func TestDeleteDownloadCancelsPreparationBeforeItRetainsTorrent(t *testing.T) {
+func TestDeleteDownloadCancelsQueuedPreparation(t *testing.T) {
 	root := t.TempDir()
 	hlsRoot := filepath.Join(root, "hls")
 	downloadRoot := filepath.Join(root, "downloads")
@@ -196,52 +196,40 @@ func TestDeleteDownloadCancelsPreparationBeforeItRetainsTorrent(t *testing.T) {
 	if _, err := downloads.beginPreparation(context.Background(), id, 0); err != nil {
 		t.Fatal(err)
 	}
-	operationDone := make(chan struct{})
-
 	m := &Manager{
-		client:     client,
-		active:     make(map[streamKey]*streamInfo),
-		streamOps:  make(map[streamKey]chan struct{}),
-		torrents:   make(map[string]int),
-		torrentOps: map[string]chan struct{}{id: operationDone},
-		deletions:  make(map[string]chan struct{}),
-		downloads:  downloads,
-		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		client:    client,
+		active:    make(map[streamKey]*streamInfo),
+		streamOps: make(map[streamKey]chan struct{}),
+		torrents:  make(map[string]int),
+		deletions: make(map[string]chan struct{}),
+		downloads: downloads,
+		cfg:       config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	m.launchPreparation(magnet, id, 0)
-
-	deleteResult := make(chan error, 1)
-	go func() { deleteResult <- m.DeleteDownload(context.Background(), id) }()
-	deadline := time.Now().Add(time.Second)
-	for {
-		m.mu.Lock()
-		deleting := m.deletions[id] != nil
-		m.mu.Unlock()
-		if deleting {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("DeleteDownload() did not reserve deletion")
-		}
-		time.Sleep(time.Millisecond)
+	key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	m.mu.Lock()
+	job := m.active[key]
+	m.mu.Unlock()
+	if job == nil {
+		t.Fatal("preparation was not started")
 	}
-	m.finishTorrentOperation(id, operationDone)
-
+	t.Cleanup(func() {
+		if err := m.cleanup(context.Background(), key); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := m.DeleteDownload(ctx, id); err != nil {
+		t.Fatalf("DeleteDownload() error = %v", err)
+	}
 	select {
-	case err := <-deleteResult:
-		if err != nil {
-			t.Fatalf("DeleteDownload() error = %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("DeleteDownload() did not finish")
+	case <-job.runDone:
+	default:
+		t.Fatal("deletion returned while background preparation was still running")
 	}
-
-	deadline = time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if _, exists := client.Torrent(metainfo.NewHashFromHex(id)); exists {
-			t.Fatal("background preparation re-added torrent after deletion")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if _, exists := client.Torrent(metainfo.NewHashFromHex(id)); exists {
+		t.Fatal("background preparation retained torrent after deletion")
 	}
 }
 
