@@ -28,12 +28,21 @@ func Load() Config {
 	return Config{
 		HLSPath:       stringEnv("CINEMATOR_HLS_PATH", defaultHlsPath),
 		DownloadPath:  stringEnv("CINEMATOR_DOWNLOAD_PATH", defaultDownloadPath),
-		ViewerTimeout: defaultViewerTimeout,
+		ViewerTimeout: durationEnv("CINEMATOR_VIEWER_TIMEOUT", defaultViewerTimeout),
 		HTTPPort:      intEnv("CINEMATOR_HTTP_PORT", defaultHTTPPort),
 		TorrentPort:   intEnv("CINEMATOR_TORRENT_PORT", defaultTorrentPort),
 		PasswordHash:  stringEnv("CINEMATOR_PASSWORD_HASH", ""),
 		SessionSecret: stringEnv("CINEMATOR_SESSION_SECRET", ""),
 	}
+}
+
+func durationEnv(key string, fallback time.Duration) time.Duration {
+	value := os.Getenv(key)
+	duration, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return max(0, duration)
 }
 
 func stringEnv(key, fallback string) string {
