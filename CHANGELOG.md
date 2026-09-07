@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/NLipatov/cinemator/compare/0.7.1...0.7.2) (2026-09-07)
+
+
+### Bug Fixes
+
+* **streaming:** simplify HLS lifecycle and torrent cleanup ([#34](https://github.com/NLipatov/cinemator/issues/34)) ([7bd96d0](https://github.com/NLipatov/cinemator/commit/7bd96d00278f271f2f8661533dd640c6b9bc0b03))
+
 ## [0.7.1](https://github.com/NLipatov/cinemator/compare/0.7.0...0.7.1) (2026-09-03)
 
 
