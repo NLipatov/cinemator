@@ -169,7 +169,7 @@ func TestRetainTorrentDoesNotAddDuringConcurrentDownloadDeletion(t *testing.T) {
 	}
 }
 
-func TestDeleteDownloadCancelsPreparationBeforeItRetainsTorrent(t *testing.T) {
+func TestDeleteDownloadCancelsQueuedPreparation(t *testing.T) {
 	root := t.TempDir()
 	hlsRoot := filepath.Join(root, "hls")
 	downloadRoot := filepath.Join(root, "downloads")
@@ -193,55 +193,43 @@ func TestDeleteDownloadCancelsPreparationBeforeItRetainsTorrent(t *testing.T) {
 	if _, err := downloads.upsert(context.Background(), id, magnet, files); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := downloads.beginPreparation(context.Background(), id, 0); err != nil {
+	if _, err := downloads.beginPreparation(context.Background(), id, 0); err != nil {
 		t.Fatal(err)
 	}
-	operationDone := make(chan struct{})
-
 	m := &Manager{
-		client:     client,
-		active:     make(map[streamKey]*streamInfo),
-		streamOps:  make(map[streamKey]chan struct{}),
-		torrents:   make(map[string]int),
-		torrentOps: map[string]chan struct{}{id: operationDone},
-		deletions:  make(map[string]chan struct{}),
-		downloads:  downloads,
-		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		client:    client,
+		active:    make(map[streamKey]*streamInfo),
+		streamOps: make(map[streamKey]chan struct{}),
+		torrents:  make(map[string]int),
+		deletions: make(map[string]chan struct{}),
+		downloads: downloads,
+		cfg:       config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	m.launchPreparation(magnet, id, 0)
-
-	deleteResult := make(chan error, 1)
-	go func() { deleteResult <- m.DeleteDownload(context.Background(), id) }()
-	deadline := time.Now().Add(time.Second)
-	for {
-		m.mu.Lock()
-		deleting := m.deletions[id] != nil
-		m.mu.Unlock()
-		if deleting {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("DeleteDownload() did not reserve deletion")
-		}
-		time.Sleep(time.Millisecond)
+	key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
+	m.mu.Lock()
+	job := m.active[key]
+	m.mu.Unlock()
+	if job == nil {
+		t.Fatal("preparation was not started")
 	}
-	m.finishTorrentOperation(id, operationDone)
-
+	t.Cleanup(func() {
+		if err := m.cleanup(context.Background(), key); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := m.DeleteDownload(ctx, id); err != nil {
+		t.Fatalf("DeleteDownload() error = %v", err)
+	}
 	select {
-	case err := <-deleteResult:
-		if err != nil {
-			t.Fatalf("DeleteDownload() error = %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("DeleteDownload() did not finish")
+	case <-job.runDone:
+	default:
+		t.Fatal("deletion returned while background preparation was still running")
 	}
-
-	deadline = time.Now().Add(200 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if _, exists := client.Torrent(metainfo.NewHashFromHex(id)); exists {
-			t.Fatal("background preparation re-added torrent after deletion")
-		}
-		time.Sleep(10 * time.Millisecond)
+	if _, exists := client.Torrent(metainfo.NewHashFromHex(id)); exists {
+		t.Fatal("background preparation retained torrent after deletion")
 	}
 }
 
@@ -356,14 +344,14 @@ func TestGetStreamWaitsForConcurrentDownloadDeletion(t *testing.T) {
 	}
 }
 
-func TestDropTorrentAfterWebseedsStopHonorsCanceledContext(t *testing.T) {
+func TestDropTorrentHonorsCanceledContext(t *testing.T) {
 	client, err := torrentlib.NewClient(torrentlib.TestingConfig(t))
 	if err != nil {
 		t.Fatalf("NewClient() error = %v", err)
 	}
 	t.Cleanup(func() { client.Close() })
 	id := strings.Repeat("c", 40)
-	tor, err := client.AddMagnet("magnet:?xt=urn:btih:" + id)
+	_, err = client.AddMagnet("magnet:?xt=urn:btih:" + id)
 	if err != nil {
 		t.Fatalf("AddMagnet() error = %v", err)
 	}
@@ -371,12 +359,12 @@ func TestDropTorrentAfterWebseedsStopHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err = m.dropTorrentAfterWebseedsStop(ctx, tor)
+	err = m.dropTorrent(ctx, id)
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("dropTorrentAfterWebseedsStop() error = %v, want context canceled", err)
+		t.Fatalf("dropTorrent() error = %v, want context canceled", err)
 	}
 	if _, exists := client.Torrent(metainfo.NewHashFromHex(id)); !exists {
-		t.Fatal("dropTorrentAfterWebseedsStop() dropped torrent after context cancellation")
+		t.Fatal("dropTorrent() dropped torrent after context cancellation")
 	}
 }
 
@@ -396,7 +384,7 @@ func TestTerminalPreparationCleanupDeletesOnlyTorrentPayload(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+	if _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
 		t.Fatal(err)
 	}
 	payload := filepath.Join(store.downloadDir(id), "feature.mkv")
@@ -424,8 +412,8 @@ func TestTerminalPreparationCleanupDeletesOnlyTorrentPayload(t *testing.T) {
 	if err := os.WriteFile(payload, []byte("payload"), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
-		t.Fatalf("retry beginPreparation() = %v, %v", shouldStart, err)
+	if _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatalf("retry beginPreparation() = %v", err)
 	}
 	if err := store.finishPreparation(context.Background(), id, 0, time.Now()); err != nil {
 		t.Fatal(err)

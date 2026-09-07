@@ -34,9 +34,14 @@ jobs:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
 
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
       - name: Test
         working-directory: src
-        run: go test ./...
+        run: go test -race ./...
 
   release-please:
     runs-on: ubuntu-latest

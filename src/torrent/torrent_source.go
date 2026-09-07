@@ -17,11 +17,10 @@ const (
 )
 
 type torrentSource struct {
-	file      *torrent.File
-	registry  *rangeServer
-	token     string
-	url       string
-	readahead int64
+	file     *torrent.File
+	registry *rangeServer
+	token    string
+	url      string
 }
 
 type filePieceWindow struct {
@@ -36,11 +35,10 @@ func newTorrentSource(file *torrent.File, registry *rangeServer) (*torrentSource
 		return nil, err
 	}
 	return &torrentSource{
-		file:      file,
-		registry:  registry,
-		token:     token,
-		url:       sourceURL,
-		readahead: readahead,
+		file:     file,
+		registry: registry,
+		token:    token,
+		url:      sourceURL,
 	}, nil
 }
 

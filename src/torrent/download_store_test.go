@@ -43,12 +43,12 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 	if !download.ExpiresAt.IsZero() {
 		t.Fatalf("download expiry = %v, want zero before HLS is ready", download.ExpiresAt)
 	}
-	preparing, shouldStart, err := store.beginPreparation(context.Background(), id, 1)
+	preparing, err := store.beginPreparation(context.Background(), id, 1)
 	if err != nil {
 		t.Fatalf("beginPreparation() error = %v", err)
 	}
-	if !shouldStart || preparing.Status != DownloadStatusPreparing || preparing.SelectedFileIndex == nil || *preparing.SelectedFileIndex != 1 {
-		t.Fatalf("beginPreparation() = %#v, %v", preparing, shouldStart)
+	if preparing.Status != DownloadStatusPreparing || preparing.SelectedFileIndex == nil || *preparing.SelectedFileIndex != 1 {
+		t.Fatalf("beginPreparation() = %#v", preparing)
 	}
 	completedAt := time.Now().UTC().Truncate(time.Second)
 	if err := store.finishPreparation(context.Background(), id, 1, completedAt); err != nil {
@@ -116,8 +116,8 @@ func TestDownloadStorePreparationFailureCanBeRetried(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
 		t.Fatal(err)
 	}
-	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 3); err != nil || !shouldStart {
-		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	if _, err := store.beginPreparation(context.Background(), id, 3); err != nil {
+		t.Fatalf("beginPreparation() = %v", err)
 	}
 	if err := store.failPreparation(context.Background(), id, 3, errors.New("ffmpeg failed")); err != nil {
 		t.Fatal(err)
@@ -129,8 +129,8 @@ func TestDownloadStorePreparationFailureCanBeRetried(t *testing.T) {
 	if got := downloads[0]; got.Status != DownloadStatusFailed || got.PreparationErr != "ffmpeg failed" {
 		t.Fatalf("failed download = %#v", got)
 	}
-	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 3); err != nil || !shouldStart {
-		t.Fatalf("retry beginPreparation() = %v, %v", shouldStart, err)
+	if _, err := store.beginPreparation(context.Background(), id, 3); err != nil {
+		t.Fatalf("retry beginPreparation() = %v", err)
 	}
 }
 
@@ -147,11 +147,11 @@ func TestFinishPreparationExpiresLateStaleOutput(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
 		t.Fatal(err)
 	}
-	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
-		t.Fatalf("begin first preparation = %v, %v", shouldStart, err)
+	if _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatalf("begin first preparation = %v", err)
 	}
-	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 1); err != nil || !shouldStart {
-		t.Fatalf("begin replacement preparation = %v, %v", shouldStart, err)
+	if _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+		t.Fatalf("begin replacement preparation = %v", err)
 	}
 	if err := store.failPreparation(context.Background(), id, 1, errors.New("replacement failed")); err != nil {
 		t.Fatal(err)
@@ -184,20 +184,20 @@ func TestBeginPreparationClearsPreviousExpiry(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
 		t.Fatal(err)
 	}
-	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
-		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	if _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatalf("beginPreparation() = %v", err)
 	}
 	completedAt := time.Now().UTC().Add(-downloadDefaultTTL - time.Hour)
 	if err := store.finishPreparation(context.Background(), id, 0, completedAt); err != nil {
 		t.Fatal(err)
 	}
 
-	preparing, shouldStart, err := store.beginPreparation(context.Background(), id, 0)
+	preparing, err := store.beginPreparation(context.Background(), id, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !shouldStart || preparing.Status != DownloadStatusPreparing {
-		t.Fatalf("beginPreparation() = %#v, %v; want preparing, true", preparing, shouldStart)
+	if preparing.Status != DownloadStatusPreparing {
+		t.Fatalf("beginPreparation() = %#v; want preparing", preparing)
 	}
 	if !preparing.ExpiresAt.IsZero() {
 		t.Fatalf("preparing expiry = %v, want zero", preparing.ExpiresAt)

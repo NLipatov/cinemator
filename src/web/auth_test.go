@@ -54,6 +54,14 @@ func TestAuthenticationFlowProtectsApplication(t *testing.T) {
 	}
 	handler := server.handler()
 
+	t.Run("shared theme is available before login", func(t *testing.T) {
+		t.Chdir("..")
+		rec := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/theme.js", nil), nil)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "themeToggle") {
+			t.Fatalf("GET /theme.js = %d, %q; want the theme script", rec.Code, rec.Body.String())
+		}
+	})
+
 	t.Run("browser redirected to login", func(t *testing.T) {
 		rec := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/", nil), nil)
 		if rec.Code != http.StatusSeeOther {

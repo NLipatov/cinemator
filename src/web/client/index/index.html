@@ -95,11 +95,36 @@
       <div class="msg" id="downloadsMsg"></div>
     </section>
   </main>
+  <template id="downloadRowTemplate">
+    <div class="download-row">
+      <button type="button" class="download-open" data-action="open">
+        <span class="download-main">
+          <span class="download-title-row"><span class="download-title"></span></span>
+          <span class="download-subtitle"></span>
+        </span>
+        <span class="download-meta"><span class="download-meta-text"></span></span>
+      </button>
+      <div class="download-actions">
+        <div class="download-menu download-expiry-menu">
+          <button type="button" class="download-expiry-extend" data-action="toggle-extend"
+            title="Extend download" aria-label="Extend download" aria-haspopup="menu" aria-expanded="false">+</button>
+          <div class="download-extend-menu" role="menu" hidden>
+            <button type="button" class="download-menu-item" data-action="extend" data-days="1" role="menuitem">1 day</button>
+            <button type="button" class="download-menu-item" data-action="extend" data-days="7" role="menuitem">7 days</button>
+            <button type="button" class="download-menu-item" data-action="extend" data-days="30" role="menuitem">30 days</button>
+          </div>
+        </div>
+        <button type="button" class="download-action input-style delete icon-only" data-action="delete"
+          title="Delete" aria-label="Delete"></button>
+      </div>
+    </div>
+  </template>
   <script
     src="https://cdn.jsdelivr.net/npm/hls.js@1.6.5/dist/hls.min.js"
     integrity="sha384-EjzEuKbktrNTFpMLJKr9CPbBQjdi3b+hSp3X+IRM9bPcgMfyRD2Exd/FaoxjcTpS"
     crossorigin="anonymous"
   ></script>
+  <script src="/theme.js"></script>
   <script src="index.js"></script>
 </body>
 </html>
