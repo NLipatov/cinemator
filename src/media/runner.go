@@ -3,7 +3,6 @@ package media
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -14,17 +13,20 @@ func runCommand(ctx context.Context, stdin io.Reader, name string, args ...strin
 	if name == "" {
 		return nil, fmt.Errorf("run command: empty binary name")
 	}
-
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdin = stdin
-
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
-
 	runErr := cmd.Run()
-
-	// Build suffix with captured output (if any).
+	if ctx.Err() != nil {
+		runErr = fmt.Errorf("%s canceled: %w", name, ctx.Err())
+	} else if runErr != nil {
+		runErr = fmt.Errorf("%s failed: %w", name, runErr)
+	}
+	if runErr == nil {
+		return outBuf.Bytes(), nil
+	}
 	var parts []string
 	if errBuf.Len() > 0 {
 		parts = append(parts, "stderr:\n"+strings.TrimSpace(errBuf.String()))
@@ -32,39 +34,8 @@ func runCommand(ctx context.Context, stdin io.Reader, name string, args ...strin
 	if outBuf.Len() > 0 {
 		parts = append(parts, "stdout:\n"+strings.TrimSpace(outBuf.String()))
 	}
-	suffix := strings.Join(parts, "\n\n")
-
-	// Success (still honor rare case of already-canceled ctx).
-	if runErr == nil {
-		if ctx.Err() != nil {
-			if suffix == "" {
-				return outBuf.Bytes(), fmt.Errorf("%s canceled: %w", name, ctx.Err())
-			}
-			return outBuf.Bytes(), fmt.Errorf("%s canceled: %w\n%s", name, ctx.Err(), suffix)
-		}
-		return outBuf.Bytes(), nil
+	if len(parts) > 0 {
+		runErr = fmt.Errorf("%w\n%s", runErr, strings.Join(parts, "\n\n"))
 	}
-
-	// Context canceled/timeout takes precedence.
-	if ctx.Err() != nil {
-		if suffix == "" {
-			return outBuf.Bytes(), fmt.Errorf("%s canceled: %w", name, ctx.Err())
-		}
-		return outBuf.Bytes(), fmt.Errorf("%s canceled: %w\n%s", name, ctx.Err(), suffix)
-	}
-
-	// Non-zero exit? include exit code if available.
-	var ee *exec.ExitError
-	if errors.As(runErr, &ee) {
-		if suffix == "" {
-			return outBuf.Bytes(), fmt.Errorf("%s failed (exit code %d)", name, ee.ExitCode())
-		}
-		return outBuf.Bytes(), fmt.Errorf("%s failed (exit code %d)\n%s", name, ee.ExitCode(), suffix)
-	}
-
-	// Spawn/setup error (binary not found, permission, etc.).
-	if suffix == "" {
-		return outBuf.Bytes(), fmt.Errorf("%s failed: %v", name, runErr)
-	}
-	return outBuf.Bytes(), fmt.Errorf("%s failed: %v\n%s", name, runErr, suffix)
+	return outBuf.Bytes(), runErr
 }

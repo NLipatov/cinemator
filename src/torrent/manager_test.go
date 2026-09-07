@@ -97,11 +97,10 @@ func TestRemoveIncompleteDownloadHLSSkipsReservedOutput(t *testing.T) {
 
 	operationDone := make(chan struct{})
 	m := &Manager{
-		active:       make(map[streamKey]*streamInfo),
-		preparations: make(map[streamKey]*preparationJob),
-		streamOps:    map[streamKey]chan struct{}{key: operationDone},
-		deletions:    make(map[string]chan struct{}),
-		cfg:          config.Config{HLSPath: root},
+		active:    make(map[streamKey]*streamInfo),
+		streamOps: map[streamKey]chan struct{}{key: operationDone},
+		deletions: make(map[string]chan struct{}),
+		cfg:       config.Config{HLSPath: root},
 	}
 	if err := m.removeIncompleteDownloadHlsDirs(id); err != nil {
 		t.Fatal(err)
@@ -183,11 +182,10 @@ func TestResumePreparationsSkipsExpiredDownload(t *testing.T) {
 	}
 
 	m := &Manager{
-		active:       make(map[streamKey]*streamInfo),
-		preparations: make(map[streamKey]*preparationJob),
-		deletions:    map[string]chan struct{}{id: make(chan struct{})},
-		downloads:    store,
-		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		active:    make(map[streamKey]*streamInfo),
+		deletions: map[string]chan struct{}{id: make(chan struct{})},
+		downloads: store,
+		cfg:       config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	m.resumePreparations()
 
@@ -224,35 +222,24 @@ func TestStartHLSPreparationRestartsMissingRuntimeJob(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, magnet, []FileInfo{{Index: 0, Name: "feature.mkv"}}); err != nil {
 		t.Fatalf("upsert() error = %v", err)
 	}
-	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 0); err != nil || !shouldStart {
-		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	if _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+		t.Fatalf("beginPreparation() = %v", err)
 	}
 
 	operationDone := make(chan struct{})
 	key := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
 	m := &Manager{
-		active:       make(map[streamKey]*streamInfo),
-		preparations: make(map[streamKey]*preparationJob),
-		streamOps:    make(map[streamKey]chan struct{}),
-		torrents:     make(map[string]int),
-		torrentOps:   map[string]chan struct{}{id: operationDone},
-		deletions:    make(map[string]chan struct{}),
-		downloads:    store,
-		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		active:     make(map[streamKey]*streamInfo),
+		streamOps:  make(map[streamKey]chan struct{}),
+		torrents:   make(map[string]int),
+		torrentOps: map[string]chan struct{}{id: operationDone},
+		deletions:  make(map[string]chan struct{}),
+		downloads:  store,
+		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	t.Cleanup(func() {
-		m.mu.Lock()
-		job := m.preparations[key]
-		if job != nil {
-			job.cancel()
-		}
-		m.mu.Unlock()
-		if job != nil {
-			select {
-			case <-job.done:
-			case <-time.After(time.Second):
-				t.Error("preparation job did not stop")
-			}
+		if err := m.cleanup(context.Background(), key); err != nil {
+			t.Error(err)
 		}
 		m.finishTorrentOperation(id, operationDone)
 	})
@@ -261,7 +248,7 @@ func TestStartHLSPreparationRestartsMissingRuntimeJob(t *testing.T) {
 		t.Fatalf("StartHLSPreparation() error = %v", err)
 	}
 	m.mu.Lock()
-	job := m.preparations[key]
+	job := m.active[key]
 	m.mu.Unlock()
 	if job == nil {
 		t.Fatal("StartHLSPreparation() did not restore the missing runtime job")
@@ -270,7 +257,7 @@ func TestStartHLSPreparationRestartsMissingRuntimeJob(t *testing.T) {
 		t.Fatalf("second StartHLSPreparation() error = %v", err)
 	}
 	m.mu.Lock()
-	retriedJob := m.preparations[key]
+	retriedJob := m.active[key]
 	m.mu.Unlock()
 	if retriedJob != job {
 		t.Fatal("second StartHLSPreparation() replaced the running job")
@@ -305,29 +292,19 @@ func TestStartHLSPreparationReplacesPreviousFile(t *testing.T) {
 	firstKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
 	secondKey := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
 	m := &Manager{
-		client:       client,
-		active:       make(map[streamKey]*streamInfo),
-		preparations: make(map[streamKey]*preparationJob),
-		streamOps:    make(map[streamKey]chan struct{}),
-		torrents:     make(map[string]int),
-		torrentOps:   map[string]chan struct{}{id: operationDone},
-		deletions:    make(map[string]chan struct{}),
-		downloads:    store,
-		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		client:     client,
+		active:     make(map[streamKey]*streamInfo),
+		streamOps:  make(map[streamKey]chan struct{}),
+		torrents:   make(map[string]int),
+		torrentOps: map[string]chan struct{}{id: operationDone},
+		deletions:  make(map[string]chan struct{}),
+		downloads:  store,
+		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	t.Cleanup(func() {
-		m.mu.Lock()
-		jobs := make([]*preparationJob, 0, len(m.preparations))
-		for _, job := range m.preparations {
-			job.cancel()
-			jobs = append(jobs, job)
-		}
-		m.mu.Unlock()
-		for _, job := range jobs {
-			select {
-			case <-job.done:
-			case <-time.After(time.Second):
-				t.Error("preparation job did not stop")
+		for _, key := range m.streamKeysForDownload(id) {
+			if err := m.cleanup(context.Background(), key); err != nil {
+				t.Error(err)
 			}
 		}
 		m.finishTorrentOperation(id, operationDone)
@@ -337,7 +314,7 @@ func TestStartHLSPreparationReplacesPreviousFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.mu.Lock()
-	firstJob := m.preparations[firstKey]
+	firstJob := m.active[firstKey]
 	m.mu.Unlock()
 	if firstJob == nil {
 		t.Fatal("first preparation was not started")
@@ -346,7 +323,7 @@ func TestStartHLSPreparationReplacesPreviousFile(t *testing.T) {
 		t.Fatal("invalid replacement was accepted")
 	}
 	select {
-	case <-firstJob.done:
+	case <-firstJob.runDone:
 		t.Fatal("invalid replacement stopped the current preparation")
 	default:
 	}
@@ -355,13 +332,13 @@ func TestStartHLSPreparationReplacesPreviousFile(t *testing.T) {
 	}
 
 	select {
-	case <-firstJob.done:
+	case <-firstJob.runDone:
 	default:
 		t.Fatal("replacement left the previous preparation running")
 	}
 	m.mu.Lock()
-	remainingFirst := m.preparations[firstKey]
-	secondJob := m.preparations[secondKey]
+	remainingFirst := m.active[firstKey]
+	secondJob := m.active[secondKey]
 	m.mu.Unlock()
 	if remainingFirst != nil || secondJob == nil {
 		t.Fatalf("preparations after replacement = first %v, second %v", remainingFirst != nil, secondJob != nil)
@@ -390,37 +367,28 @@ func TestStartHLSPreparationFinishesPersistedReplacementAfterCancellation(t *tes
 	secondKey := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
 	firstCanceled := make(chan struct{})
 	releaseFirst := make(chan struct{})
-	firstJob := &preparationJob{
-		cancel: func() { close(firstCanceled) },
-		done:   make(chan struct{}),
+	firstJob := &streamInfo{
+		paths:   firstKey.paths(filepath.Join(root, "hls")),
+		cancel:  func() { close(firstCanceled) },
+		runDone: make(chan struct{}),
 	}
 	torrentOperationDone := make(chan struct{})
 	m := &Manager{
-		active:       make(map[streamKey]*streamInfo),
-		preparations: map[streamKey]*preparationJob{firstKey: firstJob},
-		streamOps:    make(map[streamKey]chan struct{}),
-		torrents:     make(map[string]int),
-		torrentOps:   map[string]chan struct{}{id: torrentOperationDone},
-		deletions:    make(map[string]chan struct{}),
-		downloads:    store,
-		cfg:          config.Config{DownloadPath: downloadRoot},
+		active:     map[streamKey]*streamInfo{firstKey: firstJob},
+		streamOps:  make(map[streamKey]chan struct{}),
+		torrents:   make(map[string]int),
+		torrentOps: map[string]chan struct{}{id: torrentOperationDone},
+		deletions:  make(map[string]chan struct{}),
+		downloads:  store,
+		cfg:        config.Config{HLSPath: filepath.Join(root, "hls"), DownloadPath: downloadRoot},
 	}
 	go func() {
 		<-releaseFirst
-		m.mu.Lock()
-		delete(m.preparations, firstKey)
-		m.mu.Unlock()
-		close(firstJob.done)
+		close(firstJob.runDone)
 	}()
 	t.Cleanup(func() {
-		m.mu.Lock()
-		job := m.preparations[secondKey]
-		if job != nil {
-			job.cancel()
-		}
-		m.mu.Unlock()
-		if job != nil {
-			<-job.done
+		if err := m.cleanup(context.Background(), secondKey); err != nil {
+			t.Error(err)
 		}
 		m.finishTorrentOperation(id, torrentOperationDone)
 	})
@@ -461,7 +429,7 @@ func TestStartHLSPreparationFinishesPersistedReplacementAfterCancellation(t *tes
 		t.Fatalf("StartHLSPreparation() error = %v", startErr)
 	}
 	m.mu.Lock()
-	secondJob := m.preparations[secondKey]
+	secondJob := m.active[secondKey]
 	m.mu.Unlock()
 	if secondJob == nil {
 		t.Fatal("persisted replacement was not launched after request cancellation")
@@ -534,27 +502,16 @@ func TestStartHLSPreparationCleansSupersededPartialOutput(t *testing.T) {
 			firstKey:  firstStream,
 			cachedKey: cachedStream,
 		},
-		preparations: make(map[streamKey]*preparationJob),
-		streamOps:    make(map[streamKey]chan struct{}),
-		torrents:     make(map[string]int),
-		torrentOps:   map[string]chan struct{}{id: operationDone},
-		deletions:    make(map[string]chan struct{}),
-		downloads:    store,
-		cfg:          config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
+		streamOps:  make(map[streamKey]chan struct{}),
+		torrents:   make(map[string]int),
+		torrentOps: map[string]chan struct{}{id: operationDone},
+		deletions:  make(map[string]chan struct{}),
+		downloads:  store,
+		cfg:        config.Config{HLSPath: hlsRoot, DownloadPath: downloadRoot},
 	}
 	t.Cleanup(func() {
-		m.mu.Lock()
-		job := m.preparations[secondKey]
-		if job != nil {
-			job.cancel()
-		}
-		m.mu.Unlock()
-		if job != nil {
-			select {
-			case <-job.done:
-			case <-time.After(time.Second):
-				t.Error("replacement preparation did not stop")
-			}
+		if err := m.cleanup(context.Background(), secondKey); err != nil {
+			t.Error(err)
 		}
 		m.finishTorrentOperation(id, operationDone)
 	})
@@ -565,7 +522,7 @@ func TestStartHLSPreparationCleansSupersededPartialOutput(t *testing.T) {
 	m.mu.Lock()
 	remaining := m.active[firstKey]
 	remainingCached := m.active[cachedKey]
-	secondJob := m.preparations[secondKey]
+	secondJob := m.active[secondKey]
 	m.mu.Unlock()
 	if remaining != nil {
 		t.Fatal("superseded conversion remained active")
@@ -601,39 +558,32 @@ func TestLaunchPreparationSkipsSupersededFile(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+	if _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+	if _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
 		t.Fatal(err)
 	}
 
 	operationDone := make(chan struct{})
 	staleKey := streamKey{InfoHash: id, Index: 0, Audio: -1, Subtitle: -1}
 	m := &Manager{
-		active:       make(map[streamKey]*streamInfo),
-		preparations: make(map[streamKey]*preparationJob),
-		torrentOps:   map[string]chan struct{}{id: operationDone},
-		deletions:    make(map[string]chan struct{}),
-		downloads:    store,
-		cfg:          config.Config{DownloadPath: downloadRoot},
+		active:     make(map[streamKey]*streamInfo),
+		torrentOps: map[string]chan struct{}{id: operationDone},
+		deletions:  make(map[string]chan struct{}),
+		downloads:  store,
+		cfg:        config.Config{HLSPath: filepath.Join(root, "hls"), DownloadPath: downloadRoot},
 	}
 	t.Cleanup(func() {
-		m.mu.Lock()
-		job := m.preparations[staleKey]
-		if job != nil {
-			job.cancel()
-		}
-		m.mu.Unlock()
-		if job != nil {
-			<-job.done
+		if err := m.cleanup(context.Background(), staleKey); err != nil {
+			t.Error(err)
 		}
 		m.finishTorrentOperation(id, operationDone)
 	})
 
 	m.launchPreparation(magnet, id, 0)
 	m.mu.Lock()
-	staleJob := m.preparations[staleKey]
+	staleJob := m.active[staleKey]
 	m.mu.Unlock()
 	if staleJob != nil {
 		t.Fatal("stale startup snapshot resurrected the superseded file")
@@ -658,13 +608,13 @@ func TestStartHLSPreparationSelectsOlderCachedRendition(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
 		t.Fatalf("upsert() error = %v", err)
 	}
-	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+	if _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.finishPreparation(context.Background(), id, 0, time.Now().Add(-time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+	if _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.failPreparation(context.Background(), id, 1, errors.New("conversion failed")); err != nil {
@@ -745,7 +695,7 @@ func TestResumePreparationsCleansFailedPayload(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, magnet, files); err != nil {
 		t.Fatalf("upsert() error = %v", err)
 	}
-	if _, _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
+	if _, err := store.beginPreparation(context.Background(), id, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.finishPreparation(context.Background(), id, 0, time.Now().Add(-time.Hour)); err != nil {
@@ -761,7 +711,7 @@ func TestResumePreparationsCleansFailedPayload(t *testing.T) {
 	if err := markStreamOutputReady(paths); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+	if _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.failPreparation(context.Background(), id, 1, errors.New("conversion failed")); err != nil {

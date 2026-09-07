@@ -21,7 +21,6 @@ import (
 type Manager struct {
 	client         *torrent.Client
 	active         map[streamKey]*streamInfo
-	preparations   map[streamKey]*preparationJob
 	streamOps      map[streamKey]chan struct{} // Serializes output lifecycle changes for each stream.
 	torrents       map[string]int              // References held by preparing, active, and cleaning streams.
 	torrentOps     map[string]chan struct{}    // Serializes add and drop for each torrent.
@@ -32,11 +31,6 @@ type Manager struct {
 	events         *downloadEventBroadcaster
 	mu             sync.Mutex
 	cfg            config.Config
-}
-
-type preparationJob struct {
-	cancel context.CancelFunc
-	done   chan struct{}
 }
 
 func NewManager(appConfig config.Config) (*Manager, error) {
@@ -65,7 +59,6 @@ func NewManager(appConfig config.Config) (*Manager, error) {
 	m := &Manager{
 		client:         client,
 		active:         make(map[streamKey]*streamInfo),
-		preparations:   make(map[streamKey]*preparationJob),
 		streamOps:      make(map[streamKey]chan struct{}),
 		torrents:       make(map[string]int),
 		torrentOps:     make(map[string]chan struct{}),
@@ -138,7 +131,7 @@ func (m *Manager) StartHLSPreparation(ctx context.Context, magnet string, fileIn
 		m.cleanupTransientPayload(hash, nil)
 		return nil
 	}
-	download, _, err := m.downloads.beginPreparation(ctx, hash, fileIndex)
+	download, err := m.downloads.beginPreparation(ctx, hash, fileIndex)
 	if err != nil {
 		return err
 	}
@@ -193,31 +186,13 @@ func (m *Manager) finishPreparationOperation(hash string, operationDone chan str
 }
 
 func (m *Manager) stopSupersededPreparation(ctx context.Context, keep streamKey) error {
-	m.mu.Lock()
-	jobs := make([]*preparationJob, 0)
-	for key, job := range m.preparations {
-		if key.InfoHash == keep.InfoHash && key != keep {
-			job.cancel()
-			jobs = append(jobs, job)
-		}
-	}
-	m.mu.Unlock()
-	for _, job := range jobs {
-		if err := waitForDone(ctx, job.done); err != nil {
-			return err
-		}
-	}
-
 	for {
-		var (
-			key    streamKey
-			stream *streamInfo
-		)
+		var key streamKey
+		var stream *streamInfo
 		m.mu.Lock()
 		for candidateKey, candidate := range m.active {
-			if candidateKey.InfoHash == keep.InfoHash && candidateKey != keep && !candidate.completed {
-				key = candidateKey
-				stream = candidate
+			if candidateKey.InfoHash == keep.InfoHash && candidateKey.Index != keep.Index && !candidate.completed {
+				key, stream = candidateKey, candidate
 				break
 			}
 		}
@@ -233,67 +208,23 @@ func (m *Manager) stopSupersededPreparation(ctx context.Context, keep streamKey)
 
 func (m *Manager) launchPreparation(magnet, hash string, fileIndex int) {
 	current, err := m.downloads.isPreparing(context.Background(), hash, fileIndex)
-	if err != nil {
-		if !errors.Is(err, ErrDownloadNotFound) {
+	if err != nil || !current {
+		if err != nil && !errors.Is(err, ErrDownloadNotFound) {
 			log.Printf("failed to validate HLS preparation: hash=%s, file=%d, err=%v", hash, fileIndex, err)
 		}
 		return
 	}
-	if !current {
-		return
-	}
 	key := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
-	ctx, cancel := context.WithCancel(context.Background())
-	job := &preparationJob{cancel: cancel, done: make(chan struct{})}
-	m.mu.Lock()
-	if m.preparations == nil {
-		m.preparations = make(map[streamKey]*preparationJob)
-	}
-	if m.deletions[hash] != nil || m.preparations[key] != nil || m.active[key] != nil {
-		m.mu.Unlock()
-		cancel()
-		return
-	}
-	m.preparations[key] = job
-	m.mu.Unlock()
-
-	go func() {
-		defer cancel()
-		defer m.finishPreparationJob(key, job)
-		info, err := m.GetMediaInfo(ctx, magnet, fileIndex)
-		if err == nil {
-			_, err = m.prepareHLSRendition(ctx, magnet, key, info, -1)
-			if err == nil {
-				ready, readyErr := streamOutputReady(key.paths(m.cfg.HLSPath))
-				if readyErr != nil {
-					err = readyErr
-				} else if ready {
-					err = m.downloads.finishPreparation(ctx, hash, fileIndex, time.Now())
-					if err == nil {
-						m.cleanupTransientPayload(hash, nil)
-					}
-				}
-			}
+	if _, err := m.startStream(context.Background(), magnet, key); err != nil {
+		m.recordPreparationFailure(hash, fileIndex, err)
+		m.cleanupTransientPayload(hash, nil)
+	} else if ready, err := streamOutputReady(key.paths(m.cfg.HLSPath)); err == nil && ready {
+		// The rendition may have completed between beginPreparation and startStream.
+		if err := m.downloads.finishPreparation(context.Background(), hash, fileIndex, time.Now()); err != nil {
+			log.Printf("failed to persist cached HLS preparation: key=%v, err=%v", key, err)
 		}
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			log.Printf("HLS preparation failed: hash=%s, file=%d, err=%v", hash, fileIndex, err)
-			m.recordPreparationFailure(hash, fileIndex, err)
-			m.cleanupTransientPayload(hash, nil)
-		}
-		m.notifyDownloadsChanged()
-	}()
-}
-
-func (m *Manager) finishPreparationJob(key streamKey, job *preparationJob) {
-	m.mu.Lock()
-	if m.preparations[key] == job {
-		delete(m.preparations, key)
 	}
-	close(job.done)
-	m.mu.Unlock()
+	m.notifyDownloadsChanged()
 }
 
 func (m *Manager) recordPreparationFailure(hash string, fileIndex int, preparationErr error) {
@@ -447,14 +378,18 @@ func (m *Manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	}
 
 	baseKey := streamKey{InfoHash: hash, Index: fileIndex, Audio: -1, Subtitle: -1}
-	if _, err := m.prepareHLSRendition(ctx, magnet, baseKey, info, -1); err != nil {
-		return "", err
-	}
-
 	videoKey := baseKey
+	keys := []streamKey{baseKey}
 	if bitmapSelected {
 		videoKey.Subtitle = subtitleTrack
-		if _, err := m.prepareHLSRendition(ctx, magnet, videoKey, info, subtitleTrack); err != nil {
+		keys = append(keys, videoKey)
+	}
+	for _, key := range keys {
+		s, err := m.startStream(ctx, magnet, key)
+		if err != nil {
+			return "", err
+		}
+		if err := s.waitPlayable(ctx); err != nil {
 			return "", err
 		}
 	}
@@ -476,130 +411,59 @@ func (m *Manager) PrepareHlsStream(ctx context.Context, magnet string, fileIndex
 	return masterPlaylist, nil
 }
 
-func (m *Manager) prepareHLSRendition(
-	ctx context.Context,
-	magnet string,
-	key streamKey,
-	info media.MediaInfo,
-	bitmapSubtitle int,
-) (string, error) {
+// startStream registers the entire preparation before probing or retaining its source.
+// Request cancellation only stops waiting; cleanup owns cancellation of the background run.
+func (m *Manager) startStream(ctx context.Context, magnet string, key streamKey) (*streamInfo, error) {
 	paths := key.paths(m.cfg.HLSPath)
-
-	if s, err := m.getStream(ctx, key); err != nil {
-		return "", err
-	} else if s != nil {
-		m.touchDownload(ctx, key.InfoHash)
-		return m.waitForPlayableStream(ctx, s)
-	}
-	if ready, err := m.activateCachedStream(ctx, key, paths); err != nil {
-		return "", err
-	} else if ready {
-		m.touchDownload(ctx, key.InfoHash)
-		log.Printf("Reusing completed HLS rendition: key=%v, playlist=%s", key, paths.masterPlaylist)
-		return paths.masterPlaylist, nil
-	}
-	// A concurrent request may have created the rendition while the ready output was checked.
-	if s, err := m.getStream(ctx, key); err != nil {
-		return "", err
-	} else if s != nil {
-		m.touchDownload(ctx, key.InfoHash)
-		return m.waitForPlayableStream(ctx, s)
-	}
-
-	t, _, err := m.retainTorrent(ctx, magnet)
-	if err != nil {
-		log.Printf("prepareHLSRendition: AddMagnet failed: %v", err)
-		return "", err
-	}
-	torrentRetained := true
-	defer func() {
-		if torrentRetained {
-			m.releaseTorrent(key.InfoHash, t)
-		}
-	}()
-
-	select {
-	case <-t.GotInfo():
-	case <-ctx.Done():
-		return "", ctx.Err()
-	}
-	files := t.Files()
-	if key.Index < 0 || key.Index >= len(files) {
-		log.Printf("prepareHLSRendition: bad file index: %d", key.Index)
-		return "", fmt.Errorf("bad file index")
-	}
-	file := files[key.Index]
-	m.touchDownload(ctx, key.InfoHash)
-
 	for {
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return nil, err
 		}
 		if s, err := m.getStream(ctx, key); err != nil {
-			return "", err
+			return nil, err
 		} else if s != nil {
-			return m.waitForPlayableStream(ctx, s)
+			return s, nil
 		}
-
-		source, err := newTorrentSource(file, m.sources)
-		if err != nil {
-			return "", err
+		if ready, err := m.activateCachedStream(ctx, key, paths); err != nil {
+			return nil, err
+		} else if ready {
+			continue
 		}
 
 		m.mu.Lock()
-		if operationDone := m.streamOps[key]; operationDone != nil {
+		if m.deletions[key.InfoHash] != nil || m.streamOps[key] != nil || m.active[key] != nil {
 			m.mu.Unlock()
-			source.Close()
-			if err := waitForDone(ctx, operationDone); err != nil {
-				return "", err
-			}
-			continue
-		}
-		if _, exists := m.active[key]; exists {
-			m.mu.Unlock()
-			source.Close()
 			continue
 		}
 		operationDone := m.reserveStreamOperationLocked(key)
 		m.mu.Unlock()
 
 		if err := resetStreamOutput(paths); err != nil {
-			source.Close()
 			m.finishStreamOperation(key, operationDone)
-			return "", fmt.Errorf("reset stream output %s: %w", paths.outDir, err)
+			return nil, fmt.Errorf("reset stream output %s: %w", paths.outDir, err)
 		}
 
+		m.mu.Lock()
+		if m.deletions[key.InfoHash] != nil {
+			m.mu.Unlock()
+			m.finishStreamOperation(key, operationDone)
+			continue
+		}
 		streamCtx, cancel := context.WithCancel(context.Background())
 		s := &streamInfo{
 			cancel:         cancel,
-			torrent:        t,
-			file:           file,
 			lastView:       time.Now(),
 			paths:          paths,
-			source:         source,
-			mediaInfo:      info,
-			bitmapSubtitle: bitmapSubtitle,
+			bitmapSubtitle: key.Subtitle,
 			playable:       make(chan struct{}),
 			runDone:        make(chan struct{}),
 		}
-		m.mu.Lock()
 		m.active[key] = s
-		torrentRetained = false
 		m.mu.Unlock()
-
-		file.Download()
-		file.SetPriority(torrent.PiecePriorityHigh)
-		source.PrefetchRange(0, initialProbeBytes)
-
-		m.launchConversion(streamCtx, key, s)
+		m.launchStream(streamCtx, magnet, key, s)
 		m.finishStreamOperation(key, operationDone)
 		m.notifyDownloadsChanged()
-		playlist, err := m.waitForPlayableStream(ctx, s)
-		if err != nil {
-			return "", err
-		}
-		log.Printf("HLS rendition ready: key=%v, playlist=%s", key, paths.masterPlaylist)
-		return playlist, nil
+		return s, nil
 	}
 }
 
@@ -690,13 +554,6 @@ func (m *Manager) getStream(ctx context.Context, key streamKey) (*streamInfo, er
 	}
 }
 
-func (m *Manager) waitForPlayableStream(ctx context.Context, s *streamInfo) (string, error) {
-	if err := s.waitPlayable(ctx); err != nil {
-		return "", err
-	}
-	return s.paths.masterPlaylist, nil
-}
-
 func (m *Manager) ListDownloads(ctx context.Context) ([]Download, error) {
 	downloads, err := m.downloads.list(ctx)
 	if err != nil {
@@ -733,9 +590,6 @@ func (m *Manager) DeleteDownload(ctx context.Context, id string) error {
 	}
 	defer m.finishDownloadDeletion(id, deletionDone)
 
-	if err := m.cancelPreparations(ctx, id); err != nil {
-		return err
-	}
 	keys := m.streamKeysForDownload(id)
 	for _, key := range keys {
 		if err := m.cleanup(ctx, key); err != nil {
@@ -756,24 +610,6 @@ func (m *Manager) DeleteDownload(ctx context.Context, id string) error {
 		return err
 	}
 	m.notifyDownloadsChanged()
-	return nil
-}
-
-func (m *Manager) cancelPreparations(ctx context.Context, id string) error {
-	m.mu.Lock()
-	jobs := make([]*preparationJob, 0)
-	for key, job := range m.preparations {
-		if key.InfoHash == id {
-			job.cancel()
-			jobs = append(jobs, job)
-		}
-	}
-	m.mu.Unlock()
-	for _, job := range jobs {
-		if err := waitForDone(ctx, job.done); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -883,7 +719,7 @@ func (m *Manager) removeIncompleteDownloadHlsDirs(id string) error {
 		}
 
 		m.mu.Lock()
-		if m.deletions[id] != nil || m.preparations[key] != nil || m.active[key] != nil || m.streamOps[key] != nil {
+		if m.deletions[id] != nil || m.active[key] != nil || m.streamOps[key] != nil {
 			m.mu.Unlock()
 			continue
 		}
@@ -996,31 +832,44 @@ func pathDiskSize(root string) int64 {
 	return total
 }
 
-func (m *Manager) launchConversion(
-	streamCtx context.Context,
-	key streamKey,
-	s *streamInfo,
-) {
-	runDone := s.runDone
+func (m *Manager) launchStream(streamCtx context.Context, magnet string, key streamKey, s *streamInfo) {
 	go func() {
-		err := m.runConversion(streamCtx, s)
+		err := m.runConversion(streamCtx, magnet, key, s)
 		if err == nil {
 			err = markStreamOutputReady(s.paths)
 		}
-		if err == nil {
-			m.finishConversion(key, s, nil)
-			close(runDone)
-			return
-		}
-		close(runDone)
+		s.signalPlayable(err)
 		m.finishConversion(key, s, err)
 	}()
 }
 
-func (m *Manager) runConversion(
-	streamCtx context.Context,
-	s *streamInfo,
-) error {
+func (m *Manager) runConversion(streamCtx context.Context, magnet string, key streamKey, s *streamInfo) error {
+	t, _, err := m.retainTorrent(streamCtx, magnet)
+	if err != nil {
+		return err
+	}
+	s.torrent = t
+	select {
+	case <-t.GotInfo():
+	case <-streamCtx.Done():
+		return streamCtx.Err()
+	}
+	files := t.Files()
+	if key.Index < 0 || key.Index >= len(files) {
+		return fmt.Errorf("bad file index")
+	}
+	s.file = files[key.Index]
+	s.mediaInfo, err = m.GetMediaInfo(streamCtx, magnet, key.Index)
+	if err != nil {
+		return err
+	}
+	s.source, err = newTorrentSource(s.file, m.sources)
+	if err != nil {
+		return err
+	}
+	s.file.Download()
+	s.file.SetPriority(torrent.PiecePriorityHigh)
+
 	if err := s.source.WaitRange(streamCtx, 0, initialProbeBytes); err != nil {
 		s.signalPlayable(err)
 		return err
@@ -1047,34 +896,26 @@ func (m *Manager) runConversion(
 
 	streamDone := streamCtx.Done()
 	playlistReadyCh := playlistReady
-	playableSent := false
 
 	for {
 		select {
 		case err := <-errCh:
-			if !playableSent {
-				s.signalPlayable(err)
-			}
+			s.signalPlayable(err)
 			return err
 		case <-streamDone:
 			err := streamCtx.Err()
-			if !playableSent {
-				s.signalPlayable(err)
-			}
+			s.signalPlayable(err)
 			cancelConversion()
 			<-errCh
 			return err
 		case err := <-playlistReadyCh:
 			if err != nil {
-				if !playableSent {
-					s.signalPlayable(err)
-				}
+				s.signalPlayable(err)
 				cancelConversion()
 				<-errCh
 				return err
 			}
 			s.signalPlayable(nil)
-			playableSent = true
 			streamDone = nil
 			playlistReadyCh = nil
 		}
@@ -1090,12 +931,12 @@ func (m *Manager) finishConversion(key streamKey, s *streamInfo, err error) {
 	m.mu.Lock()
 	if current, ok := m.active[key]; !ok || current != s {
 		m.mu.Unlock()
+		close(s.runDone)
 		return
 	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		log.Printf("Stream conversion error for key=%v: %v", key, err)
 	}
-	notifyCompleted := false
 	if err == nil {
 		s.completed = true
 		cancel = s.cancel
@@ -1105,7 +946,6 @@ func (m *Manager) finishConversion(key streamKey, s *streamInfo, err error) {
 		t = s.torrent
 		s.torrent = nil
 		s.file = nil
-		notifyCompleted = true
 	}
 	m.mu.Unlock()
 	if cancel != nil {
@@ -1122,15 +962,17 @@ func (m *Manager) finishConversion(key streamKey, s *streamInfo, err error) {
 	if t != nil {
 		m.releaseTorrent(key.InfoHash, t)
 	}
-	if notifyCompleted {
+	if err == nil {
 		m.notifyDownloadsChanged()
 	}
 
+	if err != nil && key.Audio == -1 && key.Subtitle == -1 && m.downloads != nil {
+		m.recordPreparationFailure(key.InfoHash, key.Index, err)
+		m.notifyDownloadsChanged()
+	}
+	// Persist the result before cleanup can release the source and remove output.
+	close(s.runDone)
 	if err != nil {
-		if key.Audio == -1 && key.Subtitle == -1 && m.downloads != nil {
-			m.recordPreparationFailure(key.InfoHash, key.Index, err)
-			m.notifyDownloadsChanged()
-		}
 		m.cleanupIfCurrent(key, s)
 	}
 }

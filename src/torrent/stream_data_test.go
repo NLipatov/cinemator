@@ -223,8 +223,8 @@ func TestStreamInfoSignalsPlayableOnce(t *testing.T) {
 func TestFinishConversionIgnoresReplacedStream(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
 	canceled := false
-	stale := &streamInfo{cancel: func() { canceled = true }}
-	current := &streamInfo{}
+	stale := &streamInfo{cancel: func() { canceled = true }, runDone: make(chan struct{})}
+	current := &streamInfo{runDone: make(chan struct{})}
 
 	m := &Manager{
 		active: map[streamKey]*streamInfo{key: current},
@@ -238,7 +238,7 @@ func TestFinishConversionIgnoresReplacedStream(t *testing.T) {
 
 func TestFinishConversionMarksSuccessfulRunCompleted(t *testing.T) {
 	key := streamKey{InfoHash: "hash", Index: 1, Audio: 0, Subtitle: -1}
-	s := &streamInfo{}
+	s := &streamInfo{runDone: make(chan struct{})}
 	events := newDownloadEventBroadcaster()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -270,12 +270,12 @@ func TestFinishConversionMakesBaseHLSTheReadyArtifact(t *testing.T) {
 	if _, err := store.upsert(context.Background(), id, "magnet:?xt=urn:btih:"+id, files); err != nil {
 		t.Fatal(err)
 	}
-	if _, shouldStart, err := store.beginPreparation(context.Background(), id, 1); err != nil || !shouldStart {
-		t.Fatalf("beginPreparation() = %v, %v", shouldStart, err)
+	if _, err := store.beginPreparation(context.Background(), id, 1); err != nil {
+		t.Fatalf("beginPreparation() = %v", err)
 	}
 
 	key := streamKey{InfoHash: id, Index: 1, Audio: -1, Subtitle: -1}
-	s := &streamInfo{}
+	s := &streamInfo{runDone: make(chan struct{})}
 	m := &Manager{
 		active:    map[streamKey]*streamInfo{key: s},
 		downloads: store,
@@ -301,7 +301,6 @@ func TestFinishConversionCleansFailedBackgroundPreparation(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &streamInfo{paths: paths, runDone: make(chan struct{})}
-	close(s.runDone)
 	m := &Manager{
 		active:    map[streamKey]*streamInfo{key: s},
 		streamOps: make(map[streamKey]chan struct{}),
@@ -420,16 +419,16 @@ func TestCanceledStartupWaiterKeepsBackgroundPreparation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err := m.waitForPlayableStream(ctx, s)
+	err := s.waitPlayable(ctx)
 
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("waitForPlayableStream() error = %v, want %v", err, context.Canceled)
+		t.Fatalf("waitPlayable() error = %v, want %v", err, context.Canceled)
 	}
 	if canceled {
-		t.Fatal("waitForPlayableStream() canceled background preparation")
+		t.Fatal("waitPlayable() canceled background preparation")
 	}
 	if m.active[key] != s {
-		t.Fatal("waitForPlayableStream() removed background preparation")
+		t.Fatal("waitPlayable() removed background preparation")
 	}
 	if _, err := os.Stat(partialChunk); err != nil {
 		t.Fatalf("partial HLS chunk was removed: %v", err)
@@ -689,29 +688,5 @@ func TestResetStreamOutputRemovesStaleHLSFiles(t *testing.T) {
 		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("stale file %s still exists: %v", path, err)
 		}
-	}
-}
-
-func TestTorrentStatusHasActiveWebseedRequests(t *testing.T) {
-	const status = `first
-Infohash: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-webseeds:
-- https://example.test/first/
-  active requests: 2 of [0-8)
-
-second
-Infohash: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-webseeds:
-- https://example.test/second/
-`
-
-	if !torrentStatusHasActiveWebseedRequests(status, strings.Repeat("a", 40)) {
-		t.Fatal("active webseed request was not detected")
-	}
-	if torrentStatusHasActiveWebseedRequests(status, strings.Repeat("b", 40)) {
-		t.Fatal("inactive torrent reported an active webseed request")
-	}
-	if torrentStatusHasActiveWebseedRequests(status, strings.Repeat("c", 40)) {
-		t.Fatal("missing torrent reported an active webseed request")
 	}
 }

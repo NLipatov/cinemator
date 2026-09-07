@@ -239,8 +239,7 @@ func TestSubtitlePrerollMakesRenditionReadyBeforeFirstCue(t *testing.T) {
 func TestConverterUsesTrackSpecificSubtitlePaths(t *testing.T) {
 	dir := t.TempDir()
 	converter := Converter{
-		builder:  argsBuilder{OutDir: dir},
-		inputURL: "input",
+		builder: argsBuilder{OutDir: dir, Input: "input"},
 	}
 	args := converter.subtitleArgs(2, filepath.Join(dir, "subs_2.raw.m3u8"))
 	joined := strings.Join(args, " ")

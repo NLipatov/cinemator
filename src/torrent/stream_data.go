@@ -22,6 +22,8 @@ type streamKey struct {
 }
 
 type streamInfo struct {
+	// The background run initializes its media resources. Cleanup reads them
+	// only after runDone closes; completed and cancel are protected by Manager.mu.
 	playable       chan struct{}
 	cancel         context.CancelFunc
 	torrent        *torrent.Torrent

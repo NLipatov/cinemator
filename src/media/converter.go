@@ -12,7 +12,6 @@ import (
 // Converter creates one persisted HLS rendition set from an analyzed input.
 type Converter struct {
 	ctx            context.Context
-	inputURL       string
 	info           MediaInfo
 	builder        argsBuilder
 	bitmapSubtitle int
@@ -38,7 +37,6 @@ func NewURLConverter(ctx context.Context,
 ) *Converter {
 	return &Converter{
 		ctx:            ctx,
-		inputURL:       inputURL,
 		info:           info,
 		builder:        argsBuilder{OutDir: outDir, Input: inputURL},
 		bitmapSubtitle: bitmapSubtitle,
@@ -175,7 +173,7 @@ func (c *Converter) runFFmpeg(args []string) error {
 func (c *Converter) subtitleArgs(subIdx int, rawPlaylist string) []string {
 	return []string{
 		"-fflags", "+genpts",
-		"-i", c.inputURL,
+		"-i", c.builder.Input,
 		"-map", fmt.Sprintf("0:s:%d", subIdx),
 		"-c:s", "webvtt",
 		"-f", "segment",

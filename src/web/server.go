@@ -77,6 +77,7 @@ func (s *Server) handler() http.Handler {
 	root.Handle("/favicon.ico", http.FileServer(http.Dir(staticDir)))
 	root.Handle("/index.css", http.FileServer(http.Dir(clientDir)))
 	root.Handle("/login.js", http.FileServer(http.Dir(clientDir)))
+	root.Handle("/theme.js", http.FileServer(http.Dir(clientDir)))
 	root.Handle("/sign-in-approval.js", http.FileServer(http.Dir(clientDir)))
 	root.HandleFunc("/login", s.handleLoginPage)
 	root.HandleFunc("GET /sign-in-approvals/{approvalToken}", s.handleSignInApprovalPage)

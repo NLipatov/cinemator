@@ -241,13 +241,13 @@ func (s *downloadStore) extend(ctx context.Context, id string, extension time.Du
 	return download, nil
 }
 
-func (s *downloadStore) beginPreparation(ctx context.Context, id string, fileIndex int) (Download, bool, error) {
+func (s *downloadStore) beginPreparation(ctx context.Context, id string, fileIndex int) (Download, error) {
 	if err := ctx.Err(); err != nil {
-		return Download{}, false, err
+		return Download{}, err
 	}
 	id, err := cleanInfoHash(id)
 	if err != nil {
-		return Download{}, false, err
+		return Download{}, err
 	}
 
 	s.mu.Lock()
@@ -255,14 +255,14 @@ func (s *downloadStore) beginPreparation(ctx context.Context, id string, fileInd
 
 	download, err := s.readLocked(id)
 	if err != nil {
-		return Download{}, false, err
+		return Download{}, err
 	}
 	if !hasFileIndex(download.Files, fileIndex) {
-		return Download{}, false, fmt.Errorf("bad file index")
+		return Download{}, fmt.Errorf("bad file index")
 	}
 	if download.SelectedFileIndex != nil && *download.SelectedFileIndex == fileIndex &&
 		download.Status == DownloadStatusPreparing {
-		return download, false, nil
+		return download, nil
 	}
 
 	now := time.Now().UTC()
@@ -274,9 +274,9 @@ func (s *downloadStore) beginPreparation(ctx context.Context, id string, fileInd
 	download.UpdatedAt = now
 	download.LastAccessedAt = now
 	if err := s.writeLocked(download); err != nil {
-		return Download{}, false, err
+		return Download{}, err
 	}
-	return download, true, nil
+	return download, nil
 }
 
 func (s *downloadStore) isPreparing(ctx context.Context, id string, fileIndex int) (bool, error) {
@@ -651,7 +651,7 @@ func (s *downloadStore) diskSizeLocked(id string) int64 {
 }
 
 func allocatedFileSize(info fs.FileInfo) int64 {
-	if blocks, ok := fileBlocks(info); ok && blocks > 0 {
+	if blocks, ok := fileBlocks(info); ok {
 		return blocks * 512
 	}
 	return info.Size()

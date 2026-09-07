@@ -1,25 +1,3 @@
-const themeKey = 'theme-mode';
-const themes = ['dark', 'light'];
-const themeToggle = document.getElementById('themeToggle');
-const moon = document.getElementById('icon-moon');
-const sun = document.getElementById('icon-sun');
-let themeIndex = 0;
-
-function setTheme(index, save = true) {
-  document.documentElement.setAttribute('data-theme', themes[index]);
-  moon.style.display = index === 0 ? '' : 'none';
-  sun.style.display = index === 1 ? '' : 'none';
-  themeIndex = index;
-  if (save) localStorage.setItem(themeKey, themes[index]);
-}
-
-let savedTheme = localStorage.getItem(themeKey);
-if (!themes.includes(savedTheme)) {
-  savedTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-}
-setTheme(themes.indexOf(savedTheme), false);
-themeToggle.addEventListener('click', () => setTheme(1 - themeIndex));
-
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 const title = document.getElementById('deviceTitle');
 const description = document.getElementById('deviceDescription');

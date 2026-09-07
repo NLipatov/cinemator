@@ -6,18 +6,13 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 )
 
-const (
-	webseedStopTimeout  = 5 * time.Second
-	webseedPollInterval = 100 * time.Millisecond
-	streamReadyVersion  = "2\n"
-)
+const streamReadyVersion = "2\n"
 
 func (m *Manager) cleanup(ctx context.Context, key streamKey) error {
 	return m.cleanupMatching(ctx, key, nil)
@@ -75,11 +70,12 @@ func (m *Manager) cleanupMatchingLocked(key streamKey, expected *streamInfo) (*s
 }
 
 func (m *Manager) finishStreamCleanup(key streamKey, s *streamInfo, operationDone chan struct{}) {
-	if s.source != nil {
-		s.source.Close()
-	}
+	// The run owns its source until it stops, including acquisition during probing.
 	if s.runDone != nil {
 		<-s.runDone
+	}
+	if s.source != nil {
+		s.source.Close()
 	}
 	log.Printf("Cleaning up stream: key=%v, dir=%s", key, s.paths.outDir)
 	ready, err := streamOutputReady(s.paths)
@@ -310,23 +306,24 @@ func (m *Manager) cleanupTransientPayload(hash string, released *torrent.Torrent
 	go func() {
 		operationDone, _ := m.reserveTorrentOperation(context.Background(), hash)
 		m.mu.Lock()
-		refs := m.torrents[hash]
+		inUse := m.torrents[hash] > 0
+		// A registered run may still be waiting to acquire its torrent reference.
+		for key, stream := range m.active {
+			if key.InfoHash == hash && !stream.completed {
+				inUse = true
+				break
+			}
+		}
 		m.mu.Unlock()
 		current, exists := m.client.Torrent(metainfo.NewHashFromHex(hash))
 		payloadCanBeDeleted := !exists
-		if refs == 0 && exists && (released == nil || current == released) {
+		if !inUse && exists && (released == nil || current == released) {
 			log.Printf("Dropping torrent: %s", hash)
-			dropCtx, cancel := context.WithTimeout(context.Background(), webseedStopTimeout)
-			err := m.dropTorrentAfterWebseedsStop(dropCtx, current)
-			cancel()
-			if err != nil {
-				log.Printf("Failed to drop torrent %s: %v", hash, err)
-			} else {
-				payloadCanBeDeleted = true
-			}
+			current.Drop()
+			payloadCanBeDeleted = true
 		}
 		payloadDisposable := false
-		if refs == 0 && payloadCanBeDeleted && m.downloads != nil {
+		if !inUse && payloadCanBeDeleted && m.downloads != nil {
 			var stateErr error
 			payloadDisposable, stateErr = m.downloads.payloadDisposable(context.Background(), hash)
 			if stateErr != nil && !errors.Is(stateErr, ErrDownloadNotFound) {
@@ -372,70 +369,12 @@ func (m *Manager) dropTorrent(ctx context.Context, hash string) error {
 		return nil
 	}
 
-	dropResult := make(chan error, 1)
 	go func() {
 		log.Printf("Dropping torrent: %s", hash)
-		dropCtx, cancel := context.WithTimeout(ctx, webseedStopTimeout)
-		err := m.dropTorrentAfterWebseedsStop(dropCtx, t)
-		cancel()
+		t.Drop()
 		m.finishTorrentOperation(hash, operationDone)
-		dropResult <- err
 	}()
-	select {
-	case err := <-dropResult:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func (m *Manager) dropTorrentAfterWebseedsStop(ctx context.Context, t *torrent.Torrent) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	// anacrolix removes webseed requests asynchronously. Dropping the torrent
-	// before that cleanup finishes can trip its client-wide consistency check.
-	t.DisallowDataDownload()
-	dropped := false
-	defer func() {
-		if !dropped {
-			t.AllowDataDownload()
-		}
-	}()
-	ticker := time.NewTicker(webseedPollInterval)
-	defer ticker.Stop()
-	for {
-		var status strings.Builder
-		m.client.WriteStatus(&status)
-		if !torrentStatusHasActiveWebseedRequests(status.String(), t.InfoHash().HexString()) {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("wait for webseed requests to stop: %w", ctx.Err())
-		case <-ticker.C:
-		}
-	}
-	t.Drop()
-	dropped = true
-	return nil
-}
-
-func torrentStatusHasActiveWebseedRequests(status, hash string) bool {
-	currentHash := ""
-	for _, line := range strings.Split(status, "\n") {
-		if strings.HasPrefix(line, "Infohash: ") {
-			currentHash = strings.TrimSpace(strings.TrimPrefix(line, "Infohash: "))
-			continue
-		}
-		if strings.EqualFold(currentHash, hash) && strings.Contains(line, "active requests:") {
-			return true
-		}
-	}
-	return false
+	return waitForDone(ctx, operationDone)
 }
 
 func (m *Manager) releaseTorrentLocked(hash string) bool {

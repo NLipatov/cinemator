@@ -1,25 +1,3 @@
-    const themeKey = 'theme-mode';
-    const themes = ['dark', 'light'];
-    const $toggle = document.getElementById('themeToggle');
-    const $moon = document.getElementById('icon-moon');
-    const $sun  = document.getElementById('icon-sun');
-    let themeIdx = 0;
-    function setTheme(idx, save=true) {
-      document.documentElement.setAttribute('data-theme', themes[idx]);
-      $moon.style.display = (idx === 0) ? '' : 'none';
-      $sun.style.display  = (idx === 1) ? '' : 'none';
-      themeIdx = idx;
-      if (save) localStorage.setItem(themeKey, themes[idx]);
-    }
-    $toggle.onclick = function() { setTheme(1-themeIdx); };
-    (function() {
-      let mode = localStorage.getItem(themeKey);
-      if (!themes.includes(mode)) {
-        mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-      }
-      setTheme(themes.indexOf(mode), false);
-    })();
-
     // Main logic
     const $ = id => document.getElementById(id);
     async function apiFetch(input, init) {
@@ -80,11 +58,6 @@
     let flowRequestController = null;
     const downloadFallbackInitialMs = 5000;
     const downloadFallbackPollingMs = 30000;
-    const extendOptions = [
-      { days: 1, label: '1 day' },
-      { days: 7, label: '7 days' },
-      { days: 30, label: '30 days' },
-    ];
     const isStale = id => id !== requestSeq;
     function cancelFlowRequest() {
       requestSeq++;
@@ -246,46 +219,12 @@
       openExtendDownloadID = toggle.dataset.id;
     }
 
-    function createExtendMenu(downloadID) {
-      const extendMenu = document.createElement('div');
-      extendMenu.className = 'download-menu download-expiry-menu';
-      const extendBtn = document.createElement('button');
-      extendBtn.type = 'button';
-      extendBtn.className = 'download-expiry-extend';
-      extendBtn.dataset.action = 'toggle-extend';
-      extendBtn.dataset.id = downloadID;
-      extendBtn.title = 'Extend download';
-      extendBtn.setAttribute('aria-label', 'Extend download');
-      extendBtn.setAttribute('aria-haspopup', 'menu');
-      extendBtn.setAttribute('aria-expanded', 'false');
-      extendBtn.textContent = '+';
-
-      const popup = document.createElement('div');
-      popup.className = 'download-extend-menu';
-      popup.setAttribute('role', 'menu');
-      popup.hidden = true;
-      extendOptions.forEach(({ days, label }) => {
-        const item = document.createElement('button');
-        item.type = 'button';
-        item.className = 'download-menu-item';
-        item.dataset.action = 'extend';
-        item.dataset.id = downloadID;
-        item.dataset.days = String(days);
-        item.setAttribute('role', 'menuitem');
-        item.textContent = label;
-        popup.appendChild(item);
-      });
-      extendMenu.append(extendBtn, popup);
-      return extendMenu;
-    }
-
     function renderDownloads(downloads) {
       const list = $('downloadsList');
       const restoreExtendID = openExtendDownloadID;
-      let restoredExtendMenu = false;
-      list.textContent = '';
+      openExtendDownloadID = null;
+      list.replaceChildren();
       if (!downloads.length) {
-        openExtendDownloadID = null;
         const empty = document.createElement('div');
         empty.className = 'downloads-empty';
         empty.textContent = 'No downloads yet';
@@ -293,66 +232,29 @@
         return;
       }
 
+      const template = $('downloadRowTemplate');
       downloads.forEach(download => {
-        const row = document.createElement('div');
-        row.className = 'download-row' + (download.id === activeDownloadID ? ' active' : '');
+        const row = template.content.firstElementChild.cloneNode(true);
         row.dataset.id = download.id;
-
-        const openBtn = document.createElement('button');
-        openBtn.type = 'button';
-        openBtn.className = 'download-open';
-        openBtn.dataset.action = 'open';
-        openBtn.dataset.id = download.id;
-        if (download.id === activeDownloadID) openBtn.setAttribute('aria-current', 'true');
-
-        const main = document.createElement('span');
-        main.className = 'download-main';
-        const titleRow = document.createElement('span');
-        titleRow.className = 'download-title-row';
-        const title = document.createElement('span');
-        title.className = 'download-title';
-        title.textContent = download.title || `Torrent ${download.id.slice(0, 8)}`;
-        titleRow.appendChild(title);
-        const subtitle = document.createElement('span');
-        subtitle.className = 'download-subtitle';
-        subtitle.textContent = download.id;
-        main.append(titleRow, subtitle);
-
-        const meta = document.createElement('span');
-        meta.className = 'download-meta';
-        const metaText = document.createElement('span');
-        metaText.className = 'download-meta-text';
-        metaText.textContent = `${formatDownloadSize(download)} · ${formatDownloadState(download)}`;
-        meta.append(metaText);
-        openBtn.append(main, meta);
-
-        const actions = document.createElement('div');
-        actions.className = 'download-actions';
-
-        let extendMenu = null;
-        if (download.status === 'ready') {
-          extendMenu = createExtendMenu(download.id);
-          if (download.id === restoreExtendID) {
-            openExtendMenu(extendMenu);
-            restoredExtendMenu = true;
-          }
+        row.classList.toggle('active', download.id === activeDownloadID);
+        row.querySelectorAll('button[data-action]').forEach(button => {
+          button.dataset.id = download.id;
+        });
+        if (download.id === activeDownloadID) {
+          row.querySelector('.download-open').setAttribute('aria-current', 'true');
         }
+        row.querySelector('.download-title').textContent = download.title || `Torrent ${download.id.slice(0, 8)}`;
+        row.querySelector('.download-subtitle').textContent = download.id;
+        row.querySelector('.download-meta-text').textContent = `${formatDownloadSize(download)} · ${formatDownloadState(download)}`;
 
-        const deleteBtn = document.createElement('button');
-        deleteBtn.type = 'button';
-        deleteBtn.className = 'download-action input-style delete icon-only';
-        deleteBtn.dataset.action = 'delete';
-        deleteBtn.dataset.id = download.id;
-        deleteBtn.title = 'Delete';
-        deleteBtn.setAttribute('aria-label', 'Delete');
-
-        if (extendMenu) actions.appendChild(extendMenu);
-        actions.appendChild(deleteBtn);
-
-        row.append(openBtn, actions);
+        const extendMenu = row.querySelector('.download-menu');
+        if (download.status !== 'ready') {
+          extendMenu.remove();
+        } else if (download.id === restoreExtendID) {
+          openExtendMenu(extendMenu);
+        }
         list.appendChild(row);
       });
-      if (!restoredExtendMenu) openExtendDownloadID = null;
     }
 
     async function loadDownloads({ quiet = false, suppressError = false } = {}) {
