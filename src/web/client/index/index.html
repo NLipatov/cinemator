@@ -76,9 +76,11 @@
             <div class="warning-inner">
               <span class="warning-icon" aria-hidden="true">!</span>
               <div class="warning-text">
-                <span>Server is downloading and preparing the video.</span>
-                <span>This may take several minutes for large torrents.</span>
-                <strong>Please stay on this page until playback begins.</strong>
+                <strong id="preparationStage" role="status">Preparing video…</strong>
+                <progress id="preparationProgress" max="1" aria-label="Selected video downloaded" hidden></progress>
+                <span id="preparationDetails"></span>
+                <span id="preparationVideo"></span>
+                <span>Preparation continues on the server. You can return later.</span>
                 <span id="warn-extra" hidden></span>
               </div>
             </div>
@@ -103,6 +105,7 @@
           <span class="download-subtitle"></span>
         </span>
         <span class="download-meta"><span class="download-meta-text"></span></span>
+        <progress class="download-progress" max="1" aria-label="Selected video downloaded" hidden></progress>
       </button>
       <div class="download-actions">
         <div class="download-menu download-expiry-menu">

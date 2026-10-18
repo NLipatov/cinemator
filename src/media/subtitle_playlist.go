@@ -277,6 +277,9 @@ func parseEXTINFDuration(line string) (float64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("parse EXTINF duration %q: %w", line, err)
 	}
+	if duration < 0 || math.IsNaN(duration) || math.IsInf(duration, 0) {
+		return 0, fmt.Errorf("invalid EXTINF duration %q", line)
+	}
 	return duration, nil
 }
 

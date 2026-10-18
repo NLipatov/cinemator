@@ -15,6 +15,7 @@ type torrentManager interface {
 	PrepareHlsStream(ctx context.Context, magnet string, fileIndex, audioTrack, subtitleTrack int) (playlistPath string, err error)
 	TouchStream(ctx context.Context, dirName string)
 	ListDownloads(ctx context.Context) ([]torrent.Download, error)
+	ListDownloadProgress(ctx context.Context) ([]torrent.Download, error)
 	ExtendDownload(ctx context.Context, id string, extension time.Duration) (torrent.Download, error)
 	DeleteDownload(ctx context.Context, id string) error
 	SubscribeDownloadEvents(ctx context.Context) <-chan struct{}

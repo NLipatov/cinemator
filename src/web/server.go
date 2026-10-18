@@ -150,7 +150,13 @@ func (s *Server) handleListDownloads(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	downloads, err := s.mgr.ListDownloads(r.Context())
+	var downloads []torrent.Download
+	var err error
+	if r.URL.Query().Get("progress") == "1" {
+		downloads, err = s.mgr.ListDownloadProgress(r.Context())
+	} else {
+		downloads, err = s.mgr.ListDownloads(r.Context())
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

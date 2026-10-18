@@ -568,13 +568,27 @@ func (m *Manager) getStream(ctx context.Context, key streamKey) (*streamInfo, er
 }
 
 func (m *Manager) ListDownloads(ctx context.Context) ([]Download, error) {
-	downloads, err := m.downloads.list(ctx)
+	return m.listDownloads(ctx, true)
+}
+
+func (m *Manager) ListDownloadProgress(ctx context.Context) ([]Download, error) {
+	return m.listDownloads(ctx, false)
+}
+
+func (m *Manager) listDownloads(ctx context.Context, includeDiskSize bool) ([]Download, error) {
+	downloads, err := m.downloads.listWithDiskSize(ctx, includeDiskSize)
 	if err != nil {
 		return nil, err
 	}
-	hlsSizes := hlsDiskSizes(m.cfg.HLSPath)
+	var hlsSizes map[string]int64
+	if includeDiskSize {
+		hlsSizes = hlsDiskSizes(m.cfg.HLSPath)
+	}
 	for i := range downloads {
 		downloads[i].DiskSize += hlsSizes[downloads[i].ID]
+		if downloads[i].Status == DownloadStatusPreparing && downloads[i].SelectedFileIndex != nil {
+			downloads[i].Progress = m.preparationProgress(ctx, downloads[i])
+		}
 	}
 	return downloads, nil
 }
