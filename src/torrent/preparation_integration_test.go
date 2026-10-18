@@ -108,7 +108,7 @@ func TestHLSPreparationWithLocalMedia(t *testing.T) {
 	if err := waitForDone(ctx, stream.runDone); err != nil {
 		t.Fatal(err)
 	}
-	downloads, err := m.ListDownloads(ctx)
+	downloads, err := m.ListDownloads(ctx, true)
 	if err != nil || len(downloads) != 1 || downloads[0].Status != DownloadStatusReady {
 		t.Fatalf("completed downloads = %#v, %v", downloads, err)
 	}

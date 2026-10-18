@@ -49,9 +49,11 @@
     let downloadCatalog = [];
     let downloadsLoading = false;
     let downloadsRefreshQueued = false;
+    let lastDownloadCatalogRefreshAt = 0;
     let downloadEvents = null;
-    let downloadFallbackPolling = false;
     let downloadPollingTimer = null;
+    const downloadSamples = new Map();
+    let progressUnavailable = false;
     let openExtendDownloadID = null;
     let activeDownloadID = null;
     let requestSeq = 0;
@@ -79,6 +81,8 @@
     function finishFlowRequest(request) {
       if (flowRequestController === request.controller) {
         flowRequestController = null;
+        renderPreparationProgress();
+        renderDownloads(downloadCatalog);
       }
     }
     function destroyVideoAndHls({ resetLayout = true } = {}) {
@@ -120,6 +124,8 @@
     function showWarning() {
       clearSubtitleWait();
       $('warnMsg').hidden = false;
+      renderPreparationProgress();
+      renderDownloads(downloadCatalog);
     }
     function setWarningExtra(msg) {
       const extra = document.getElementById('warn-extra');
@@ -137,6 +143,7 @@
     function removeWarning() {
       clearSubtitleWait();
       $('warnMsg').hidden = true;
+      renderDownloads(downloadCatalog);
     }
 
     function formatBytes(bytes) {
@@ -180,6 +187,88 @@
       return 'select a video';
     }
 
+    function preparationStage(progress) {
+      if (progress.stage === 'playable') return 'Video segments ready · preparing the rest';
+      if (progress.stage === 'preparing') return 'Preparing video';
+      return 'Downloading initial data and reading video tracks';
+    }
+
+    function preparationDetails(progress) {
+      const parts = [`Downloaded ${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}`];
+      if (progress.totalBytes > 0) {
+        const percent = Math.min(100, Math.floor(100 * progress.downloadedBytes / progress.totalBytes));
+        parts[0] += ` (${percent}%)`;
+      }
+      if (progress.totalBytes > 0 && progress.downloadedBytes < progress.totalBytes) {
+        parts.push(Number.isFinite(progress.downloadSpeed) ? `${formatBytes(progress.downloadSpeed)}/s` : 'Measuring speed…');
+        parts.push(`${progress.peers} ${progress.peers === 1 ? 'peer' : 'peers'}`);
+      }
+      return parts.join(' · ');
+    }
+
+    function preparedVideo(progress) {
+      const seconds = Math.floor(progress.preparedSeconds);
+      if (seconds <= 0) return 'Waiting for the first video segment…';
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor(seconds / 60) % 60;
+      const clock = `${hours ? `${hours}:${String(minutes).padStart(2, '0')}` : minutes}:${String(seconds % 60).padStart(2, '0')}`;
+      return `Video prepared: ${clock}`;
+    }
+
+    function updateDownloadSamples(downloads) {
+      const active = new Set();
+      downloads.forEach(download => {
+        const progress = download.progress;
+        if (!progress) return;
+        active.add(download.id);
+        const previous = downloadSamples.get(download.id);
+        const elapsed = previous ? (Date.parse(progress.sampledAt) - Date.parse(previous.sampledAt)) / 1000 : 0;
+        if (previous && previous.fileIndex === progress.fileIndex && progress.receivedBytes >= previous.receivedBytes) {
+          if (elapsed >= 0.5 && elapsed <= 10) {
+            progress.downloadSpeed = (progress.receivedBytes - previous.receivedBytes) / elapsed;
+          } else if (elapsed > 0 && elapsed < 0.5) {
+            progress.downloadSpeed = previous.downloadSpeed;
+            return;
+          }
+        }
+        downloadSamples.set(download.id, progress);
+      });
+      for (const id of downloadSamples.keys()) {
+        if (!active.has(id)) downloadSamples.delete(id);
+      }
+    }
+
+    function renderPreparationProgress() {
+      const download = downloadCatalog.find(item => item.id === activeDownloadID);
+      const progress = download?.progress;
+      const matches = progress && progress.fileIndex === Number($('filelist').value);
+      const selected = download?.selectedFileIndex === Number($('filelist').value);
+      let stage = 'Preparing selected video…';
+      let details = '';
+      if (matches) {
+        stage = preparationStage(progress);
+        details = preparationDetails(progress);
+      } else if (selected && download.status === 'failed') {
+        stage = 'Preparation failed';
+        details = download.preparationError || 'Could not prepare video';
+      } else if (selected && download.status === 'ready') {
+        stage = 'Video is ready to play';
+      }
+      if (flowRequestController && (matches && progress.stage === 'playable' || selected && download.status === 'ready')) {
+        stage = 'Preparing selected stream…';
+      }
+      if (progressUnavailable) {
+        stage = 'Reconnecting to the server…';
+        details = 'Progress is unavailable. Retrying…';
+      }
+      $('preparationStage').textContent = stage;
+      const bar = $('preparationProgress');
+      bar.hidden = !matches || progressUnavailable || progress.totalBytes <= 0;
+      if (!bar.hidden) bar.value = Math.min(1, progress.downloadedBytes / progress.totalBytes);
+      $('preparationDetails').textContent = details;
+      $('preparationVideo').textContent = matches && !progressUnavailable ? preparedVideo(progress) : '';
+    }
+
     function closeExtendMenus(except = null) {
       let preservedID = null;
       document.querySelectorAll('.download-menu.open').forEach(menu => {
@@ -221,20 +310,23 @@
 
     function renderDownloads(downloads) {
       const list = $('downloadsList');
+      const focused = list.contains(document.activeElement) ? document.activeElement : null;
       const restoreExtendID = openExtendDownloadID;
       openExtendDownloadID = null;
-      list.replaceChildren();
       if (!downloads.length) {
         const empty = document.createElement('div');
         empty.className = 'downloads-empty';
         empty.textContent = 'No downloads yet';
-        list.appendChild(empty);
+        list.replaceChildren(empty);
         return;
       }
 
       const template = $('downloadRowTemplate');
-      downloads.forEach(download => {
-        const row = template.content.firstElementChild.cloneNode(true);
+      const rows = new Map(Array.from(list.querySelectorAll('.download-row'), row => [row.dataset.id, row]));
+      list.querySelector('.downloads-empty')?.remove();
+      downloads.forEach((download, index) => {
+        const row = rows.get(download.id) || template.content.firstElementChild.cloneNode(true);
+        rows.delete(download.id);
         row.dataset.id = download.id;
         row.classList.toggle('active', download.id === activeDownloadID);
         row.querySelectorAll('button[data-action]').forEach(button => {
@@ -242,22 +334,45 @@
         });
         if (download.id === activeDownloadID) {
           row.querySelector('.download-open').setAttribute('aria-current', 'true');
+        } else {
+          row.querySelector('.download-open').removeAttribute('aria-current');
         }
         row.querySelector('.download-title').textContent = download.title || `Torrent ${download.id.slice(0, 8)}`;
         row.querySelector('.download-subtitle').textContent = download.id;
         row.querySelector('.download-meta-text').textContent = `${formatDownloadSize(download)} · ${formatDownloadState(download)}`;
+        row.querySelector('.download-meta-text').classList.remove('has-progress');
+        row.querySelector('.download-progress').hidden = true;
+        const progressAtPlayer = download.id === activeDownloadID && !$('warnMsg').hidden &&
+          download.progress?.fileIndex === Number($('filelist').value);
+        if (progressAtPlayer) {
+          row.querySelector('.download-meta-text').textContent = progressUnavailable ? 'Reconnecting…' :
+            download.progress.stage === 'playable' && !flowRequestController ? 'Ready to play' : 'Preparing';
+        } else if (download.progress) {
+          const meta = row.querySelector('.download-meta-text');
+          meta.classList.add('has-progress');
+          meta.textContent = progressUnavailable ? 'Progress unavailable · reconnecting…' :
+            `${preparationStage(download.progress)} · ${preparationDetails(download.progress)} · ${preparedVideo(download.progress)}`;
+          const bar = row.querySelector('.download-progress');
+          bar.hidden = progressUnavailable || download.progress.totalBytes <= 0;
+          if (!bar.hidden) bar.value = Math.min(1, download.progress.downloadedBytes / download.progress.totalBytes);
+        }
 
         const extendMenu = row.querySelector('.download-menu');
-        if (download.status !== 'ready') {
-          extendMenu.remove();
-        } else if (download.id === restoreExtendID) {
+        extendMenu.hidden = download.status !== 'ready';
+        if (download.status === 'ready' && download.id === restoreExtendID) {
           openExtendMenu(extendMenu);
+        } else {
+          extendMenu.classList.remove('open');
+          extendMenu.querySelector('.download-extend-menu').hidden = true;
+          extendMenu.querySelector('[data-action="toggle-extend"]').setAttribute('aria-expanded', 'false');
         }
-        list.appendChild(row);
+        if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
       });
+      for (const row of rows.values()) row.remove();
+      if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
     }
 
-    async function loadDownloads({ quiet = false, suppressError = false } = {}) {
+    async function loadDownloads({ quiet = false, suppressError = false, progressOnly = false } = {}) {
       if (downloadsLoading) {
         downloadsRefreshQueued = true;
         return;
@@ -265,21 +380,35 @@
       downloadsLoading = true;
       if (!quiet) showMsg('downloadsMsg', 'Loading downloads...', false, true);
       try {
-        const res = await apiFetch('/api/downloads');
+        const res = await apiFetch('/api/downloads' + (progressOnly ? '?progress=1' : ''));
         if (!res.ok) throw new Error('Could not load downloads');
-        downloadCatalog = await res.json();
+        const downloads = await res.json();
+        if (progressOnly) {
+          const diskSizes = new Map(downloadCatalog.map(download => [download.id, download.diskSize]));
+          downloads.forEach(download => { download.diskSize = diskSizes.get(download.id); });
+        } else {
+          lastDownloadCatalogRefreshAt = Date.now();
+        }
+        downloadCatalog = downloads;
+        updateDownloadSamples(downloadCatalog);
+        progressUnavailable = false;
         if (!downloadCatalog.some(download => download.id === activeDownloadID)) {
           const currentMagnet = $('magnet').value.trim();
           activeDownloadID = downloadCatalog.find(download => download.magnet === currentMagnet)?.id || null;
         }
         renderDownloads(downloadCatalog);
+        renderPreparationProgress();
         if (!quiet) showMsg('downloadsMsg', '');
       } catch (e) {
+        progressUnavailable = true;
+        renderDownloads(downloadCatalog);
+        renderPreparationProgress();
         if (!suppressError) {
           showMsg('downloadsMsg', e.message || 'Could not load downloads', true);
         }
       } finally {
         downloadsLoading = false;
+        scheduleDownloadRefresh();
         if (downloadsRefreshQueued) {
           downloadsRefreshQueued = false;
           loadDownloads({ quiet: true, suppressError: true });
@@ -371,43 +500,45 @@
       }
     }
 
-    function stopDownloadFallbackPolling() {
-      downloadFallbackPolling = false;
-      if (downloadPollingTimer) {
-        clearTimeout(downloadPollingTimer);
-        downloadPollingTimer = null;
+    function scheduleDownloadRefresh(delay) {
+      clearTimeout(downloadPollingTimer);
+      downloadPollingTimer = null;
+      if (document.visibilityState === 'hidden') return;
+      const preparing = downloadCatalog.some(download => download.status === 'preparing');
+      if (delay === undefined) {
+        if (preparing || progressUnavailable) delay = 2000;
+        else if (!downloadEvents || downloadEvents.readyState !== EventSource.OPEN) delay = downloadFallbackPollingMs;
+        else return;
       }
-    }
-
-    function scheduleDownloadFallbackPolling(delay = downloadFallbackPollingMs) {
-      downloadFallbackPolling = true;
-      if (downloadPollingTimer) return;
       downloadPollingTimer = setTimeout(() => {
         downloadPollingTimer = null;
-        if (!downloadFallbackPolling) return;
-        if (document.visibilityState !== 'hidden') {
-          loadDownloads({ quiet: true, suppressError: true });
-        }
-        scheduleDownloadFallbackPolling(downloadFallbackPollingMs);
+        loadDownloads({ quiet: true, suppressError: true,
+          progressOnly: Date.now() - lastDownloadCatalogRefreshAt < downloadFallbackPollingMs });
       }, delay);
     }
 
     function startDownloadEvents() {
       if (!window.EventSource) {
-        scheduleDownloadFallbackPolling(0);
+        scheduleDownloadRefresh(0);
         return;
       }
 
       const events = new EventSource('/api/downloads/events');
       downloadEvents = events;
       events.addEventListener('open', () => {
-        if (downloadEvents === events) stopDownloadFallbackPolling();
+        if (downloadEvents === events) {
+          if (!downloadPollingTimer || !downloadCatalog.some(download => download.status === 'preparing')) {
+            scheduleDownloadRefresh();
+          }
+        }
       });
       events.addEventListener('changed', () => {
         loadDownloads({ quiet: true, suppressError: true });
       });
       events.addEventListener('error', () => {
-        if (downloadEvents === events) scheduleDownloadFallbackPolling(downloadFallbackInitialMs);
+        if (downloadEvents === events) {
+          if (!downloadPollingTimer) scheduleDownloadRefresh(downloadFallbackInitialMs);
+        }
       });
     }
 
@@ -438,12 +569,14 @@
       loadDownloads({ quiet: true, suppressError: true });
     });
     document.addEventListener('visibilitychange', () => {
+      scheduleDownloadRefresh();
       if (document.visibilityState === 'visible') {
         loadDownloads({ quiet: true, suppressError: true });
       }
     });
     window.addEventListener('beforeunload', () => {
       if (downloadEvents) downloadEvents.close();
+      clearTimeout(downloadPollingTimer);
     });
     loadDownloads();
     startDownloadEvents();
@@ -459,7 +592,7 @@
       const request = beginFlowRequest();
       const requestId = request.id;
       destroyVideoAndHls();
-      showMsg('magnetMsg', 'Loading file list…', false, true);
+      showMsg('magnetMsg', 'Finding peers and loading the file list…', false, true);
       $('filelist').textContent = '';
       $('step-files').style.display = 'none';
       $('step-tracks').style.display = 'none';
@@ -504,12 +637,14 @@
       const requestId = request.id;
       showMsg('fileMsg', 'Loading track info…', false, true);
       $('step-tracks').style.display = 'none';
+      showWarning();
       try {
         const prepare = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}`, {
           method: 'POST',
           signal: request.signal,
         });
         if (!prepare.ok) throw new Error((await prepare.text()).trim() || 'Could not start preparation');
+        loadDownloads({ quiet: true });
         const res = await apiFetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal });
         if (!res.ok) throw new Error((await res.text()).trim() || 'Could not load media info');
         const info = await res.json();
@@ -568,6 +703,7 @@
       } catch (e) {
         if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
+        removeWarning();
         showMsg('fileMsg', e.message || 'Error loading tracks', true);
       } finally {
         finishFlowRequest(request);

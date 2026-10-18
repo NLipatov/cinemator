@@ -241,7 +241,7 @@ func TestLaunchPreparationRecordsCachedInspectionFailure(t *testing.T) {
 	}
 	m := &Manager{downloads: store, cfg: config.Config{HLSPath: hlsRoot}, active: map[streamKey]*streamInfo{key: {completed: true, paths: paths}}}
 	m.launchPreparation(magnet, id, 0)
-	downloads, err := m.ListDownloads(t.Context())
+	downloads, err := m.ListDownloads(t.Context(), true)
 	if err != nil {
 		t.Fatal(err)
 	}

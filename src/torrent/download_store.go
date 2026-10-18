@@ -94,7 +94,7 @@ func (s *downloadStore) upsert(ctx context.Context, id, magnet string, files []F
 	return download, nil
 }
 
-func (s *downloadStore) list(ctx context.Context) ([]Download, error) {
+func (s *downloadStore) list(ctx context.Context, includeDiskSize bool) ([]Download, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -129,7 +129,9 @@ func (s *downloadStore) list(ctx context.Context) ([]Download, error) {
 		if !download.ExpiresAt.IsZero() && now.After(download.ExpiresAt) {
 			download.Status = DownloadStatusExpired
 		}
-		download.DiskSize = s.diskSizeLocked(entry.Name())
+		if includeDiskSize {
+			download.DiskSize = s.diskSizeLocked(entry.Name())
+		}
 		downloads = append(downloads, download)
 	}
 	sort.SliceStable(downloads, func(i, j int) bool {

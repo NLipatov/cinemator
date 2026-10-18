@@ -251,7 +251,7 @@ func (m *Manager) ensureFailedHLSExpiry(hash string) {
 }
 
 func (m *Manager) resumePreparations() {
-	downloads, err := m.downloads.list(context.Background())
+	downloads, err := m.downloads.list(context.Background(), false)
 	if err != nil {
 		log.Printf("failed to restore HLS preparations: %v", err)
 		return
@@ -567,14 +567,20 @@ func (m *Manager) getStream(ctx context.Context, key streamKey) (*streamInfo, er
 	}
 }
 
-func (m *Manager) ListDownloads(ctx context.Context) ([]Download, error) {
-	downloads, err := m.downloads.list(ctx)
+func (m *Manager) ListDownloads(ctx context.Context, includeDiskSize bool) ([]Download, error) {
+	downloads, err := m.downloads.list(ctx, includeDiskSize)
 	if err != nil {
 		return nil, err
 	}
-	hlsSizes := hlsDiskSizes(m.cfg.HLSPath)
+	var hlsSizes map[string]int64
+	if includeDiskSize {
+		hlsSizes = hlsDiskSizes(m.cfg.HLSPath)
+	}
 	for i := range downloads {
 		downloads[i].DiskSize += hlsSizes[downloads[i].ID]
+		if downloads[i].Status == DownloadStatusPreparing && downloads[i].SelectedFileIndex != nil {
+			downloads[i].Progress = m.preparationProgress(ctx, downloads[i])
+		}
 	}
 	return downloads, nil
 }

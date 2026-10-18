@@ -54,7 +54,7 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 	if err := store.finishPreparation(context.Background(), id, 1, completedAt); err != nil {
 		t.Fatalf("finishPreparation() error = %v", err)
 	}
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatalf("list() after preparation error = %v", err)
 	}
@@ -75,7 +75,7 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 		t.Fatalf("write payload file: %v", err)
 	}
 
-	downloads, err = store.list(context.Background())
+	downloads, err = store.list(context.Background(), true)
 	if err != nil {
 		t.Fatalf("list() error = %v", err)
 	}
@@ -97,7 +97,7 @@ func TestDownloadStoreLifecycle(t *testing.T) {
 	if err := store.delete(context.Background(), id); err != nil {
 		t.Fatalf("delete() error = %v", err)
 	}
-	downloads, err = store.list(context.Background())
+	downloads, err = store.list(context.Background(), true)
 	if err != nil {
 		t.Fatalf("list() after delete error = %v", err)
 	}
@@ -122,7 +122,7 @@ func TestDownloadStorePreparationFailureCanBeRetried(t *testing.T) {
 	if err := store.failPreparation(context.Background(), id, 3, errors.New("ffmpeg failed")); err != nil {
 		t.Fatal(err)
 	}
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestFinishPreparationExpiresLateStaleOutput(t *testing.T) {
 	if err := store.finishPreparation(context.Background(), id, 0, completedAt); err != nil {
 		t.Fatal(err)
 	}
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestBeginPreparationClearsPreviousExpiry(t *testing.T) {
 		t.Fatalf("preparing expiry = %v, want zero", preparing.ExpiresAt)
 	}
 
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +267,7 @@ func TestDeletePayloadPreservesDownloadMetadata(t *testing.T) {
 	if err != nil || !found || !reflect.DeepEqual(cached, mediaInfo) {
 		t.Fatalf("loadMediaInfo() = %#v, %v, %v; want preserved media info", cached, found, err)
 	}
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil || len(downloads) != 1 || downloads[0].ID != id {
 		t.Fatalf("list() = %#v, %v; want preserved download", downloads, err)
 	}
@@ -357,7 +357,7 @@ func TestLegacyMultiVideoMigrationClearsObsoleteExpiry(t *testing.T) {
 		t.Fatalf("write legacy download: %v", err)
 	}
 
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatalf("list() error = %v", err)
 	}

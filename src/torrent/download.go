@@ -22,18 +22,30 @@ const (
 )
 
 type Download struct {
-	ID                string         `json:"id"`
-	Magnet            string         `json:"magnet"`
-	Title             string         `json:"title"`
-	Status            DownloadStatus `json:"status"`
-	Size              int64          `json:"size"`
-	DiskSize          int64          `json:"diskSize,omitempty"`
-	Files             []FileInfo     `json:"files"`
-	SelectedFileIndex *int           `json:"selectedFileIndex,omitempty"`
-	ReadyAt           time.Time      `json:"readyAt,omitempty"`
-	PreparationErr    string         `json:"preparationError,omitempty"`
-	CreatedAt         time.Time      `json:"createdAt"`
-	UpdatedAt         time.Time      `json:"updatedAt"`
-	LastAccessedAt    time.Time      `json:"lastAccessedAt"`
-	ExpiresAt         time.Time      `json:"expiresAt"`
+	ID                string               `json:"id"`
+	Magnet            string               `json:"magnet"`
+	Title             string               `json:"title"`
+	Status            DownloadStatus       `json:"status"`
+	Size              int64                `json:"size"`
+	DiskSize          int64                `json:"diskSize,omitempty"`
+	Files             []FileInfo           `json:"files"`
+	SelectedFileIndex *int                 `json:"selectedFileIndex,omitempty"`
+	ReadyAt           time.Time            `json:"readyAt,omitempty"`
+	PreparationErr    string               `json:"preparationError,omitempty"`
+	CreatedAt         time.Time            `json:"createdAt"`
+	UpdatedAt         time.Time            `json:"updatedAt"`
+	LastAccessedAt    time.Time            `json:"lastAccessedAt"`
+	ExpiresAt         time.Time            `json:"expiresAt"`
+	Progress          *PreparationProgress `json:"progress,omitempty"`
+}
+
+type PreparationProgress struct {
+	FileIndex       int       `json:"fileIndex"`
+	Stage           string    `json:"stage"`
+	DownloadedBytes int64     `json:"downloadedBytes"`
+	TotalBytes      int64     `json:"totalBytes"`
+	ReceivedBytes   int64     `json:"receivedBytes"`
+	Peers           int       `json:"peers"`
+	PreparedSeconds float64   `json:"preparedSeconds"`
+	SampledAt       time.Time `json:"sampledAt"`
 }

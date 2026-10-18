@@ -63,6 +63,7 @@ type fakeTorrentManager struct {
 	prepare   string
 	start     func() error
 	getFiles  func()
+	progress  []torrent.Download
 }
 
 func (m fakeTorrentManager) GetTorrentFiles(context.Context, string) ([]torrent.FileInfo, error) {
@@ -89,8 +90,28 @@ func (m fakeTorrentManager) PrepareHlsStream(context.Context, string, int, int, 
 
 func (m fakeTorrentManager) TouchStream(context.Context, string) {}
 
-func (m fakeTorrentManager) ListDownloads(context.Context) ([]torrent.Download, error) {
+func (m fakeTorrentManager) ListDownloads(_ context.Context, includeDiskSize bool) ([]torrent.Download, error) {
+	if !includeDiskSize {
+		return m.progress, nil
+	}
 	return []torrent.Download{}, nil
+}
+
+func TestDownloadProgressUsesLightweightListing(t *testing.T) {
+	server := Server{mgr: fakeTorrentManager{progress: []torrent.Download{
+		{ID: strings.Repeat("a", 40), Progress: &torrent.PreparationProgress{Stage: "analyzing", TotalBytes: 100}},
+	}}}
+	for _, query := range []string{"", "?progress=1"} {
+		rec := httptest.NewRecorder()
+		server.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/downloads"+query, nil))
+		var downloads []torrent.Download
+		if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &downloads) != nil {
+			t.Fatalf("query=%q: response %d: %s", query, rec.Code, rec.Body)
+		}
+		if query == "" && len(downloads) != 0 || query != "" && (len(downloads) != 1 || downloads[0].Progress == nil) {
+			t.Fatalf("query=%q: wrong listing returned: %+v", query, downloads)
+		}
+	}
 }
 
 func (m fakeTorrentManager) ExtendDownload(context.Context, string, time.Duration) (torrent.Download, error) {

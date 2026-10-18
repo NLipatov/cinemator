@@ -2,6 +2,18 @@ package media
 
 import "testing"
 
+func TestPlaylistDuration(t *testing.T) {
+	data := "#EXTM3U\n#EXTINF:2.5,\nfirst.ts\n#EXTINF:3,\nsecond.ts\n#EXTINF:9,\n"
+	if got, err := PlaylistDuration([]byte(data)); err != nil || got != 5.5 {
+		t.Fatalf("PlaylistDuration = %g, %v; want 5.5", got, err)
+	}
+	for _, value := range []string{"broken", "NaN", "+Inf", "-1"} {
+		if got, err := PlaylistDuration([]byte("#EXTM3U\n#EXTINF:" + value + ",\nvideo.ts\n")); err == nil || got != 0 {
+			t.Fatalf("duration %q: got %g, %v; want an error", value, got, err)
+		}
+	}
+}
+
 func TestHasSegment(t *testing.T) {
 	tests := []struct {
 		name string
