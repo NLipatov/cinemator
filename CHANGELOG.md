@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/NLipatov/cinemator/compare/0.7.2...0.8.0) (2026-10-18)
+
+
+### Features
+
+* **player:** show video preparation progress ([#38](https://github.com/NLipatov/cinemator/issues/38)) ([6d133f8](https://github.com/NLipatov/cinemator/commit/6d133f83220c75d37d8f593cdcc9ebd0e56c1428))
+
 ## [0.7.2](https://github.com/NLipatov/cinemator/compare/0.7.1...0.7.2) (2026-09-07)
 
 
