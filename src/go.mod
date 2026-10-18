@@ -25,7 +25,7 @@ require (
 	github.com/anacrolix/missinggo/v2 v2.11.0 // indirect
 	github.com/anacrolix/mmsg v1.1.1 // indirect
 	github.com/anacrolix/multiless v0.4.0 // indirect
-	github.com/anacrolix/stm v0.5.0 // indirect; v0.6.0 removes Settish.Iter required by dht/v2 v2.24.0.
+	github.com/anacrolix/stm v0.5.0 // indirect
 	github.com/anacrolix/sync v0.6.0 // indirect
 	github.com/anacrolix/upnp v0.1.4 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
