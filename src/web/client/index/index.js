@@ -51,7 +51,6 @@
     let downloadsRefreshQueued = false;
     let lastDownloadCatalogRefreshAt = 0;
     let downloadEvents = null;
-    let downloadEventsConnected = false;
     let downloadPollingTimer = null;
     const downloadSamples = new Map();
     let progressUnavailable = false;
@@ -311,6 +310,7 @@
 
     function renderDownloads(downloads) {
       const list = $('downloadsList');
+      const focused = list.contains(document.activeElement) ? document.activeElement : null;
       const restoreExtendID = openExtendDownloadID;
       openExtendDownloadID = null;
       if (!downloads.length) {
@@ -369,6 +369,7 @@
         if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
       });
       for (const row of rows.values()) row.remove();
+      if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
     }
 
     async function loadDownloads({ quiet = false, suppressError = false, progressOnly = false } = {}) {
@@ -506,7 +507,7 @@
       const preparing = downloadCatalog.some(download => download.status === 'preparing');
       if (delay === undefined) {
         if (preparing || progressUnavailable) delay = 2000;
-        else if (!downloadEventsConnected) delay = downloadFallbackPollingMs;
+        else if (!downloadEvents || downloadEvents.readyState !== EventSource.OPEN) delay = downloadFallbackPollingMs;
         else return;
       }
       downloadPollingTimer = setTimeout(() => {
@@ -526,7 +527,6 @@
       downloadEvents = events;
       events.addEventListener('open', () => {
         if (downloadEvents === events) {
-          downloadEventsConnected = true;
           if (!downloadPollingTimer || !downloadCatalog.some(download => download.status === 'preparing')) {
             scheduleDownloadRefresh();
           }
@@ -537,7 +537,6 @@
       });
       events.addEventListener('error', () => {
         if (downloadEvents === events) {
-          downloadEventsConnected = false;
           if (!downloadPollingTimer) scheduleDownloadRefresh(downloadFallbackInitialMs);
         }
       });

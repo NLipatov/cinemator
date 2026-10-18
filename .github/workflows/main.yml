@@ -43,6 +43,15 @@ jobs:
         working-directory: src
         run: go test -race ./...
 
+      - name: Install browser test dependencies
+        run: |
+          python3 -m venv /tmp/cinemator-browser-tests
+          /tmp/cinemator-browser-tests/bin/pip install -r src/web/tests/requirements.txt
+          /tmp/cinemator-browser-tests/bin/playwright install --with-deps chromium webkit
+
+      - name: Test browser progress
+        run: /tmp/cinemator-browser-tests/bin/python src/web/tests/progress_test.py
+
   release-please:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
