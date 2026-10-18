@@ -189,7 +189,7 @@ func TestResumePreparationsSkipsExpiredDownload(t *testing.T) {
 	}
 	m.resumePreparations()
 
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatalf("list() error = %v", err)
 	}
@@ -651,7 +651,7 @@ func TestStartHLSPreparationSelectsOlderCachedRendition(t *testing.T) {
 		t.Fatalf("StartHLSPreparation() error = %v", err)
 	}
 
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatalf("list() error = %v", err)
 	}
@@ -669,7 +669,7 @@ func TestStartHLSPreparationSelectsOlderCachedRendition(t *testing.T) {
 	if err := store.finishPreparation(context.Background(), id, 1, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	downloads, err = store.list(context.Background())
+	downloads, err = store.list(context.Background(), true)
 	if err != nil {
 		t.Fatalf("list() after stale completion error = %v", err)
 	}
@@ -761,7 +761,7 @@ func TestResumePreparationsCleansFailedPayload(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatalf("list() error = %v", err)
 	}

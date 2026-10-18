@@ -32,7 +32,7 @@ func TestListDownloadsPreparationProgress(t *testing.T) {
 	m := &Manager{downloads: store, cfg: config.Config{HLSPath: filepath.Join(root, "hls")}}
 	check := func(stage string, index int, total int64, prepared float64) {
 		t.Helper()
-		downloads, err := m.ListDownloadProgress(t.Context())
+		downloads, err := m.ListDownloads(t.Context(), false)
 		if err != nil || len(downloads) != 1 {
 			t.Fatalf("ListDownloads = %+v, %v", downloads, err)
 		}
@@ -104,11 +104,11 @@ func TestDownloadProgressOmitsDiskUsage(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(paths.outDir, "video.ts"), make([]byte, 4096), 0644); err != nil {
 		t.Fatal(err)
 	}
-	full, err := m.ListDownloads(t.Context())
+	full, err := m.ListDownloads(t.Context(), true)
 	if err != nil || len(full) != 1 || full[0].DiskSize == 0 {
 		t.Fatalf("full listing = %+v, %v", full, err)
 	}
-	light, err := m.ListDownloadProgress(t.Context())
+	light, err := m.ListDownloads(t.Context(), false)
 	if err != nil || len(light) != 1 || light[0].DiskSize != 0 || light[0].ID != full[0].ID {
 		t.Fatalf("light listing = %+v, %v", light, err)
 	}
@@ -169,7 +169,7 @@ func TestListDownloadsUsesTorrentFileCompletion(t *testing.T) {
 				t.Fatal("verified payload did not become complete")
 			}
 		}
-		downloads, err := m.ListDownloads(t.Context())
+		downloads, err := m.ListDownloads(t.Context(), true)
 		if err != nil || len(downloads) != 1 {
 			t.Fatalf("ListDownloads = %+v, %v", downloads, err)
 		}

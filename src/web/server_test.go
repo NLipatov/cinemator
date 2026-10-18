@@ -90,12 +90,11 @@ func (m fakeTorrentManager) PrepareHlsStream(context.Context, string, int, int, 
 
 func (m fakeTorrentManager) TouchStream(context.Context, string) {}
 
-func (m fakeTorrentManager) ListDownloads(context.Context) ([]torrent.Download, error) {
+func (m fakeTorrentManager) ListDownloads(_ context.Context, includeDiskSize bool) ([]torrent.Download, error) {
+	if !includeDiskSize {
+		return m.progress, nil
+	}
 	return []torrent.Download{}, nil
-}
-
-func (m fakeTorrentManager) ListDownloadProgress(context.Context) ([]torrent.Download, error) {
-	return m.progress, nil
 }
 
 func TestDownloadProgressUsesLightweightListing(t *testing.T) {

@@ -94,11 +94,7 @@ func (s *downloadStore) upsert(ctx context.Context, id, magnet string, files []F
 	return download, nil
 }
 
-func (s *downloadStore) list(ctx context.Context) ([]Download, error) {
-	return s.listWithDiskSize(ctx, true)
-}
-
-func (s *downloadStore) listWithDiskSize(ctx context.Context, includeDiskSize bool) ([]Download, error) {
+func (s *downloadStore) list(ctx context.Context, includeDiskSize bool) ([]Download, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}

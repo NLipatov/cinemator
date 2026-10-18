@@ -282,7 +282,7 @@ func TestFinishConversionMakesBaseHLSTheReadyArtifact(t *testing.T) {
 	}
 	m.finishConversion(key, s, nil)
 
-	downloads, err := store.list(context.Background())
+	downloads, err := store.list(context.Background(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
