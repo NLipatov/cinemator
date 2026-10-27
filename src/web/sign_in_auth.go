@@ -35,6 +35,8 @@ type signInRequest struct {
 	expiresAt     time.Time
 	approved      chan struct{}
 	sessionWaiter chan struct{}
+	// Written once before approved is closed, then immutable for all waiters.
+	session session
 }
 
 func (s *Server) handleStartSignInRequest(w http.ResponseWriter, r *http.Request) {
@@ -132,12 +134,16 @@ func (s *Server) handleSignInRequestSession(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	token, expiresAt, err := s.auth.createSession()
+	if !request.session.expiresAt.After(time.Now()) {
+		http.Error(w, "approving session expired", http.StatusGone)
+		return
+	}
+	cookie, err := s.auth.createSession(request.session)
 	if err != nil {
 		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
 	}
-	http.SetCookie(w, sessionCookie(token, expiresAt, int(sessionTTL/time.Second)))
+	http.SetCookie(w, cookie)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -147,7 +153,7 @@ func (s *Server) handleSignInApproval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	if !s.auth.authenticated(r) {
+	if s.auth.sessionFromRequest(r) == nil {
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return
 	}
@@ -169,11 +175,12 @@ func (s *Server) handleApproveSignInRequest(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	if !s.auth.authenticated(r) {
+	approvingSession := s.auth.sessionFromRequest(r)
+	if approvingSession == nil {
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return
 	}
-	if !s.auth.approveSignInRequest(r.PathValue("approvalToken"), time.Now()) {
+	if !s.auth.approveSignInRequest(r.PathValue("approvalToken"), *approvingSession, time.Now()) {
 		http.Error(w, "sign-in request expired", http.StatusGone)
 		return
 	}
@@ -185,7 +192,7 @@ func (s *Server) handleSignInApprovalPage(w http.ResponseWriter, r *http.Request
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	if !s.auth.authenticated(r) {
+	if s.auth.sessionFromRequest(r) == nil {
 		next := url.QueryEscape(r.URL.RequestURI())
 		http.Redirect(w, r, "/login?next="+next, http.StatusSeeOther)
 		return
@@ -244,10 +251,13 @@ func (a *authenticator) signInRequestForApproval(approvalToken string, now time.
 	return nil, false
 }
 
-func (a *authenticator) approveSignInRequest(approvalToken string, now time.Time) bool {
+func (a *authenticator) approveSignInRequest(approvalToken string, approvingSession session, now time.Time) bool {
 	a.signInMu.Lock()
 	defer a.signInMu.Unlock()
 	a.removeExpiredSignInRequestsLocked(now)
+	if !approvingSession.expiresAt.After(now) {
+		return false
+	}
 	for _, request := range a.signInRequests {
 		if subtle.ConstantTimeCompare([]byte(request.approvalToken), []byte(approvalToken)) != 1 {
 			continue
@@ -255,6 +265,7 @@ func (a *authenticator) approveSignInRequest(approvalToken string, now time.Time
 		select {
 		case <-request.approved:
 		default:
+			request.session = approvingSession
 			close(request.approved)
 		}
 		return true
