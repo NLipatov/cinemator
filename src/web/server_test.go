@@ -441,7 +441,7 @@ func TestAPIErrorsPreserveStatusAndBodyWithOptionalTranslationCode(t *testing.T)
 func TestLocalizationAssetsAreAvailableBeforeLogin(t *testing.T) {
 	t.Chdir("..")
 	_, handler := sessionServerForTest(t)
-	for _, path := range []string{"/i18n.js", "/locales/en.js", "/locales/ru.js", "/locales/zh-Hans.js"} {
+	for _, path := range []string{"/i18n.js", "/locales/en.js", "/locales/ru.js", "/locales/zh-Hans.js", "/locales/zh-Hant.js"} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 		if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), "javascript") || rec.Body.Len() == 0 {

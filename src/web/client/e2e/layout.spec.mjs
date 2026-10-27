@@ -70,9 +70,10 @@ async function openPage(page, path, language) {
 }
 
 for (const [languages, expected] of [
-  [["zh-TW", "en-US"], "en"],
-  [["zh-Hant-CN", "ru"], "ru"],
+  [["zh-TW", "en-US"], "zh-Hant"],
+  [["zh-Hant-CN", "ru"], "zh-Hant"],
   [["zh-Hans-TW", "en"], "zh-Hans"],
+  [["zh-Latn", "en-US"], "en"],
 ]) {
   test(`browser preferences ${languages.join(", ")} select and persist ${expected}`, async ({
     page,
@@ -129,7 +130,7 @@ async function layoutProblems(page) {
   });
 }
 
-for (const language of ["en", "ru", "zh-Hans"]) {
+for (const language of ["en", "ru", "zh-Hans", "zh-Hant"]) {
   for (const path of ["/", "/login", "/sign-in-approvals/test"]) {
     test(`${language} ${path}: labels fit at different widths and font sizes`, async ({ page }) => {
       await openPage(page, path, language);
@@ -148,6 +149,29 @@ for (const language of ["en", "ru", "zh-Hans"]) {
       }
     });
   }
+}
+
+for (const [path, key, translated] of [
+  ["/", "player.load", "載入"],
+  ["/login", "auth.continue", "繼續"],
+  ["/sign-in-approvals/test", "approval.allow", "允許"],
+]) {
+  test(`${path}: selecting Traditional Chinese updates the page and survives reload`, async ({
+    page,
+  }) => {
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, "languages", { value: ["en-US"] });
+    });
+    await openPage(page, path);
+    await expect(page.locator("html")).toHaveAttribute("lang", "en");
+    await page.locator("#languageSelect").selectOption("zh-Hant");
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh-Hant");
+    await expect(page.locator(`[data-i18n="${key}"]`)).toHaveText(translated);
+    await page.reload();
+    await expect(page.locator("html")).toHaveAttribute("lang", "zh-Hant");
+    await expect(page.locator("#languageSelect")).toHaveValue("zh-Hant");
+    await expect(page.locator(`[data-i18n="${key}"]`)).toHaveText(translated);
+  });
 }
 
 test("long and unbroken translated labels wrap without squeezing the magnet field away", async ({

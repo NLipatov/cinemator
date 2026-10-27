@@ -1,8 +1,9 @@
 import en from './locales/en.js';
 import ru from './locales/ru.js';
-import zh from './locales/zh-Hans.js';
+import zhHans from './locales/zh-Hans.js';
+import zhHant from './locales/zh-Hant.js';
 
-const messages = { en, ru, 'zh-Hans': zh };
+const messages = { en, ru, 'zh-Hans': zhHans, 'zh-Hant': zhHant };
 const storageKey = 'cinemator-language';
 let language;
 try {
@@ -15,7 +16,7 @@ if (!Object.hasOwn(messages, language)) {
         try {
           const locale = new Intl.Locale(tag);
           if (locale.language !== 'zh') return locale.language;
-          return locale.maximize().script === 'Hans' ? 'zh-Hans' : undefined;
+          return `zh-${locale.maximize().script}`;
         } catch {
           return undefined;
         }

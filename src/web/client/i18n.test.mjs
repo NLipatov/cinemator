@@ -3,7 +3,8 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import en from './index/locales/en.js';
 import ru from './index/locales/ru.js';
-import zh from './index/locales/zh-Hans.js';
+import zhHans from './index/locales/zh-Hans.js';
+import zhHant from './index/locales/zh-Hant.js';
 
 let instance = 0;
 async function openClient({ languages = ['en'], storage = new Map(), blocked = false } = {}) {
@@ -52,18 +53,20 @@ test('first supported browser preference is selected and persisted', async () =>
 
 test('Chinese browser preferences respect script and region', async () => {
   for (const [languages, expected] of [
-    [['zh-TW', 'en-US'], 'en'],
-    [['zh-HK', 'ru-RU'], 'ru'],
-    [['zh-MO', 'en-GB'], 'en'],
-    [['zh-Hant', 'ru'], 'ru'],
-    [['zh-Hant-CN', 'ru'], 'ru'],
-    [['zh-TW'], 'en'],
+    [['zh-TW', 'en-US'], 'zh-Hant'],
+    [['zh-HK', 'ru-RU'], 'zh-Hant'],
+    [['zh-MO', 'en-GB'], 'zh-Hant'],
+    [['zh-Hant', 'ru'], 'zh-Hant'],
+    [['zh-Hant-CN', 'ru'], 'zh-Hant'],
+    [['zh-TW'], 'zh-Hant'],
     [['zh-Hans-TW', 'en'], 'zh-Hans'],
     [['zh-Hans-HK'], 'zh-Hans'],
     [['zh-SG'], 'zh-Hans'],
-    [['zh-Hant-TW', 'zh-CN', 'en'], 'zh-Hans'],
-    [['ZH-hAnT-cn', 'ru'], 'ru'],
+    [['zh-Hant-TW', 'zh-CN', 'en'], 'zh-Hant'],
+    [['ZH-hAnT-cn', 'ru'], 'zh-Hant'],
     [['zh-CN-u-ca-chinese'], 'zh-Hans'],
+    [['zh-HK-u-nu-hanidec'], 'zh-Hant'],
+    [['zh-Latn', 'en-US'], 'en'],
     [['zh--TW', 'ru'], 'ru'],
   ]) {
     const client = await openClient({ languages });
@@ -73,12 +76,17 @@ test('Chinese browser preferences respect script and region', async () => {
   }
 });
 
-test('saved Simplified Chinese takes priority over a Traditional Chinese browser preference', async () => {
-  const storage = new Map([['cinemator-language', 'zh-Hans']]);
-  const client = await openClient({ languages: ['zh-TW', 'en-US'], storage });
-  assert.equal(client.document.documentElement.lang, 'zh-Hans');
-  assert.equal(client.select.value, 'zh-Hans');
-  assert.equal(storage.get('cinemator-language'), 'zh-Hans');
+test('saved Chinese script takes priority over the browser preference', async () => {
+  for (const [saved, preferred] of [
+    ['zh-Hans', 'zh-TW'],
+    ['zh-Hant', 'zh-CN'],
+  ]) {
+    const storage = new Map([['cinemator-language', saved]]);
+    const client = await openClient({ languages: [preferred, 'en-US'], storage });
+    assert.equal(client.document.documentElement.lang, saved);
+    assert.equal(client.select.value, saved);
+    assert.equal(storage.get('cinemator-language'), saved);
+  }
 });
 
 test('automatically selected language survives a browser language change', async () => {
@@ -163,7 +171,7 @@ test('messages retain parameters for retranslation and insert plain text', async
 
 test('all languages cover the same keys and interpolation parameters', () => {
   const placeholders = (value) => [...value.matchAll(/\{(\w+)\}/g)].map((m) => m[1]).sort();
-  for (const messages of [ru, zh]) {
+  for (const messages of [ru, zhHans, zhHant]) {
     assert.deepEqual(Object.keys(messages).sort(), Object.keys(en).sort());
     for (const [key, value] of Object.entries(messages)) {
       const base = typeof en[key] === 'string' ? en[key] : en[key].other;
