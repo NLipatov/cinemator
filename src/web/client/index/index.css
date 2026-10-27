@@ -609,6 +609,7 @@ button:disabled {
 }
 
 .download-action.delete {
+  grid-column: 2;
   color: var(--color-error);
   background: transparent;
   border-color: transparent;
