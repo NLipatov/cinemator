@@ -43,6 +43,10 @@ jobs:
         working-directory: src
         run: go test -race ./...
 
+      - name: Test localization
+        working-directory: src
+        run: node --test web/client/i18n.test.mjs
+
   release-please:
     runs-on: ubuntu-latest
     if: github.event_name == 'push'

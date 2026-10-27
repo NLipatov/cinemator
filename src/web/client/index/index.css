@@ -178,12 +178,15 @@ button:disabled {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 0.5rem;
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 0.35rem;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .brand-name {
@@ -204,6 +207,13 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  flex-shrink: 0;
+}
+
+.language-select {
+  width: 6.5rem;
+  padding-inline: 0.6rem 0.25rem;
+  font-size: 0.82rem;
 }
 
 .auth-logout,
@@ -922,6 +932,23 @@ button:disabled {
 }
 
 @media (max-width: 32rem) {
+  .topbar {
+    padding-inline: 0.75rem;
+  }
+
+  .top-actions {
+    gap: 0.25rem;
+  }
+
+  .language-select {
+    width: 6rem;
+    padding-inline: 0.4rem 0.25rem;
+  }
+
+  .auth-logout {
+    padding-inline: 0.2rem;
+  }
+
   .input-row,
   .track-row {
     grid-template-columns: minmax(0, 1fr);

@@ -78,6 +78,8 @@ func (s *Server) handler() http.Handler {
 	root.Handle("/index.css", http.FileServer(http.Dir(clientDir)))
 	root.Handle("/login.js", http.FileServer(http.Dir(clientDir)))
 	root.Handle("/theme.js", http.FileServer(http.Dir(clientDir)))
+	root.Handle("/i18n.js", http.FileServer(http.Dir(clientDir)))
+	root.Handle("/locales/", http.FileServer(http.Dir(clientDir)))
 	root.Handle("/sign-in-approval.js", http.FileServer(http.Dir(clientDir)))
 	root.HandleFunc("/login", s.handleLoginPage)
 	root.HandleFunc("GET /sign-in-approvals/{approvalToken}", s.handleSignInApprovalPage)
@@ -116,7 +118,7 @@ func (s *Server) handleGetTorrentFiles(w http.ResponseWriter, r *http.Request) {
 	}
 	files, err := s.mgr.GetTorrentFiles(r.Context(), magnet)
 	if err != nil {
-		http.Error(w, err.Error(), apiErrorStatus(err))
+		writeAPIError(w, err)
 		return
 	}
 
@@ -137,7 +139,7 @@ func (s *Server) handleGetMediaInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := s.mgr.GetMediaInfo(r.Context(), magnet, fileIndex)
 	if err != nil {
-		http.Error(w, err.Error(), apiErrorStatus(err))
+		writeAPIError(w, err)
 		return
 	}
 
@@ -225,7 +227,7 @@ func (s *Server) handleDownloadAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.mgr.DeleteDownload(r.Context(), id); err != nil {
-			http.Error(w, err.Error(), apiErrorStatus(err))
+			writeAPIError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
@@ -245,7 +247,7 @@ func (s *Server) handleDownloadAction(w http.ResponseWriter, r *http.Request) {
 		}
 		download, err := s.mgr.ExtendDownload(r.Context(), id, time.Duration(days)*24*time.Hour)
 		if err != nil {
-			http.Error(w, err.Error(), apiErrorStatus(err))
+			writeAPIError(w, err)
 			return
 		}
 		writeJSON(w, download)
@@ -268,7 +270,7 @@ func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) 
 	}
 	if r.Method == http.MethodPost {
 		if err := s.ensureHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
-			http.Error(w, err.Error(), apiErrorStatus(err))
+			writeAPIError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -286,13 +288,13 @@ func (s *Server) handlePrepareHlsStream(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.ensureHLSPreparation(r.Context(), magnet, fileIndex); err != nil {
-		http.Error(w, err.Error(), apiErrorStatus(err))
+		writeAPIError(w, err)
 		return
 	}
 
 	playlist, err := s.mgr.PrepareHlsStream(r.Context(), magnet, fileIndex, audioTrack, subtitleTrack)
 	if err != nil {
-		http.Error(w, err.Error(), apiErrorStatus(err))
+		writeAPIError(w, err)
 		return
 	}
 	http.Redirect(
@@ -356,17 +358,24 @@ func writeSSEEvent(w io.Writer, event string) error {
 	return err
 }
 
-func apiErrorStatus(err error) int {
-	if errors.Is(err, torrent.ErrBadDownloadID) || errors.Is(err, torrent.ErrUnsupportedMagnetVersion) {
-		return http.StatusBadRequest
+func writeAPIError(w http.ResponseWriter, err error) {
+	status, code := http.StatusInternalServerError, ""
+	switch {
+	case errors.Is(err, torrent.ErrUnsupportedMagnetVersion):
+		status, code = http.StatusBadRequest, "unsupported_magnet"
+	case errors.Is(err, torrent.ErrBadDownloadID):
+		status, code = http.StatusBadRequest, "bad_download_id"
+	case errors.Is(err, torrent.ErrDownloadNotFound):
+		status, code = http.StatusNotFound, "download_not_found"
+	case errors.Is(err, torrent.ErrDownloadNotReady):
+		status, code = http.StatusConflict, "download_not_ready"
+	case errors.Is(err, media.ErrSubtitleTrackEmpty):
+		code = "empty_subtitle_track"
 	}
-	if errors.Is(err, torrent.ErrDownloadNotFound) {
-		return http.StatusNotFound
+	if code != "" {
+		w.Header().Set("X-Error-Code", code)
 	}
-	if errors.Is(err, torrent.ErrDownloadNotReady) {
-		return http.StatusConflict
-	}
-	return http.StatusInternalServerError
+	http.Error(w, err.Error(), status)
 }
 
 func (s *Server) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {

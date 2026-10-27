@@ -1,12 +1,26 @@
+import { t, setText, number, errorKey } from './i18n.js';
+
     // Main logic
     const $ = id => document.getElementById(id);
     async function apiFetch(input, init) {
       const response = await window.fetch(input, init);
       if (response.status === 401) {
         window.location.replace('/login');
-        throw new Error('Session expired');
+        throw new Error('auth.sessionExpired');
       }
       return response;
+    }
+
+    async function responseError(response, fallback) {
+      const error = new Error('errors.' + response.headers.get('X-Error-Code'));
+      error.message = errorKey(error, fallback);
+      error.detail = (await response.text()).trim();
+      return error;
+    }
+
+    function showError(id, error, fallback) {
+      showMsg(id, errorKey(error, fallback), true);
+      $(id).title = error.detail || '';
     }
 
     const versionLabel = $('appVersion');
@@ -33,7 +47,7 @@
         logoutBtn.disabled = true;
         try {
           const response = await apiFetch('/api/auth/logout', { method: 'POST' });
-          if (!response.ok) throw new Error('Could not sign out');
+          if (!response.ok) throw new Error('auth.signOutFailed');
           window.location.replace('/login');
         } catch (error) {
           if (window.location.pathname !== '/login') logoutBtn.disabled = false;
@@ -96,27 +110,37 @@
       oldVideo.parentNode.replaceChild(newVideo, oldVideo);
       newVideo.id = 'video';
     }
+    const optionLabels = new WeakMap();
     function setOptions(select, options) {
-      select.replaceChildren(...options.map(({ value, label }) => new Option(label, String(value))));
+      select.replaceChildren(...options.map(({ value, label }) => {
+        const option = new Option(label(), String(value));
+        optionLabels.set(option, label);
+        return option;
+      }));
     }
     function setFileList(files) {
       setOptions($('filelist'), files.map(f => ({
         value: f.index,
-        label: `${f.name} (${formatBytes(f.size)})`,
+        label: () => `${f.name} (${formatBytes(f.size)})`,
       })));
     }
-    function showMsg(id, msg, isErr=false, loader=false) {
+    function showMsg(id, key, isErr=false, loader=false, params={}) {
       clearTimeout(msgTimeout);
       const el = $(id);
       el.textContent = '';
+      el.removeAttribute('title');
       if (loader) {
         const spinner = document.createElement('span');
         spinner.className = 'loader';
         el.appendChild(spinner);
       }
-      if (msg) el.appendChild(document.createTextNode(msg));
+      if (key) {
+        const text = document.createElement('span');
+        setText(text, key, params);
+        el.appendChild(text);
+      }
       el.className = 'msg' + (isErr ? ' error' : '');
-      const shouldAutoClear = msg && !isErr && !loader;
+      const shouldAutoClear = key && !isErr && !loader;
       if (shouldAutoClear) {
         msgTimeout = setTimeout(() => { el.textContent = ''; }, 2200);
       }
@@ -130,7 +154,7 @@
     function setWarningExtra(msg) {
       const extra = document.getElementById('warn-extra');
       if (!extra) return;
-      extra.textContent = msg || '';
+      setText(extra, msg);
       extra.hidden = !msg;
     }
     function clearSubtitleWait() {
@@ -147,7 +171,7 @@
     }
 
     function formatBytes(bytes) {
-      if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+      if (!Number.isFinite(bytes) || bytes <= 0) return `${number(0)} ${t('units.B')}`;
       const units = ['B', 'KB', 'MB', 'GB', 'TB'];
       let value = bytes;
       let idx = 0;
@@ -156,22 +180,22 @@
         idx++;
       }
       const digits = value >= 10 || idx === 0 ? 0 : 1;
-      return `${value.toFixed(digits)} ${units[idx]}`;
+      return `${number(value, { minimumFractionDigits: digits, maximumFractionDigits: digits })} ${t('units.' + units[idx])}`;
     }
 
     function formatExpiry(value) {
       const expires = new Date(value);
-      if (!Number.isFinite(expires.getTime()) || expires.getUTCFullYear() <= 1) return 'no expiry';
+      if (!Number.isFinite(expires.getTime()) || expires.getUTCFullYear() <= 1) return t('downloads.noExpiry');
       const diffMs = expires.getTime() - Date.now();
       const absMs = Math.abs(diffMs);
       const units = [
-        { label: 'd', ms: 24 * 60 * 60 * 1000 },
-        { label: 'h', ms: 60 * 60 * 1000 },
-        { label: 'm', ms: 60 * 1000 },
+        { label: 'day', ms: 24 * 60 * 60 * 1000 },
+        { label: 'hour', ms: 60 * 60 * 1000 },
+        { label: 'minute', ms: 60 * 1000 },
       ];
       const unit = units.find(u => absMs >= u.ms) || units[units.length - 1];
       const valueRounded = Math.max(1, Math.round(absMs / unit.ms));
-      return diffMs < 0 ? `expired ${valueRounded}${unit.label} ago` : `${valueRounded}${unit.label} left`;
+      return t(diffMs < 0 ? 'downloads.expiredAgo' : 'downloads.remaining', { duration: t('downloads.duration.' + unit.label, { count: valueRounded }) });
     }
 
     function formatDownloadSize(download) {
@@ -181,38 +205,38 @@
 
     function formatDownloadState(download) {
       if (download.status === 'ready') return formatExpiry(download.expiresAt);
-      if (download.status === 'preparing') return 'preparing';
-      if (download.status === 'failed') return download.preparationError || 'preparation failed';
-      if (download.status === 'expired') return 'expired';
-      return 'select a video';
+      if (download.status === 'preparing') return t('downloads.preparing');
+      if (download.status === 'failed') return t('progress.failed');
+      if (download.status === 'expired') return t('downloads.expired');
+      return t('downloads.selectVideo');
     }
 
     function preparationStage(progress) {
-      if (progress.stage === 'playable') return 'Video segments ready · preparing the rest';
-      if (progress.stage === 'preparing') return 'Preparing video';
-      return 'Downloading initial data and reading video tracks';
+      if (progress.stage === 'playable') return t('progress.playable');
+      if (progress.stage === 'preparing') return t('progress.preparing');
+      return t('progress.analyzing');
     }
 
     function preparationDetails(progress) {
-      const parts = [`Downloaded ${formatBytes(progress.downloadedBytes)} / ${formatBytes(progress.totalBytes)}`];
+      const parts = [t('progress.downloaded', { downloaded: formatBytes(progress.downloadedBytes), total: formatBytes(progress.totalBytes) })];
       if (progress.totalBytes > 0) {
         const percent = Math.min(100, Math.floor(100 * progress.downloadedBytes / progress.totalBytes));
-        parts[0] += ` (${percent}%)`;
+        parts[0] += ` (${number(percent / 100, { style: 'percent' })})`;
       }
       if (progress.totalBytes > 0 && progress.downloadedBytes < progress.totalBytes) {
-        parts.push(Number.isFinite(progress.downloadSpeed) ? `${formatBytes(progress.downloadSpeed)}/s` : 'Measuring speed…');
-        parts.push(`${progress.peers} ${progress.peers === 1 ? 'peer' : 'peers'}`);
+        parts.push(Number.isFinite(progress.downloadSpeed) ? t('progress.speed', { speed: formatBytes(progress.downloadSpeed) }) : t('progress.measuring'));
+        parts.push(t('progress.peers', { count: progress.peers }));
       }
       return parts.join(' · ');
     }
 
     function preparedVideo(progress) {
       const seconds = Math.floor(progress.preparedSeconds);
-      if (seconds <= 0) return 'Waiting for the first video segment…';
+      if (seconds <= 0) return t('progress.waitingSegment');
       const hours = Math.floor(seconds / 3600);
       const minutes = Math.floor(seconds / 60) % 60;
       const clock = `${hours ? `${hours}:${String(minutes).padStart(2, '0')}` : minutes}:${String(seconds % 60).padStart(2, '0')}`;
-      return `Video prepared: ${clock}`;
+      return t('progress.prepared', { time: clock });
     }
 
     function updateDownloadSamples(downloads) {
@@ -243,29 +267,30 @@
       const progress = download?.progress;
       const matches = progress && progress.fileIndex === Number($('filelist').value);
       const selected = download?.selectedFileIndex === Number($('filelist').value);
-      let stage = 'Preparing selected video…';
+      let stage = t('progress.selectedVideo');
       let details = '';
       if (matches) {
         stage = preparationStage(progress);
         details = preparationDetails(progress);
       } else if (selected && download.status === 'failed') {
-        stage = 'Preparation failed';
-        details = download.preparationError || 'Could not prepare video';
+        stage = t('progress.failed');
+        details = t('errors.preparation');
       } else if (selected && download.status === 'ready') {
-        stage = 'Video is ready to play';
+        stage = t('progress.ready');
       }
       if (flowRequestController && (matches && progress.stage === 'playable' || selected && download.status === 'ready')) {
-        stage = 'Preparing selected stream…';
+        stage = t('progress.selectedStream');
       }
       if (progressUnavailable) {
-        stage = 'Reconnecting to the server…';
-        details = 'Progress is unavailable. Retrying…';
+        stage = t('progress.reconnectingServer');
+        details = t('progress.unavailable');
       }
       $('preparationStage').textContent = stage;
       const bar = $('preparationProgress');
       bar.hidden = !matches || progressUnavailable || progress.totalBytes <= 0;
       if (!bar.hidden) bar.value = Math.min(1, progress.downloadedBytes / progress.totalBytes);
       $('preparationDetails').textContent = details;
+      $('preparationDetails').title = selected && download.status === 'failed' ? download.preparationError || '' : '';
       $('preparationVideo').textContent = matches && !progressUnavailable ? preparedVideo(progress) : '';
     }
 
@@ -316,7 +341,7 @@
       if (!downloads.length) {
         const empty = document.createElement('div');
         empty.className = 'downloads-empty';
-        empty.textContent = 'No downloads yet';
+        empty.textContent = t('downloads.empty');
         list.replaceChildren(empty);
         return;
       }
@@ -337,20 +362,21 @@
         } else {
           row.querySelector('.download-open').removeAttribute('aria-current');
         }
-        row.querySelector('.download-title').textContent = download.title || `Torrent ${download.id.slice(0, 8)}`;
+        row.querySelector('.download-title').textContent = download.title || t('downloads.torrent', { id: download.id.slice(0, 8) });
         row.querySelector('.download-subtitle').textContent = download.id;
         row.querySelector('.download-meta-text').textContent = `${formatDownloadSize(download)} · ${formatDownloadState(download)}`;
         row.querySelector('.download-meta-text').classList.remove('has-progress');
+        row.querySelector('.download-meta-text').title = download.preparationError || '';
         row.querySelector('.download-progress').hidden = true;
         const progressAtPlayer = download.id === activeDownloadID && !$('warnMsg').hidden &&
           download.progress?.fileIndex === Number($('filelist').value);
         if (progressAtPlayer) {
-          row.querySelector('.download-meta-text').textContent = progressUnavailable ? 'Reconnecting…' :
-            download.progress.stage === 'playable' && !flowRequestController ? 'Ready to play' : 'Preparing';
+          row.querySelector('.download-meta-text').textContent = progressUnavailable ? t('progress.reconnecting') :
+            download.progress.stage === 'playable' && !flowRequestController ? t('downloads.ready') : t('downloads.preparing');
         } else if (download.progress) {
           const meta = row.querySelector('.download-meta-text');
           meta.classList.add('has-progress');
-          meta.textContent = progressUnavailable ? 'Progress unavailable · reconnecting…' :
+          meta.textContent = progressUnavailable ? t('progress.reconnectingDetails') :
             `${preparationStage(download.progress)} · ${preparationDetails(download.progress)} · ${preparedVideo(download.progress)}`;
           const bar = row.querySelector('.download-progress');
           bar.hidden = progressUnavailable || download.progress.totalBytes <= 0;
@@ -378,10 +404,10 @@
         return;
       }
       downloadsLoading = true;
-      if (!quiet) showMsg('downloadsMsg', 'Loading downloads...', false, true);
+      if (!quiet) showMsg('downloadsMsg', 'downloads.loading', false, true);
       try {
         const res = await apiFetch('/api/downloads' + (progressOnly ? '?progress=1' : ''));
-        if (!res.ok) throw new Error('Could not load downloads');
+        if (!res.ok) throw await responseError(res, 'errors.downloads');
         const downloads = await res.json();
         if (progressOnly) {
           const diskSizes = new Map(downloadCatalog.map(download => [download.id, download.diskSize]));
@@ -404,7 +430,7 @@
         renderDownloads(downloadCatalog);
         renderPreparationProgress();
         if (!suppressError) {
-          showMsg('downloadsMsg', e.message || 'Could not load downloads', true);
+          showError('downloadsMsg', e, 'errors.downloads');
         }
       } finally {
         downloadsLoading = false;
@@ -437,7 +463,7 @@
 
     function openDownload(download) {
       if (!download || !download.magnet || !download.files || download.files.length === 0) {
-        showMsg('downloadsMsg', 'Download metadata is incomplete', true);
+        showMsg('downloadsMsg', 'downloads.incomplete', true);
         return;
       }
       cancelFlowRequest();
@@ -459,29 +485,29 @@
     }
 
     async function extendDownload(id, days) {
-      showMsg('downloadsMsg', 'Extending download...', false, true);
+      showMsg('downloadsMsg', 'downloads.extending', false, true);
       try {
         const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}/extend`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ days }),
         });
-        if (!res.ok) throw new Error('Could not extend download');
+        if (!res.ok) throw await responseError(res, 'errors.extend');
         await loadDownloads({ quiet: true });
-        showMsg('downloadsMsg', `Download extended by ${days}d`);
+        showMsg('downloadsMsg', 'downloads.extended', false, false, { count: days });
       } catch (e) {
-        showMsg('downloadsMsg', e.message || 'Could not extend download', true);
+        showError('downloadsMsg', e, 'errors.extend');
       }
     }
 
     async function deleteDownload(id) {
       const download = findDownload(id);
-      if (!download || !window.confirm(`Delete ${download.title || id}?`)) return;
+      if (!download || !window.confirm(t('downloads.confirmDelete', { title: download.title || id }))) return;
       const deletingCurrentDownload = activeDownloadID === id;
-      showMsg('downloadsMsg', 'Deleting download...', false, true);
+      showMsg('downloadsMsg', 'downloads.deleting', false, true);
       try {
         const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
-        if (!res.ok) throw new Error('Could not delete download');
+        if (!res.ok) throw await responseError(res, 'errors.delete');
         if (deletingCurrentDownload && activeDownloadID === id) {
           cancelFlowRequest();
           destroyVideoAndHls();
@@ -494,9 +520,9 @@
           removeWarning();
         }
         await loadDownloads({ quiet: true });
-        showMsg('downloadsMsg', 'Download deleted');
+        showMsg('downloadsMsg', 'downloads.deleted');
       } catch (e) {
-        showMsg('downloadsMsg', e.message || 'Could not delete download', true);
+        showError('downloadsMsg', e, 'errors.delete');
       }
     }
 
@@ -585,14 +611,14 @@
       e.preventDefault();
       const magnet = $('magnet').value.trim();
       if (!magnet) {
-        showMsg('magnetMsg', 'Magnet link required', true);
+        showMsg('magnetMsg', 'player.magnetRequired', true);
         return;
       }
       setActiveDownload(downloadCatalog.find(download => download.magnet === magnet)?.id || null);
       const request = beginFlowRequest();
       const requestId = request.id;
       destroyVideoAndHls();
-      showMsg('magnetMsg', 'Finding peers and loading the file list…', false, true);
+      showMsg('magnetMsg', 'player.loadingFiles', false, true);
       $('filelist').textContent = '';
       $('step-files').style.display = 'none';
       $('step-tracks').style.display = 'none';
@@ -600,10 +626,10 @@
       removeWarning();
       try {
         const res = await apiFetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: request.signal });
-        if (!res.ok) throw new Error((await res.text()).trim() || 'Server error');
+        if (!res.ok) throw await responseError(res, 'errors.files');
         const files = await res.json();
         if (isStale(requestId)) return;
-        if (!files.length) throw new Error('No playable files found in torrent');
+        if (!files.length) throw new Error('errors.noFiles');
         setFileList(files);
         $('step-files').style.display = '';
         showMsg('magnetMsg', '');
@@ -611,7 +637,7 @@
       } catch (e) {
         if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
-        showMsg('magnetMsg', e.message || 'Error loading files', true);
+        showError('magnetMsg', e, 'errors.files');
         return;
       } finally {
         finishFlowRequest(request);
@@ -619,7 +645,7 @@
     };
 
     function formatTrackLabel(track, type) {
-      let label = type === 'audio' ? `Track ${track.index + 1}` : `Subtitle ${track.index + 1}`;
+      let label = t(type === 'audio' ? 'player.track' : 'player.subtitle', { index: track.index + 1 });
       if (track.language) label += ` [${track.language}]`;
       if (track.title) label += ` - ${track.title}`;
       if (track.codec) label += ` (${track.codec})`;
@@ -630,12 +656,12 @@
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
       if (!magnet || idx === undefined || idx === '') {
-        showMsg('fileMsg', 'Select a file first', true);
+        showMsg('fileMsg', 'player.selectFile', true);
         return;
       }
       const request = beginFlowRequest();
       const requestId = request.id;
-      showMsg('fileMsg', 'Loading track info…', false, true);
+      showMsg('fileMsg', 'player.loadingTracks', false, true);
       $('step-tracks').style.display = 'none';
       showWarning();
       try {
@@ -643,10 +669,10 @@
           method: 'POST',
           signal: request.signal,
         });
-        if (!prepare.ok) throw new Error((await prepare.text()).trim() || 'Could not start preparation');
+        if (!prepare.ok) throw await responseError(prepare, 'errors.startPreparation');
         loadDownloads({ quiet: true });
         const res = await apiFetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal });
-        if (!res.ok) throw new Error((await res.text()).trim() || 'Could not load media info');
+        if (!res.ok) throw await responseError(res, 'errors.mediaInfo');
         const info = await res.json();
         if (isStale(requestId)) return;
         loadDownloads({ quiet: true });
@@ -661,8 +687,8 @@
         // If nothing to choose, play immediately
         if (audioCount <= 1 && subCount === 0) {
           showMsg('fileMsg', '');
-          setOptions(audioSelect, [{ value: 0, label: 'Default' }]);
-          setOptions(subSelect, [{ value: -1, label: 'None' }]);
+          setOptions(audioSelect, [{ value: 0, label: () => t('player.default') }]);
+          setOptions(subSelect, [{ value: -1, label: () => t('player.none') }]);
           if (audioRow) audioRow.style.display = 'none';
           if (subRow) subRow.style.display = 'none';
           $('play').click();
@@ -673,22 +699,22 @@
         if (audioCount > 1) {
           setOptions(audioSelect, info.audioTracks.map(t => ({
             value: t.index,
-            label: formatTrackLabel(t, 'audio'),
+            label: () => formatTrackLabel(t, 'audio'),
           })));
           if (audioRow) audioRow.style.display = '';
         } else {
-          setOptions(audioSelect, [{ value: 0, label: 'Default' }]);
+          setOptions(audioSelect, [{ value: 0, label: () => t('player.default') }]);
           if (audioRow) audioRow.style.display = 'none';
         }
 
         // Subtitles
-        setOptions(subSelect, [{ value: -1, label: 'None' }]);
+        setOptions(subSelect, [{ value: -1, label: () => t('player.none') }]);
         if (subCount > 0) {
           setOptions(subSelect, [
-            { value: -1, label: 'None' },
+            { value: -1, label: () => t('player.none') },
             ...info.subtitles.map(t => ({
               value: t.index,
-              label: formatTrackLabel(t, 'subtitle'),
+              label: () => formatTrackLabel(t, 'subtitle'),
             })),
           ]);
           if (subRow) subRow.style.display = '';
@@ -704,7 +730,7 @@
         if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
         removeWarning();
-        showMsg('fileMsg', e.message || 'Error loading tracks', true);
+        showError('fileMsg', e, 'errors.tracks');
       } finally {
         finishFlowRequest(request);
       }
@@ -717,7 +743,7 @@
       const subtitle = $('subtitleSelect').value || '-1';
       const subtitleSelected = parseInt(subtitle, 10) >= 0;
       if (!magnet || idx === undefined || idx === '') {
-        showMsg('trackMsg', 'Select a file first', true);
+        showMsg('trackMsg', 'player.selectFile', true);
         return;
       }
       const request = beginFlowRequest();
@@ -734,7 +760,7 @@
       if (subtitleSelected) {
         clearSubtitleWait();
         subtitleWaitTimer = setTimeout(() => {
-          setWarningExtra('Waiting for subtitles...');
+          setWarningExtra('player.waitingSubtitles');
         }, 8000);
       }
       try {
@@ -742,7 +768,7 @@
           redirect: 'follow',
           signal: request.signal,
         });
-        if (!resp.ok) throw new Error((await resp.text()).trim() || 'Stream error');
+        if (!resp.ok) throw await responseError(resp, 'errors.stream');
         if (isStale(requestId)) return;
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
         $('player-block').style.display = '';
@@ -753,8 +779,7 @@
         if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
         removeWarning();
-        const msg = e.message || 'Could not start stream';
-        showMsg('trackMsg', msg, true);
+        showError('trackMsg', e, 'errors.stream');
         return;
       } finally {
         finishFlowRequest(request);
@@ -817,7 +842,8 @@
 
     function showPlaybackError(details) {
       removeWarning();
-      showMsg('playerMsg', 'Playback error: ' + (details || 'Fatal error'), true);
+      showMsg('playerMsg', 'player.playbackError', true);
+      $('playerMsg').title = details || '';
     }
 
     function playHls(src, enableSubtitles, resumeTime = 0) {
@@ -879,7 +905,7 @@
             return;
           }
           if (data.fatal) {
-            showPlaybackError(data.details || 'Fatal error');
+            showPlaybackError(data.details);
           }
         });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -896,13 +922,15 @@
         }, { once: true });
       } else {
         removeWarning();
-        showMsg('playerMsg', 'Your browser does not support HLS.', true);
+        showMsg('playerMsg', 'player.hlsUnsupported', true);
       }
     }
 
     function updateDelayDisplay() {
       const el = $('subDelayValue');
-      if (el) el.textContent = `${subtitleDelay.toFixed(1)}s`;
+      if (el) setText(el, 'player.seconds', { value: number(subtitleDelay, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) });
+      setText($('subDelayMinus'), 'player.seconds', { value: number(-0.5) });
+      setText($('subDelayPlus'), 'player.seconds', { value: number(0.5, { signDisplay: 'always' }) });
     }
     function changeDelay(delta) {
       subtitleDelay = Math.max(-10, Math.min(10, subtitleDelay + delta));
@@ -918,3 +946,13 @@
     const plusBtn = $('subDelayPlus');
     if (minusBtn) minusBtn.onclick = () => changeDelay(-0.5);
     if (plusBtn) plusBtn.onclick = () => changeDelay(0.5);
+
+    document.addEventListener('cinemator:languagechange', () => {
+      renderDownloads(downloadCatalog);
+      renderPreparationProgress();
+      updateDelayDisplay();
+      for (const option of document.querySelectorAll('select option')) {
+        const label = optionLabels.get(option);
+        if (label) option.textContent = label();
+      }
+    });

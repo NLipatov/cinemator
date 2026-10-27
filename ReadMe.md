@@ -2,6 +2,18 @@
 
 Cinemator (“cinema” + “torrent”) lets you instantly watch videos from any torrent magnet link.
 
+## Interface language
+
+English, Russian, and Simplified Chinese are available on the player, sign-in, and QR approval pages. On the first visit, Cinemator chooses the first supported language in the browser's preferences, falling back to English. Chinese browser locales use Simplified Chinese (`zh-Hans`). The result is saved in local storage, including automatic selection and the English fallback. A later browser-language change does not override it; use the language selector to change it explicitly.
+
+Switching languages updates the current page without restarting playback or QR sign-in. Each device keeps its own language preference. Original filenames, track metadata, and technical error diagnostics remain unchanged; known API errors have translated messages, with original diagnostics available in tooltips.
+
+Translations live in `src/web/client/index/locales/`; shared selection and formatting live in `i18n.js`. Run the client tests with Node.js 22.7 or newer:
+
+```bash
+node --test src/web/client/i18n.test.mjs
+```
+
 ## Download lifecycle
 
 Adding a torrent with one video starts HLS preparation immediately. Torrents with multiple videos wait for a file selection. Preparation continues on the server after the browser closes, and playback can begin as soon as the first HLS segments are available.
