@@ -2,10 +2,12 @@ import { test, expect } from "@playwright/test";
 import { fileURLToPath } from "node:url";
 
 async function openPage(page, path, language) {
-  await page.addInitScript(
-    (language) => localStorage.setItem("cinemator-language", language),
-    language,
-  );
+  if (language) {
+    await page.addInitScript(
+      (language) => localStorage.setItem("cinemator-language", language),
+      language,
+    );
+  }
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     if (url.hostname !== "cinemator.test") {
@@ -51,7 +53,7 @@ async function openPage(page, path, language) {
     });
   });
   await page.goto(`http://cinemator.test${path}`);
-  await expect(page.locator("html")).toHaveAttribute("lang", language);
+  if (language) await expect(page.locator("html")).toHaveAttribute("lang", language);
   await page.addStyleTag({
     content: "* { animation: none !important; transition: none !important; }",
   });
@@ -65,6 +67,24 @@ async function openPage(page, path, language) {
       document.querySelector('[data-action="toggle-extend"]').click();
     });
   }
+}
+
+for (const [languages, expected] of [
+  [["zh-TW", "en-US"], "en"],
+  [["zh-Hant-CN", "ru"], "ru"],
+  [["zh-Hans-TW", "en"], "zh-Hans"],
+]) {
+  test(`browser preferences ${languages.join(", ")} select and persist ${expected}`, async ({
+    page,
+  }) => {
+    await page.addInitScript((languages) => {
+      Object.defineProperty(navigator, "languages", { value: languages });
+    }, languages);
+    await openPage(page, "/login");
+    await expect(page.locator("html")).toHaveAttribute("lang", expected);
+    await expect(page.locator("#languageSelect")).toHaveValue(expected);
+    expect(await page.evaluate(() => localStorage.getItem("cinemator-language"))).toBe(expected);
+  });
 }
 
 async function layoutProblems(page) {

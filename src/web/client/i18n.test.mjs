@@ -38,7 +38,7 @@ test('first supported browser preference is selected and persisted', async () =>
     [['ru-RU', 'en-US'], 'ru'],
     [['de-DE', 'zh-CN', 'ru'], 'zh-Hans'],
     [['zh-Hans-SG'], 'zh-Hans'],
-    [['zh-TW'], 'zh-Hans'],
+    [['zh'], 'zh-Hans'],
     [['en-GB', 'ru'], 'en'],
     [['fr', 'de'], 'en'],
     [[], 'en'],
@@ -48,6 +48,37 @@ test('first supported browser preference is selected and persisted', async () =>
     assert.equal(client.select.value, expected);
     assert.equal(client.storage.get('cinemator-language'), expected);
   }
+});
+
+test('Chinese browser preferences respect script and region', async () => {
+  for (const [languages, expected] of [
+    [['zh-TW', 'en-US'], 'en'],
+    [['zh-HK', 'ru-RU'], 'ru'],
+    [['zh-MO', 'en-GB'], 'en'],
+    [['zh-Hant', 'ru'], 'ru'],
+    [['zh-Hant-CN', 'ru'], 'ru'],
+    [['zh-TW'], 'en'],
+    [['zh-Hans-TW', 'en'], 'zh-Hans'],
+    [['zh-Hans-HK'], 'zh-Hans'],
+    [['zh-SG'], 'zh-Hans'],
+    [['zh-Hant-TW', 'zh-CN', 'en'], 'zh-Hans'],
+    [['ZH-hAnT-cn', 'ru'], 'ru'],
+    [['zh-CN-u-ca-chinese'], 'zh-Hans'],
+    [['zh--TW', 'ru'], 'ru'],
+  ]) {
+    const client = await openClient({ languages });
+    assert.equal(client.document.documentElement.lang, expected, languages.join(', '));
+    assert.equal(client.select.value, expected);
+    assert.equal(client.storage.get('cinemator-language'), expected);
+  }
+});
+
+test('saved Simplified Chinese takes priority over a Traditional Chinese browser preference', async () => {
+  const storage = new Map([['cinemator-language', 'zh-Hans']]);
+  const client = await openClient({ languages: ['zh-TW', 'en-US'], storage });
+  assert.equal(client.document.documentElement.lang, 'zh-Hans');
+  assert.equal(client.select.value, 'zh-Hans');
+  assert.equal(storage.get('cinemator-language'), 'zh-Hans');
 });
 
 test('automatically selected language survives a browser language change', async () => {

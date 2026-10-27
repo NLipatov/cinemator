@@ -12,8 +12,13 @@ if (!Object.hasOwn(messages, language)) {
   language =
     (navigator.languages || [navigator.language])
       .map((tag) => {
-        const base = tag.toLowerCase().split('-')[0];
-        return base === 'zh' ? 'zh-Hans' : base;
+        try {
+          const locale = new Intl.Locale(tag);
+          if (locale.language !== 'zh') return locale.language;
+          return locale.maximize().script === 'Hans' ? 'zh-Hans' : undefined;
+        } catch {
+          return undefined;
+        }
       })
       .find((tag) => Object.hasOwn(messages, tag)) || 'en';
 }
