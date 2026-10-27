@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/NLipatov/cinemator/compare/0.8.0...0.9.0) (2026-10-27)
+
+
+### Features
+
+* **auth:** add bounded stateless session renewal ([#42](https://github.com/NLipatov/cinemator/issues/42)) ([fb5a27d](https://github.com/NLipatov/cinemator/commit/fb5a27d783861a4a96e6372bddf8036f357a4b14))
+* **i18n:** add English, Russian, Simplified and Traditional Chinese ([#43](https://github.com/NLipatov/cinemator/issues/43)) ([bade76b](https://github.com/NLipatov/cinemator/commit/bade76b4f9e89a0a9b621196f2150e3a4ac95264))
+
+
+### Bug Fixes
+
+* **downloads:** keep delete buttons aligned ([#40](https://github.com/NLipatov/cinemator/issues/40)) ([7710435](https://github.com/NLipatov/cinemator/commit/7710435741624070e32ff1558807178010f0bb6f))
+
 ## [0.8.0](https://github.com/NLipatov/cinemator/compare/0.7.2...0.8.0) (2026-10-18)
 
 
