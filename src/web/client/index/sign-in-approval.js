@@ -1,3 +1,5 @@
+import { setText, errorKey } from './i18n.js';
+
 const token = window.location.pathname.split('/').filter(Boolean).pop();
 const title = document.getElementById('deviceTitle');
 const description = document.getElementById('deviceDescription');
@@ -7,11 +9,11 @@ const allowButton = document.getElementById('allowDevice');
 const message = document.getElementById('approvalMessage');
 let expiresAt;
 
-function showUnavailable(text) {
-  title.textContent = 'Sign-in unavailable';
-  description.textContent = text;
+function showUnavailable(key) {
+  setText(title, 'approval.unavailable');
+  setText(description, key);
   code.hidden = true;
-  expiry.textContent = '';
+  setText(expiry, '');
   allowButton.hidden = true;
 }
 
@@ -19,15 +21,13 @@ function updateExpiry() {
   if (!expiresAt) return;
   const seconds = Math.max(0, Math.ceil((expiresAt.getTime() - Date.now()) / 1000));
   const minutes = Math.floor(seconds / 60);
-  expiry.textContent = seconds > 0
-    ? `Expires in ${minutes}:${String(seconds % 60).padStart(2, '0')}`
-    : 'Expired';
-  if (seconds === 0) showUnavailable('This QR code has expired. Refresh it on the other device.');
+  setText(expiry, seconds > 0 ? 'auth.expiresIn' : 'auth.expired', { time: `${minutes}:${String(seconds % 60).padStart(2, '0')}` });
+  if (seconds === 0) showUnavailable('approval.expired');
 }
 
 async function loadAuthorization() {
   if (!token) {
-    showUnavailable('The sign-in link is invalid.');
+    showUnavailable('approval.invalid');
     return;
   }
   try {
@@ -38,40 +38,41 @@ async function loadAuthorization() {
       return;
     }
     if (response.status === 410) {
-      showUnavailable('This QR code has expired. Refresh it on the other device.');
+      showUnavailable('approval.expired');
       return;
     }
-    if (!response.ok) throw new Error('Could not load the sign-in request.');
+    if (!response.ok) throw new Error('approval.loadFailed');
     const authorization = await response.json();
+    setText(code, '');
     code.textContent = authorization.code;
     expiresAt = new Date(authorization.expiresAt);
     updateExpiry();
   } catch (error) {
-    showUnavailable(error.message || 'Could not load the sign-in request.');
+    showUnavailable(errorKey(error, 'approval.loadFailed'));
   }
 }
 
 async function approve() {
   allowButton.disabled = true;
-  message.textContent = '';
+  setText(message, '');
   message.className = 'msg';
   try {
     const response = await fetch(`/api/auth/sign-in-approvals/${encodeURIComponent(token)}`, {
       method: 'POST',
     });
     if (response.status === 410) {
-      showUnavailable('This QR code has expired. Refresh it on the other device.');
+      showUnavailable('approval.expired');
       return;
     }
-    if (!response.ok) throw new Error('Could not update the sign-in request.');
+    if (!response.ok) throw new Error('approval.updateFailed');
     expiresAt = undefined;
-    title.textContent = 'Sign-in allowed';
-    description.textContent = 'You can return to the other device.';
+    setText(title, 'approval.allowed');
+    setText(description, 'approval.return');
     code.hidden = true;
-    expiry.textContent = '';
+    setText(expiry, '');
     allowButton.hidden = true;
   } catch (error) {
-    message.textContent = error.message || 'Could not update the sign-in request.';
+    setText(message, errorKey(error, 'approval.updateFailed'));
     message.className = 'msg error';
     allowButton.disabled = false;
   }

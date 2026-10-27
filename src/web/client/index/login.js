@@ -1,3 +1,5 @@
+import { setText, errorKey } from './i18n.js';
+
 const form = document.getElementById('loginForm');
 const password = document.getElementById('password');
 const button = document.getElementById('loginButton');
@@ -19,7 +21,7 @@ function loginDestination() {
 form.addEventListener('submit', async event => {
   event.preventDefault();
   button.disabled = true;
-  message.textContent = '';
+  setText(message, '');
   message.className = 'msg';
   try {
     const response = await fetch('/api/auth/login', {
@@ -28,11 +30,11 @@ form.addEventListener('submit', async event => {
       body: JSON.stringify({ password: password.value }),
     });
     if (!response.ok) {
-      throw new Error(response.status === 401 ? 'Incorrect password' : 'Could not sign in');
+      throw new Error(response.status === 401 ? 'auth.incorrectPassword' : response.status === 429 ? 'auth.tooManyAttempts' : 'auth.failed');
     }
     window.location.replace(loginDestination());
   } catch (error) {
-    message.textContent = error.message || 'Could not sign in';
+    setText(message, errorKey(error, 'auth.failed'));
     message.className = 'msg error';
     password.select();
     button.disabled = false;
@@ -52,7 +54,7 @@ function showQRCode(path) {
   qrCode.onerror = () => {
     qrCode.hidden = true;
     qrPlaceholder.hidden = false;
-    qrPlaceholder.textContent = 'QR code unavailable';
+    setText(qrPlaceholder, 'auth.qrUnavailable');
   };
   qrCode.src = path;
 }
@@ -61,9 +63,7 @@ function updateSignInExpiry() {
   if (!signInRequest) return;
   const seconds = Math.max(0, Math.ceil((new Date(signInRequest.expiresAt).getTime() - Date.now()) / 1000));
   const minutes = Math.floor(seconds / 60);
-  deviceExpiry.textContent = seconds > 0
-    ? `Expires in ${minutes}:${String(seconds % 60).padStart(2, '0')}`
-    : 'Refreshing…';
+  setText(deviceExpiry, seconds > 0 ? 'auth.expiresIn' : 'auth.refreshing', { time: `${minutes}:${String(seconds % 60).padStart(2, '0')}` });
   if (seconds === 0) startSignInRequest();
 }
 
@@ -72,7 +72,7 @@ async function waitForSignInSession() {
   const deviceToken = signInRequest.deviceToken;
   const controller = new AbortController();
   sessionRequestController = controller;
-  deviceMessage.textContent = '';
+  setText(deviceMessage, '');
   deviceMessage.className = 'msg';
   try {
     const response = await fetch(`/api/auth/sign-in-requests/${encodeURIComponent(deviceToken)}/session`, {
@@ -87,10 +87,10 @@ async function waitForSignInSession() {
       if (signInRequest?.deviceToken === deviceToken) await startSignInRequest();
       return;
     }
-    throw new Error('Could not complete QR sign-in');
+    throw new Error('auth.qrFailed');
   } catch (error) {
     if (error.name === 'AbortError' || signInRequest?.deviceToken !== deviceToken) return;
-    deviceMessage.textContent = 'Reconnecting QR sign-in…';
+    setText(deviceMessage, 'auth.qrReconnecting');
     deviceMessage.className = 'msg error';
     retryTimer = window.setTimeout(waitForSignInSession, 1000);
   } finally {
@@ -108,10 +108,10 @@ async function startSignInRequest() {
   signInRequest = undefined;
   qrCode.hidden = true;
   qrPlaceholder.hidden = false;
-  qrPlaceholder.textContent = 'Generating QR code…';
-  deviceCode.textContent = '';
-  deviceExpiry.textContent = '';
-  deviceMessage.textContent = '';
+  setText(qrPlaceholder, 'auth.generatingQR');
+  setText(deviceCode, '');
+  setText(deviceExpiry, '');
+  setText(deviceMessage, '');
   deviceMessage.className = 'msg';
   try {
     const response = await fetch('/api/auth/sign-in-requests', { method: 'POST' });
@@ -120,16 +120,16 @@ async function startSignInRequest() {
       if (response.status === 429 && Number.isFinite(retryAfter) && retryAfter > 0) {
         retryDelay = retryAfter * 1000;
       }
-      throw new Error('QR sign-in is temporarily unavailable');
+      throw new Error('auth.qrTemporary');
     }
     signInRequest = await response.json();
-    deviceCode.textContent = `Code ${signInRequest.code}`;
+    setText(deviceCode, 'auth.code', { code: signInRequest.code });
     showQRCode(signInRequest.qrCode);
     updateSignInExpiry();
     waitForSignInSession();
   } catch (error) {
-    qrPlaceholder.textContent = 'QR code unavailable';
-    deviceMessage.textContent = error.message || 'QR sign-in is temporarily unavailable';
+    setText(qrPlaceholder, 'auth.qrUnavailable');
+    setText(deviceMessage, errorKey(error, 'auth.qrTemporary'));
     deviceMessage.className = 'msg error';
     retryTimer = window.setTimeout(startSignInRequest, retryDelay);
   } finally {

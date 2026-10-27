@@ -409,9 +409,49 @@ func TestParseExtendDays(t *testing.T) {
 	}
 }
 
-func TestAPIErrorStatusDefaultsToInternalServerError(t *testing.T) {
-	if got := apiErrorStatus(errors.New("boom")); got != http.StatusInternalServerError {
-		t.Fatalf("apiErrorStatus() = %d, want %d", got, http.StatusInternalServerError)
+func TestAPIErrorsPreserveStatusAndBodyWithOptionalTranslationCode(t *testing.T) {
+	for _, test := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{torrent.ErrUnsupportedMagnetVersion, http.StatusBadRequest, "unsupported_magnet"},
+		{torrent.ErrBadDownloadID, http.StatusBadRequest, "bad_download_id"},
+		{torrent.ErrDownloadNotFound, http.StatusNotFound, "download_not_found"},
+		{torrent.ErrDownloadNotReady, http.StatusConflict, "download_not_ready"},
+		{media.ErrSubtitleTrackEmpty, http.StatusInternalServerError, "empty_subtitle_track"},
+		{errors.New("unexpected failure"), http.StatusInternalServerError, ""},
+	} {
+		t.Run(test.err.Error(), func(t *testing.T) {
+			// Managers may wrap errors; both the code and original diagnostics must survive.
+			err := errors.Join(test.err, errors.New("diagnostic detail"))
+			server := Server{mgr: fakeTorrentManager{filesErr: err}}
+			rec := httptest.NewRecorder()
+			server.handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/torrent/files?magnet=test", nil))
+			if rec.Code != test.status || rec.Body.String() != err.Error()+"\n" {
+				t.Fatalf("response changed: status %d, body %q", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("X-Error-Code"); got != test.code {
+				t.Fatalf("error code = %q, want %q", got, test.code)
+			}
+		})
+	}
+}
+
+func TestLocalizationAssetsAreAvailableBeforeLogin(t *testing.T) {
+	t.Chdir("..")
+	_, handler := sessionServerForTest(t)
+	for _, path := range []string{"/i18n.js", "/locales/en.js", "/locales/ru.js", "/locales/zh-Hans.js", "/locales/zh-Hant.js"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), "javascript") || rec.Body.Len() == 0 {
+			t.Errorf("localization asset %s is unavailable: %d, %s", path, rec.Code, rec.Header().Get("Content-Type"))
+		}
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/index.js", nil))
+	if rec.Code != http.StatusSeeOther || rec.Header().Get("Location") != "/login" {
+		t.Fatal("localization assets exposed the protected application")
 	}
 }
 

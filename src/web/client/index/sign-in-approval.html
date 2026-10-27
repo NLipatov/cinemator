@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Approve sign-in · Cinemator</title>
+  <title data-i18n="approval.pageTitle">Approve sign-in · Cinemator</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="referrer" content="no-referrer">
   <link rel="stylesheet" href="/index.css">
@@ -15,7 +15,13 @@
         <span class="brand-name">cinemator</span>
       </div>
       <div class="top-actions">
-        <button class="theme-toggle" id="themeToggle" type="button" title="Switch theme" aria-label="Switch theme">
+        <select id="languageSelect" aria-label="Language" data-i18n-aria-label="common.language">
+          <option value="en" lang="en">English</option>
+          <option value="ru" lang="ru">Русский</option>
+          <option value="zh-Hans" lang="zh-Hans">简体中文</option>
+          <option value="zh-Hant" lang="zh-Hant">繁體中文</option>
+        </select>
+        <button class="theme-toggle" id="themeToggle" type="button" title="Switch theme" data-i18n-title="common.theme" aria-label="Switch theme" data-i18n-aria-label="common.theme">
           <span class="icon" id="icon-moon" style="display:none;">☾</span>
           <span class="icon" id="icon-sun" style="display:none;">☼</span>
         </button>
@@ -25,16 +31,16 @@
   <main class="device-shell">
     <section class="device-approval" id="deviceApproval">
       <div class="login-copy">
-        <h1 id="deviceTitle">Allow sign-in?</h1>
-        <p id="deviceDescription">A device is requesting access to Cinemator. Only continue if its code matches.</p>
+        <h1 id="deviceTitle" data-i18n="approval.title">Allow sign-in?</h1>
+        <p id="deviceDescription" data-i18n="approval.description">A device is requesting access to Cinemator. Only continue if its code matches.</p>
       </div>
-      <strong class="approval-code" id="approvalCode">Loading…</strong>
+      <strong class="approval-code" id="approvalCode" data-i18n="common.loading">Loading…</strong>
       <span class="device-expiry" id="approvalExpiry"></span>
-      <button id="allowDevice" type="button">Allow</button>
+      <button id="allowDevice" type="button" data-i18n="approval.allow">Allow</button>
       <div class="msg" id="approvalMessage" role="status" aria-live="polite"></div>
     </section>
   </main>
   <script src="/theme.js"></script>
-  <script src="/sign-in-approval.js"></script>
+  <script type="module" src="/sign-in-approval.js"></script>
 </body>
 </html>
