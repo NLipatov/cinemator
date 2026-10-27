@@ -2,6 +2,7 @@ export default {
   'common.language': 'Язык',
   'common.theme': 'Сменить тему',
   'common.loading': 'Загрузка…',
+  'common.details': 'Подробности',
   'auth.pageTitle': 'Вход · Cinemator',
   'auth.signIn': 'Вход',
   'auth.description': 'Введите пароль, установленный владельцем сервера.',

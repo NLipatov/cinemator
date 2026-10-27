@@ -2,6 +2,7 @@ export default {
   'common.language': '語言',
   'common.theme': '切換主題',
   'common.loading': '載入中…',
+  'common.details': '詳細資訊',
   'auth.pageTitle': '登入 · Cinemator',
   'auth.signIn': '登入',
   'auth.description': '請輸入伺服器擁有者設定的密碼。',

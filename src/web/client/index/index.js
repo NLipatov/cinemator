@@ -20,7 +20,15 @@ import { t, setText, number, errorKey } from './i18n.js';
 
     function showError(id, error, fallback) {
       showMsg(id, errorKey(error, fallback), true);
-      $(id).title = error.detail || '';
+      if (!error.detail) return;
+      const details = document.createElement('details');
+      details.className = 'error-details';
+      const summary = document.createElement('summary');
+      setText(summary, 'common.details');
+      const diagnostic = document.createElement('pre');
+      diagnostic.textContent = error.detail;
+      details.append(summary, diagnostic);
+      $(id).appendChild(details);
     }
 
     const versionLabel = $('appVersion');
@@ -128,7 +136,6 @@ import { t, setText, number, errorKey } from './i18n.js';
       clearTimeout(msgTimeout);
       const el = $(id);
       el.textContent = '';
-      el.removeAttribute('title');
       if (loader) {
         const spinner = document.createElement('span');
         spinner.className = 'loader';

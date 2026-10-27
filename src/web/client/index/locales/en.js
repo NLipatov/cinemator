@@ -2,6 +2,7 @@ export default {
   'common.language': 'Language',
   'common.theme': 'Switch theme',
   'common.loading': 'Loading…',
+  'common.details': 'Details',
   'auth.pageTitle': 'Sign in · Cinemator',
   'auth.signIn': 'Sign in',
   'auth.description': 'Enter the password configured by the server owner.',

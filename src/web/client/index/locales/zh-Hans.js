@@ -2,6 +2,7 @@ export default {
   'common.language': '语言',
   'common.theme': '切换主题',
   'common.loading': '正在加载…',
+  'common.details': '详细信息',
   'auth.pageTitle': '登录 · Cinemator',
   'auth.signIn': '登录',
   'auth.description': '请输入服务器所有者设置的密码。',
