@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,14 +21,20 @@ import (
 const (
 	sessionCookieName        = "__Host-cinemator_session"
 	sessionTTL               = 7 * 24 * time.Hour
+	maxSessionRenewals       = 3
 	maxLoginBodyBytes        = 4 << 10
 	loginAttemptInterval     = 10 * time.Second
 	loginAttemptBurst        = 5
 	maxConcurrentLoginChecks = 2
 	minSessionSecret         = 32
 	sessionNonceBytes        = 32
-	sessionVersion           = "v1"
+	sessionVersion           = "v2"
 )
+
+type session struct {
+	expiresAt time.Time
+	renewals  int
+}
 
 type authenticator struct {
 	passwordHash   []byte
@@ -68,7 +75,18 @@ func (s *Server) requireAuthentication(next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
-		if s.auth.authenticated(r) {
+		if current := s.auth.sessionFromRequest(r); current != nil {
+			if r.URL.Path != "/api/auth/logout" && current.renewals < maxSessionRenewals && time.Until(current.expiresAt) <= sessionTTL/3 {
+				cookie, err := s.auth.createSession(session{
+					expiresAt: time.Now().Add(sessionTTL),
+					renewals:  current.renewals + 1,
+				})
+				if err != nil {
+					http.Error(w, "failed to renew session", http.StatusInternalServerError)
+					return
+				}
+				http.SetCookie(w, cookie)
+			}
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -86,7 +104,7 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if s.auth == nil || s.auth.authenticated(r) {
+	if s.auth == nil || s.auth.sessionFromRequest(r) != nil {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
@@ -106,7 +124,7 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		Authenticated bool `json:"authenticated"`
 	}{
 		Enabled:       s.auth != nil,
-		Authenticated: s.auth != nil && s.auth.authenticated(r),
+		Authenticated: s.auth != nil && s.auth.sessionFromRequest(r) != nil,
 	})
 }
 
@@ -148,12 +166,12 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, expiresAt, err := s.auth.createSession()
+	cookie, err := s.auth.createSession(session{expiresAt: time.Now().Add(sessionTTL)})
 	if err != nil {
 		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
 	}
-	http.SetCookie(w, sessionCookie(token, expiresAt, int(sessionTTL/time.Second)))
+	http.SetCookie(w, cookie)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -172,52 +190,66 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (a *authenticator) createSession() (string, time.Time, error) {
-	expiresAt := time.Now().Add(sessionTTL)
-	token, err := a.newSessionToken(expiresAt)
-	if err != nil {
-		return "", time.Time{}, err
+func (a *authenticator) createSession(s session) (*http.Cookie, error) {
+	expiresAt := s.expiresAt.Truncate(time.Second)
+	maxAge := int(math.Ceil(time.Until(expiresAt).Seconds()))
+	if maxAge <= 0 {
+		return nil, errors.New("session expired")
 	}
-	return token, expiresAt, nil
-}
-
-func (a *authenticator) authenticated(r *http.Request) bool {
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil || cookie.Value == "" {
-		return false
-	}
-	parts := strings.Split(cookie.Value, ".")
-	if len(parts) != 4 || parts[0] != sessionVersion {
-		return false
-	}
-	nonce, err := base64.RawURLEncoding.DecodeString(parts[2])
-	if err != nil || len(nonce) != sessionNonceBytes {
-		return false
-	}
-	providedSignature, err := base64.RawURLEncoding.DecodeString(parts[3])
-	if err != nil {
-		return false
-	}
-	payload := strings.Join(parts[:3], ".")
-	if !hmac.Equal(providedSignature, a.sign(payload)) {
-		return false
-	}
-	expiresAt, err := strconv.ParseInt(parts[1], 10, 64)
-	return err == nil && time.Unix(expiresAt, 0).After(time.Now())
-}
-
-func (a *authenticator) newSessionToken(expiresAt time.Time) (string, error) {
 	nonce := make([]byte, sessionNonceBytes)
 	if _, err := rand.Read(nonce); err != nil {
-		return "", err
+		return nil, err
 	}
 	payload := strings.Join([]string{
 		sessionVersion,
 		strconv.FormatInt(expiresAt.Unix(), 10),
 		base64.RawURLEncoding.EncodeToString(nonce),
+		strconv.Itoa(s.renewals),
 	}, ".")
 	signature := base64.RawURLEncoding.EncodeToString(a.sign(payload))
-	return payload + "." + signature, nil
+	return sessionCookie(payload+"."+signature, expiresAt, maxAge), nil
+}
+
+func (a *authenticator) sessionFromRequest(r *http.Request) *session {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" {
+		return nil
+	}
+	parts := strings.Split(cookie.Value, ".")
+	renewals := maxSessionRenewals
+	switch {
+	case len(parts) == 4 && parts[0] == "v1":
+		// Legacy sessions remain usable, but cannot acquire a new renewal budget.
+	case len(parts) == 5 && parts[0] == sessionVersion:
+		renewals, err = strconv.Atoi(parts[3])
+		if err != nil || renewals < 0 || renewals > maxSessionRenewals {
+			return nil
+		}
+	default:
+		return nil
+	}
+	nonce, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil || len(nonce) != sessionNonceBytes {
+		return nil
+	}
+	signatureIndex := len(parts) - 1
+	providedSignature, err := base64.RawURLEncoding.DecodeString(parts[signatureIndex])
+	if err != nil {
+		return nil
+	}
+	payload := strings.Join(parts[:signatureIndex], ".")
+	if !hmac.Equal(providedSignature, a.sign(payload)) {
+		return nil
+	}
+	expires, err := strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return nil
+	}
+	expiresAt := time.Unix(expires, 0)
+	if !expiresAt.After(time.Now()) {
+		return nil
+	}
+	return &session{expiresAt: expiresAt, renewals: renewals}
 }
 
 func (a *authenticator) sign(payload string) []byte {

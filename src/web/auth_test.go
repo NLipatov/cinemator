@@ -176,11 +176,7 @@ func TestAuthenticationFlowProtectsApplication(t *testing.T) {
 	})
 
 	t.Run("expired session is rejected", func(t *testing.T) {
-		token, err := auth.newSessionToken(time.Now().Add(-time.Minute))
-		if err != nil {
-			t.Fatalf("newSessionToken() error = %v", err)
-		}
-		expired := &http.Cookie{Name: sessionCookieName, Value: token}
+		expired := signedSessionCookieForTest("v1", time.Now().Add(-time.Minute), "")
 		rec := serveRequest(handler, httptest.NewRequest(http.MethodGet, "/api/downloads", nil), expired)
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusUnauthorized)
@@ -382,7 +378,7 @@ func TestSignInRequestFlow(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("session request did not stop after disconnect")
 	}
-	if !auth.approveSignInRequest(interruptedRequest.approvalToken, time.Now()) {
+	if !auth.approveSignInRequest(interruptedRequest.approvalToken, session{expiresAt: approverSession.Expires}, time.Now()) {
 		t.Fatal("disconnected sign-in request could not be approved")
 	}
 	reconnected := serveRequest(
@@ -442,10 +438,10 @@ func TestSignInRequestLimitsConcurrentSessionWaiters(t *testing.T) {
 				t.Fatalf("attempt %d: concurrent session requests both remained open", attempt)
 			}
 
-			if !auth.approveSignInRequest(request.approvalToken, time.Now()) {
+			if !auth.approveSignInRequest(request.approvalToken, session{expiresAt: time.Now().Add(sessionTTL)}, time.Now()) {
 				t.Fatalf("attempt %d: approval was not recorded", attempt)
 			}
-			if !auth.approveSignInRequest(request.approvalToken, time.Now()) {
+			if !auth.approveSignInRequest(request.approvalToken, session{expiresAt: time.Now().Add(sessionTTL)}, time.Now()) {
 				t.Fatalf("attempt %d: repeated approval was not idempotent", attempt)
 			}
 

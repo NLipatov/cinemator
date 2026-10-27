@@ -97,7 +97,13 @@ Store it alongside the password hash:
 CINEMATOR_SESSION_SECRET='...'
 ```
 
-Leave `CINEMATOR_PASSWORD_HASH` empty to keep Cinemator public. When password protection is enabled, `CINEMATOR_SESSION_SECRET` must contain at least 32 bytes. Sessions are stateless and remain valid for seven days. Rotating the session secret signs everyone out. Cinemator runs as a single-instance service, and pending QR sign-in requests are lost when it restarts. Password authentication is intended to be used over HTTPS.
+Leave `CINEMATOR_PASSWORD_HASH` empty to keep Cinemator public. When password protection is enabled, `CINEMATOR_SESSION_SECRET` must contain at least 32 bytes. Password authentication is intended to be used over HTTPS.
+
+Password login creates a seven-day session with up to three automatic renewals. A request to the protected application renews the session for another seven days when no more than one third of its lifetime remains. The renewal counter is signed into the cookie; sessions remain stateless. Once the renewal limit is reached, the cookie remains valid until it expires, and a password login is needed to reset the limit. Previous tokens remain valid until their own expiry, so a lost renewal response can be retried. Signing out clears the browser cookie; rotating the session secret invalidates all tokens.
+
+QR sign-in inherits the approving session's expiry and renewal count, including on retries and when authorizing another device. It does not reset the session lifetime or renewal budget. Cinemator runs as a single-instance service, and pending QR sign-in requests are lost when it restarts.
+
+The server accepts both legacy `v1` cookies and new `v2` cookies. Legacy cookies have no renewal counter and are treated as having used all renewals; they remain valid until their original expiry. QR sessions approved with a legacy cookie inherit that restriction. Older server versions cannot accept `v2` cookies, so rolling back requires affected users to log in again.
 
 ## 3) Start the services
 
