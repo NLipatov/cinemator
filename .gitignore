@@ -34,3 +34,8 @@ go.work.sum
 
 # Local development metadata
 .serena/
+
+# Browser test dependencies and artifacts
+node_modules/
+test-results/
+playwright-report/
