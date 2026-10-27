@@ -20,15 +20,24 @@ import { t, setText, number, errorKey } from './i18n.js';
 
     function showError(id, error, fallback) {
       showMsg(id, errorKey(error, fallback), true);
-      if (!error.detail) return;
-      const details = document.createElement('details');
-      details.className = 'error-details';
-      const summary = document.createElement('summary');
-      setText(summary, 'common.details');
-      const diagnostic = document.createElement('pre');
-      diagnostic.textContent = error.detail;
-      details.append(summary, diagnostic);
-      $(id).appendChild(details);
+      renderErrorDetails($(id), error.detail);
+    }
+
+    function renderErrorDetails(container, diagnostic) {
+      let details = container.querySelector(':scope > .error-details');
+      if (!diagnostic) {
+        details?.remove();
+        return;
+      }
+      if (!details) {
+        details = document.createElement('details');
+        details.className = 'error-details';
+        const summary = document.createElement('summary');
+        setText(summary, 'common.details');
+        details.append(summary, document.createElement('pre'));
+        container.appendChild(details);
+      }
+      details.querySelector('pre').textContent = diagnostic;
     }
 
     const versionLabel = $('appVersion');
@@ -297,7 +306,8 @@ import { t, setText, number, errorKey } from './i18n.js';
       bar.hidden = !matches || progressUnavailable || progress.totalBytes <= 0;
       if (!bar.hidden) bar.value = Math.min(1, progress.downloadedBytes / progress.totalBytes);
       $('preparationDetails').textContent = details;
-      $('preparationDetails').title = selected && download.status === 'failed' ? download.preparationError || '' : '';
+      renderErrorDetails($('preparationDetails').parentElement,
+        selected && download.status === 'failed' ? download.preparationError : '');
       $('preparationVideo').textContent = matches && !progressUnavailable ? preparedVideo(progress) : '';
     }
 
@@ -373,7 +383,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         row.querySelector('.download-subtitle').textContent = download.id;
         row.querySelector('.download-meta-text').textContent = `${formatDownloadSize(download)} · ${formatDownloadState(download)}`;
         row.querySelector('.download-meta-text').classList.remove('has-progress');
-        row.querySelector('.download-meta-text').title = download.preparationError || '';
+        renderErrorDetails(row, download.preparationError);
         row.querySelector('.download-progress').hidden = true;
         const progressAtPlayer = download.id === activeDownloadID && !$('warnMsg').hidden &&
           download.progress?.fileIndex === Number($('filelist').value);
@@ -849,8 +859,7 @@ import { t, setText, number, errorKey } from './i18n.js';
 
     function showPlaybackError(details) {
       removeWarning();
-      showMsg('playerMsg', 'player.playbackError', true);
-      $('playerMsg').title = details || '';
+      showError('playerMsg', { detail: details }, 'player.playbackError');
     }
 
     function playHls(src, enableSubtitles, resumeTime = 0) {
