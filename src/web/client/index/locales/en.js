@@ -62,6 +62,7 @@ export default {
   'player.hlsUnsupported': 'Your browser does not support HLS.',
   'downloads.title': 'Downloads',
   'downloads.saved': 'Saved downloads',
+  'downloads.resume': 'Continue from {time}',
   'downloads.extend': 'Extend download',
   'downloads.delete': 'Delete',
   'downloads.days': { one: '{count} day', other: '{count} days' },

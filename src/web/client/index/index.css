@@ -650,6 +650,14 @@ button:disabled {
   gap: 0.25rem;
 }
 
+.download-resume {
+  grid-column: 1 / -1;
+  justify-self: start;
+  max-width: 100%;
+  padding: 0.5rem 0.65rem;
+  font-size: 0.8rem;
+}
+
 .download-action,
 .download-expiry-extend {
   width: 2.75rem;
