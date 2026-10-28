@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/NLipatov/cinemator/compare/0.9.1...0.10.0) (2026-10-28)
+
+
+### Features
+
+* **player:** resume playback from saved browser position ([#46](https://github.com/NLipatov/cinemator/issues/46)) ([aa5485f](https://github.com/NLipatov/cinemator/commit/aa5485f30ccb3eedcd6172fc3ef80ed44133473a))
+
 ## [0.9.1](https://github.com/NLipatov/cinemator/compare/0.9.0...0.9.1) (2026-10-28)
 
 
