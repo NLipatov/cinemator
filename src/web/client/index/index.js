@@ -87,6 +87,8 @@ import { t, setText, number, errorKey } from './i18n.js';
     let progressUnavailable = false;
     let openExtendDownloadID = null;
     let activeDownloadID = null;
+    let pendingResume = null;
+    let savePlaybackPosition = null;
     let requestSeq = 0;
     let flowRequestController = null;
     const downloadFallbackInitialMs = 5000;
@@ -117,6 +119,8 @@ import { t, setText, number, errorKey } from './i18n.js';
       }
     }
     function destroyVideoAndHls({ resetLayout = true } = {}) {
+      savePlaybackPosition?.();
+      savePlaybackPosition = null;
       if (hls) { hls.destroy(); hls = null; }
       if (resetLayout) document.body.classList.remove('has-player');
       const oldVideo = $('video');
@@ -246,13 +250,52 @@ import { t, setText, number, errorKey } from './i18n.js';
       return parts.join(' · ');
     }
 
-    function preparedVideo(progress) {
-      const seconds = Math.floor(progress.preparedSeconds);
-      if (seconds <= 0) return t('progress.waitingSegment');
+    function formatPlaybackTime(time) {
+      const seconds = Math.floor(time);
       const hours = Math.floor(seconds / 3600);
       const minutes = Math.floor(seconds / 60) % 60;
-      const clock = `${hours ? `${hours}:${String(minutes).padStart(2, '0')}` : minutes}:${String(seconds % 60).padStart(2, '0')}`;
-      return t('progress.prepared', { time: clock });
+      return `${hours ? `${hours}:${String(minutes).padStart(2, '0')}` : minutes}:${String(seconds % 60).padStart(2, '0')}`;
+    }
+
+    function preparedVideo(progress) {
+      if (Math.floor(progress.preparedSeconds) <= 0) return t('progress.waitingSegment');
+      return t('progress.prepared', { time: formatPlaybackTime(progress.preparedSeconds) });
+    }
+
+    function readPlaybackPosition(download) {
+      try {
+        const position = JSON.parse(localStorage.getItem(`cinemator-playback:${download.id}`));
+        if (position && Number.isFinite(position.time) && position.time >= 1 &&
+            Number.isInteger(position.fileIndex) && download.files?.some(file => file.index === position.fileIndex)) {
+          return position;
+        }
+      } catch {}
+      return null;
+    }
+
+    function rememberPlayback(video, magnet, fileIndex) {
+      let lastSavedAt = -Infinity;
+      function savePosition() {
+        if (video !== $('video')) return;
+        const download = downloadCatalog.find(download => download.magnet === magnet);
+        if (!download) return;
+        const time = video.currentTime;
+        if (!video.ended && (!Number.isFinite(time) || time < 1)) return;
+        lastSavedAt = performance.now();
+        try {
+          const key = `cinemator-playback:${download.id}`;
+          if (video.ended) localStorage.removeItem(key);
+          else localStorage.setItem(key, JSON.stringify({ fileIndex, time }));
+        } catch {
+          return;
+        }
+        renderDownloads(downloadCatalog);
+      }
+      savePlaybackPosition = savePosition;
+      video.addEventListener('timeupdate', () => {
+        if (!video.paused && performance.now() - lastSavedAt >= 5000) savePosition();
+      });
+      for (const event of ['pause', 'seeked', 'ended']) video.addEventListener(event, savePosition);
     }
 
     function updateDownloadSamples(downloads) {
@@ -381,6 +424,10 @@ import { t, setText, number, errorKey } from './i18n.js';
         }
         row.querySelector('.download-title').textContent = download.title || t('downloads.torrent', { id: download.id.slice(0, 8) });
         row.querySelector('.download-subtitle').textContent = download.id;
+        const resume = row.querySelector('.download-resume');
+        const position = readPlaybackPosition(download);
+        resume.hidden = !position;
+        if (position) setText(resume, 'downloads.resume', { time: formatPlaybackTime(position.time) });
         row.querySelector('.download-meta-text').textContent = `${formatDownloadSize(download)} · ${formatDownloadState(download)}`;
         row.querySelector('.download-meta-text').classList.remove('has-progress');
         renderErrorDetails(row, download.preparationError);
@@ -478,18 +525,20 @@ import { t, setText, number, errorKey } from './i18n.js';
       });
     }
 
-    function openDownload(download) {
+    function openDownload(download, position = null) {
       if (!download || !download.magnet || !download.files || download.files.length === 0) {
         showMsg('downloadsMsg', 'downloads.incomplete', true);
         return;
       }
       cancelFlowRequest();
       destroyVideoAndHls();
+      pendingResume = position ? { ...position, magnet: download.magnet } : null;
       setActiveDownload(download.id);
       $('magnet').value = download.magnet;
       setFileList(download.files);
-      if (Number.isInteger(download.selectedFileIndex)) {
-        $('filelist').value = String(download.selectedFileIndex);
+      const fileIndex = position?.fileIndex ?? download.selectedFileIndex;
+      if (Number.isInteger(fileIndex)) {
+        $('filelist').value = String(fileIndex);
       }
       $('step-files').style.display = '';
       $('step-tracks').style.display = 'none';
@@ -499,6 +548,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       showMsg('trackMsg', '');
       showMsg('downloadsMsg', '');
       removeWarning();
+      if (position) $('selectTracks').click();
     }
 
     async function extendDownload(id, days) {
@@ -594,6 +644,10 @@ import { t, setText, number, errorKey } from './i18n.js';
       const btn = e.target.closest('button[data-action][data-id]');
       if (btn) {
         if (btn.dataset.action === 'open') openDownload(findDownload(btn.dataset.id));
+        if (btn.dataset.action === 'resume') {
+          const download = findDownload(btn.dataset.id);
+          if (download) openDownload(download, readPlaybackPosition(download));
+        }
         if (btn.dataset.action === 'extend') {
           closeExtendMenus();
           extendDownload(btn.dataset.id, parseInt(btn.dataset.days || '7', 10));
@@ -615,8 +669,11 @@ import { t, setText, number, errorKey } from './i18n.js';
       scheduleDownloadRefresh();
       if (document.visibilityState === 'visible') {
         loadDownloads({ quiet: true, suppressError: true });
+      } else {
+        savePlaybackPosition?.();
       }
     });
+    window.addEventListener('pagehide', () => savePlaybackPosition?.());
     window.addEventListener('beforeunload', () => {
       if (downloadEvents) downloadEvents.close();
       clearTimeout(downloadPollingTimer);
@@ -631,6 +688,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         showMsg('magnetMsg', 'player.magnetRequired', true);
         return;
       }
+      pendingResume = null;
       setActiveDownload(downloadCatalog.find(download => download.magnet === magnet)?.id || null);
       const request = beginFlowRequest();
       const requestId = request.id;
@@ -753,7 +811,9 @@ import { t, setText, number, errorKey } from './i18n.js';
       }
     };
 
-    async function startPlayback(resumeTime = 0) {
+    $('filelist').addEventListener('change', () => { pendingResume = null; });
+
+    async function startPlayback(resumeTime) {
       const magnet = $('magnet').value.trim();
       const idx = $('filelist').value;
       const audio = $('audioSelect').value || '0';
@@ -763,6 +823,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         showMsg('trackMsg', 'player.selectFile', true);
         return;
       }
+      resumeTime ??= pendingResume?.magnet === magnet && pendingResume.fileIndex === Number(idx) ? pendingResume.time : 0;
       const request = beginFlowRequest();
       const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
@@ -790,7 +851,9 @@ import { t, setText, number, errorKey } from './i18n.js';
         const m3u8 = resp.url.replace(window.location.origin, '') + '?t=' + Date.now();
         $('player-block').style.display = '';
         document.body.classList.add('has-player');
+        rememberPlayback($('video'), magnet, Number(idx));
         playHls(m3u8, subtitleSelected, resumeTime);
+        pendingResume = null;
         loadDownloads({ quiet: true });
       } catch (e) {
         if (e.name === 'AbortError') return;
@@ -803,7 +866,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       }
     }
 
-    $('play').onclick = () => startPlayback(0);
+    $('play').onclick = () => startPlayback();
     ['audioSelect', 'subtitleSelect'].forEach(id => {
       const el = $(id);
       if (!el) return;

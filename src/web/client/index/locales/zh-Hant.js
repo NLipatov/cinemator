@@ -62,6 +62,7 @@ export default {
   'player.hlsUnsupported': '您的瀏覽器不支援 HLS。',
   'downloads.title': '下載',
   'downloads.saved': '已儲存的下載',
+  'downloads.resume': '從 {time} 繼續播放',
   'downloads.extend': '延長保留時間',
   'downloads.delete': '刪除',
   'downloads.days': { other: '{count} 天' },

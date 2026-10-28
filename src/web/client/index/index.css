@@ -645,17 +645,33 @@ button:disabled {
 
 .download-actions {
   display: grid;
-  grid-template-columns: repeat(2, 2.75rem);
+  grid-template-columns: repeat(2, 44px);
   align-items: center;
   gap: 0.25rem;
 }
 
+.download-playback-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.download-playback-actions:not(:has(> button:not([hidden]))) {
+  display: none;
+}
+
+.download-playback-actions > button {
+  flex: 1;
+  padding: 0.5rem 0.25rem;
+  font-size: 0.8rem;
+}
+
 .download-action,
 .download-expiry-extend {
-  width: 2.75rem;
-  min-width: 2.75rem;
-  height: 2.75rem;
-  min-height: 2.75rem;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
   padding: 0;
   display: inline-grid;
   place-items: center;
