@@ -137,5 +137,20 @@ async function startSignInRequest() {
   }
 }
 
-window.setInterval(updateSignInExpiry, 1000);
-startSignInRequest();
+async function initializeLogin() {
+  try {
+    // SameSite=Strict can omit the session cookie on an incoming external link.
+    const response = await fetch('/api/auth/status', { cache: 'no-store' });
+    const status = response.ok ? await response.json() : null;
+    if (status?.authenticated || status?.enabled === false) {
+      window.location.replace('/');
+      return;
+    }
+  } catch {
+    // Keep sign-in available if the session check fails.
+  }
+  window.setInterval(updateSignInExpiry, 1000);
+  startSignInRequest();
+}
+
+initializeLogin();
