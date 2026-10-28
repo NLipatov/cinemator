@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/NLipatov/cinemator/compare/0.9.0...0.9.1) (2026-10-28)
+
+
+### Bug Fixes
+
+* **auth:** redirect existing sessions to the login destination ([#44](https://github.com/NLipatov/cinemator/issues/44)) ([36a4fca](https://github.com/NLipatov/cinemator/commit/36a4fca0b6355d9b6d7cfc68ed2b863c638ef8a4))
+
 ## [0.9.0](https://github.com/NLipatov/cinemator/compare/0.8.0...0.9.0) (2026-10-27)
 
 
