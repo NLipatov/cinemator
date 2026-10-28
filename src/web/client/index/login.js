@@ -143,7 +143,7 @@ async function initializeLogin() {
     const response = await fetch('/api/auth/status', { cache: 'no-store' });
     const status = response.ok ? await response.json() : null;
     if (status?.authenticated || status?.enabled === false) {
-      window.location.replace('/');
+      window.location.replace(status.authenticated ? loginDestination() : '/');
       return;
     }
   } catch {
