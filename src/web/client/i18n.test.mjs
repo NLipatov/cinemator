@@ -160,7 +160,7 @@ test('messages retain parameters for retranslation and insert plain text', async
   const element = { dataset: {}, textContent: '' };
   const title = '<img src=x onerror=alert(1)>';
   client.setText(element, 'downloads.confirmDelete', { title });
-  assert.equal(element.textContent, `Delete ${title}?`);
+  assert.equal(element.textContent, `Delete “${title}”?`);
   assert.equal(JSON.parse(element.dataset.i18nParams).title, title);
   client.setText(element, '');
   assert.equal(element.textContent, '');

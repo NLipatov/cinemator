@@ -24,7 +24,7 @@ export async function openPage(page, path, language) {
               title: "Video ready to play",
               status: "ready",
               size: 1024,
-              expiresAt: "2099-01-01T00:00:00Z",
+              expiresAt: new Date(Date.now() + 10 * 86400000).toISOString(),
             },
             { id: "expired", title: "Expired video", status: "expired", size: 1024 },
           ],
