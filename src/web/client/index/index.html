@@ -30,18 +30,7 @@
     </div>
   </header>
   <main class="app-shell">
-    <section class="source-panel" aria-label="Torrent source" data-i18n-aria-label="player.source">
-      <form id="form" class="source-form" autocomplete="off">
-        <label class="source-label" for="magnet" data-i18n="player.magnet">Magnet link</label>
-        <div class="input-row">
-          <input id="magnet" type="text" class="input-style" placeholder="magnet:?xt=urn:btih:..." spellcheck="false" required>
-          <button type="submit" id="nextBtn" class="input-style" data-i18n="player.load">Load</button>
-        </div>
-        <div class="msg" id="magnetMsg"></div>
-      </form>
-    </section>
-
-    <section class="workspace" aria-label="Playback workspace" data-i18n-aria-label="player.workspace">
+    <section class="workspace" aria-label="Video player" data-i18n-aria-label="player.workspace">
       <div id="player-block" class="player-stage step" style="display:none">
         <video id="video" controls autoplay playsinline></video>
         <div class="msg" id="playerMsg" role="status" aria-live="polite"></div>
@@ -51,14 +40,14 @@
         <div class="step panel" id="step-files" style="display:none">
           <label class="field-label" for="filelist" data-i18n="player.file">Video file</label>
           <select id="filelist" class="input-style"></select>
-          <button id="selectTracks" type="button" class="input-style" data-i18n="player.selectTracks">Select tracks</button>
+          <button id="selectTracks" type="button" class="input-style" data-i18n="player.selectTracks">Choose audio and subtitles</button>
           <div class="msg" id="fileMsg" role="status" aria-live="polite"></div>
         </div>
 
         <div class="step panel" id="step-tracks" style="display:none">
           <h2 class="panel-title" data-i18n="player.playback">Playback</h2>
           <div class="track-row">
-            <label for="audioSelect" data-i18n="player.audio">Audio</label>
+            <label for="audioSelect" data-i18n="player.audio">Audio track</label>
             <select id="audioSelect" class="input-style"></select>
           </div>
           <div class="track-row">
@@ -66,7 +55,7 @@
             <select id="subtitleSelect" class="input-style"></select>
           </div>
           <div class="track-row" id="subtitleDelayRow" style="display:none">
-            <span class="field-label" id="subtitleDelayLabel" data-i18n="player.subtitleDelay">Sub delay</span>
+            <span class="field-label" id="subtitleDelayLabel" data-i18n="player.subtitleDelay">Subtitle offset</span>
             <div class="delay-controls" role="group" aria-labelledby="subtitleDelayLabel">
               <button type="button" id="subDelayMinus" class="input-style small-btn" data-i18n="player.seconds" data-i18n-params='{"value":"-0.5"}'>-0.5s</button>
               <div id="subDelayValue" class="delay-value" data-i18n="player.seconds" data-i18n-params='{"value":"0.0"}'>0.0s</div>
@@ -82,8 +71,8 @@
             <div class="warning-inner">
               <span class="warning-icon" aria-hidden="true">!</span>
               <div class="warning-text">
-                <strong id="preparationStage" role="status" data-i18n="progress.selectedVideo">Preparing video…</strong>
-                <progress id="preparationProgress" max="1" aria-label="Selected video downloaded" data-i18n-aria-label="progress.videoDownloaded" hidden></progress>
+                <strong id="preparationStage" role="status" data-i18n="progress.selectedVideo">Preparing selected video…</strong>
+                <progress id="preparationProgress" max="1" aria-label="Video download progress" data-i18n-aria-label="progress.videoDownloaded" hidden></progress>
                 <span id="preparationDetails"></span>
                 <span id="preparationVideo"></span>
                 <span id="warn-extra" hidden></span>
@@ -96,8 +85,25 @@
 
     <section class="downloads-panel" aria-label="Saved downloads" data-i18n-aria-label="downloads.saved">
       <div class="downloads-head">
-        <h2 data-i18n="downloads.title">Downloads</h2>
+        <div class="downloads-heading">
+          <h2 data-i18n="downloads.title">Downloads</h2>
+          <span class="downloads-count" id="downloadsCount" aria-hidden="true">0</span>
+        </div>
+        <button id="addDownloadBtn" type="button" aria-expanded="false" aria-controls="sourcePanel">
+          <span class="add-icon" aria-hidden="true"></span>
+          <span id="addDownloadLabel" data-i18n="downloads.add">Add</span>
+        </button>
       </div>
+      <section id="sourcePanel" class="source-panel" aria-label="Add a download" data-i18n-aria-label="player.source" hidden>
+        <form id="form" class="source-form" autocomplete="off">
+          <label class="source-label" for="magnet" data-i18n="player.magnet">Magnet link</label>
+          <div class="input-row">
+            <input id="magnet" type="text" class="input-style" placeholder="magnet:?xt=urn:btih:..." spellcheck="false" required>
+            <button type="submit" id="nextBtn" class="input-style" data-i18n="player.load">Open</button>
+          </div>
+          <div class="msg" id="magnetMsg" role="status" aria-live="polite"></div>
+        </form>
+      </section>
       <div id="downloadsList" class="downloads-list"></div>
       <div class="msg" id="downloadsMsg"></div>
     </section>
@@ -106,16 +112,27 @@
     <div class="download-row">
       <button type="button" class="download-open" data-action="open">
         <span class="download-main">
+          <span class="download-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <rect x="3" y="4" width="18" height="16" rx="3"/>
+              <path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/>
+            </svg>
+          </span>
           <span class="download-title-row"><span class="download-title"></span></span>
-          <span class="download-subtitle"></span>
         </span>
-        <span class="download-meta"><span class="download-meta-text"></span></span>
-        <progress class="download-progress" max="1" aria-label="Selected video downloaded" data-i18n-aria-label="progress.videoDownloaded" hidden></progress>
+        <span class="download-meta">
+          <span class="download-size"></span>
+          <span class="download-meta-text"></span>
+        </span>
+        <progress class="download-progress" max="1" aria-label="Video download progress" data-i18n-aria-label="progress.videoDownloaded" hidden></progress>
       </button>
+      <div class="download-playback-actions">
+        <button type="button" class="download-resume input-style" data-action="resume" hidden></button>
+      </div>
       <div class="download-actions">
         <div class="download-menu download-expiry-menu">
           <button type="button" class="download-expiry-extend" data-action="toggle-extend"
-            title="Extend download" data-i18n-title="downloads.extend" aria-label="Extend download" data-i18n-aria-label="downloads.extend" aria-haspopup="menu" aria-expanded="false">+</button>
+            title="Extend storage time" data-i18n-title="downloads.extend" aria-label="Extend storage time" data-i18n-aria-label="downloads.extend" aria-haspopup="menu" aria-expanded="false">+</button>
           <div class="download-extend-menu" role="menu" hidden>
             <button type="button" class="download-menu-item" data-action="extend" data-days="1" role="menuitem" data-i18n="downloads.days" data-i18n-params='{"count":1}'>1 day</button>
             <button type="button" class="download-menu-item" data-action="extend" data-days="7" role="menuitem" data-i18n="downloads.days" data-i18n-params='{"count":7}'>7 days</button>
@@ -124,9 +141,6 @@
         </div>
         <button type="button" class="download-action input-style delete icon-only" data-action="delete"
           title="Delete" data-i18n-title="downloads.delete" aria-label="Delete" data-i18n-aria-label="downloads.delete"></button>
-      </div>
-      <div class="download-playback-actions">
-        <button type="button" class="download-resume input-style" data-action="resume" hidden></button>
       </div>
     </div>
   </template>

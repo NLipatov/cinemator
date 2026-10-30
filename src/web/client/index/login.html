@@ -31,22 +31,22 @@
     <section class="login-content">
       <div class="login-copy">
         <h1 data-i18n="auth.signIn">Sign in</h1>
-        <p data-i18n="auth.description">Enter the password configured by the server owner.</p>
+        <p data-i18n="auth.description">Enter the password set by the server owner.</p>
       </div>
       <form class="login-form" id="loginForm">
         <label for="password" data-i18n="auth.password">Password</label>
         <input id="password" name="password" type="password" autocomplete="current-password" required>
-        <button id="loginButton" type="submit" data-i18n="auth.continue">Continue</button>
+        <button id="loginButton" type="submit" data-i18n="auth.continue">Sign in</button>
         <div class="msg" id="loginMessage" role="alert" aria-live="polite"></div>
       </form>
-      <div class="login-divider"><span data-i18n="auth.phone">or sign in with your phone</span></div>
+      <div class="login-divider"><span data-i18n="auth.phone">or sign in with a QR code</span></div>
       <div class="device-login">
         <div class="qr-frame">
-          <img id="deviceQRCode" alt="QR code for signing in with another device" data-i18n-alt="auth.qrAlt" hidden>
+          <img id="deviceQRCode" alt="QR code for signing in to Cinemator" data-i18n-alt="auth.qrAlt" hidden>
           <div class="qr-placeholder" id="qrPlaceholder" data-i18n="auth.generatingQR">Generating QR code…</div>
         </div>
         <div class="device-login-copy">
-          <p data-i18n="auth.scan">Scan with a device already signed in to Cinemator.</p>
+          <p data-i18n="auth.scan">Scan the QR code with a device already signed in to Cinemator.</p>
           <strong class="device-code" id="deviceCode"></strong>
           <span class="device-expiry" id="deviceExpiry"></span>
         </div>

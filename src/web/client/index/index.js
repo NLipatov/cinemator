@@ -87,6 +87,7 @@ import { t, setText, number, errorKey } from './i18n.js';
     let progressUnavailable = false;
     let openExtendDownloadID = null;
     let activeDownloadID = null;
+    let activeMagnet = '';
     let pendingResume = null;
     let savePlaybackPosition = null;
     let requestSeq = 0;
@@ -191,7 +192,7 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
 
     function formatBytes(bytes) {
-      if (!Number.isFinite(bytes) || bytes <= 0) return `${number(0)} ${t('units.B')}`;
+      if (!Number.isFinite(bytes) || bytes <= 0) return `${number(0)}\u00a0${t('units.B')}`;
       const units = ['B', 'KB', 'MB', 'GB', 'TB'];
       let value = bytes;
       let idx = 0;
@@ -200,7 +201,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         idx++;
       }
       const digits = value >= 10 || idx === 0 ? 0 : 1;
-      return `${number(value, { minimumFractionDigits: digits, maximumFractionDigits: digits })} ${t('units.' + units[idx])}`;
+      return `${number(value, { minimumFractionDigits: digits, maximumFractionDigits: digits })}\u00a0${t('units.' + units[idx])}`;
     }
 
     function formatExpiry(value) {
@@ -209,13 +210,25 @@ import { t, setText, number, errorKey } from './i18n.js';
       const diffMs = expires.getTime() - Date.now();
       const absMs = Math.abs(diffMs);
       const units = [
+        // Long countdowns use approximate years and months.
+        { label: 'year', ms: 365 * 24 * 60 * 60 * 1000 },
+        { label: 'month', ms: 30 * 24 * 60 * 60 * 1000 },
         { label: 'day', ms: 24 * 60 * 60 * 1000 },
         { label: 'hour', ms: 60 * 60 * 1000 },
         { label: 'minute', ms: 60 * 1000 },
       ];
       const unit = units.find(u => absMs >= u.ms) || units[units.length - 1];
       const valueRounded = Math.max(1, Math.round(absMs / unit.ms));
-      return t(diffMs < 0 ? 'downloads.expiredAgo' : 'downloads.remaining', { duration: t('downloads.duration.' + unit.label, { count: valueRounded }) });
+      const part = (label, count) => t('downloads.duration.' + label, { count }).replaceAll(' ', '\u00a0');
+      let duration = part(unit.label, valueRounded);
+      if (unit.label === 'day' && valueRounded >= 7) {
+        duration = part(diffMs < 0 ? 'weekPast' : 'week', Math.floor(valueRounded / 7));
+        const days = valueRounded % 7;
+        if (days) {
+          duration = t('downloads.duration.weeksAndDays', { weeks: duration, days: part('day', days) });
+        }
+      }
+      return t(diffMs < 0 ? 'downloads.expiredAgo' : 'downloads.remaining', { duration });
     }
 
     function formatDownloadSize(download) {
@@ -395,6 +408,7 @@ import { t, setText, number, errorKey } from './i18n.js';
 
     function renderDownloads(downloads) {
       const list = $('downloadsList');
+      $('downloadsCount').textContent = number(downloads.length);
       const focused = list.contains(document.activeElement) ? document.activeElement : null;
       const restoreExtendID = openExtendDownloadID;
       openExtendDownloadID = null;
@@ -413,6 +427,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         const row = rows.get(download.id) || template.content.firstElementChild.cloneNode(true);
         rows.delete(download.id);
         row.dataset.id = download.id;
+        row.dataset.status = download.status;
         row.classList.toggle('active', download.id === activeDownloadID);
         row.querySelectorAll('button[data-action]').forEach(button => {
           button.dataset.id = download.id;
@@ -423,12 +438,12 @@ import { t, setText, number, errorKey } from './i18n.js';
           row.querySelector('.download-open').removeAttribute('aria-current');
         }
         row.querySelector('.download-title').textContent = download.title || t('downloads.torrent', { id: download.id.slice(0, 8) });
-        row.querySelector('.download-subtitle').textContent = download.id;
         const resume = row.querySelector('.download-resume');
         const position = readPlaybackPosition(download);
         resume.hidden = !position;
         if (position) setText(resume, 'downloads.resume', { time: formatPlaybackTime(position.time) });
-        row.querySelector('.download-meta-text').textContent = `${formatDownloadSize(download)} · ${formatDownloadState(download)}`;
+        row.querySelector('.download-size').textContent = formatDownloadSize(download);
+        row.querySelector('.download-meta-text').textContent = formatDownloadState(download);
         row.querySelector('.download-meta-text').classList.remove('has-progress');
         renderErrorDetails(row, download.preparationError);
         row.querySelector('.download-progress').hidden = true;
@@ -438,6 +453,7 @@ import { t, setText, number, errorKey } from './i18n.js';
           row.querySelector('.download-meta-text').textContent = progressUnavailable ? t('progress.reconnecting') :
             download.progress.stage === 'playable' && !flowRequestController ? t('downloads.ready') : t('downloads.preparing');
         } else if (download.progress) {
+          row.querySelector('.download-size').textContent = '';
           const meta = row.querySelector('.download-meta-text');
           meta.classList.add('has-progress');
           meta.textContent = progressUnavailable ? t('progress.reconnectingDetails') :
@@ -483,7 +499,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         updateDownloadSamples(downloadCatalog);
         progressUnavailable = false;
         if (!downloadCatalog.some(download => download.id === activeDownloadID)) {
-          const currentMagnet = $('magnet').value.trim();
+          const currentMagnet = activeMagnet;
           activeDownloadID = downloadCatalog.find(download => download.magnet === currentMagnet)?.id || null;
         }
         renderDownloads(downloadCatalog);
@@ -534,7 +550,8 @@ import { t, setText, number, errorKey } from './i18n.js';
       destroyVideoAndHls();
       pendingResume = position ? { ...position, magnet: download.magnet } : null;
       setActiveDownload(download.id);
-      $('magnet').value = download.magnet;
+      activeMagnet = download.magnet;
+      setSourceOpen(false);
       setFileList(download.files);
       const fileIndex = position?.fileIndex ?? download.selectedFileIndex;
       if (Number.isInteger(fileIndex)) {
@@ -579,7 +596,7 @@ import { t, setText, number, errorKey } from './i18n.js';
           cancelFlowRequest();
           destroyVideoAndHls();
           setActiveDownload(null);
-          $('magnet').value = '';
+          activeMagnet = '';
           $('filelist').textContent = '';
           $('step-files').style.display = 'none';
           $('step-tracks').style.display = 'none';
@@ -681,6 +698,23 @@ import { t, setText, number, errorKey } from './i18n.js';
     loadDownloads();
     startDownloadEvents();
 
+    function setSourceOpen(open) {
+      const panel = $('sourcePanel');
+      const restoreFocus = panel.contains(document.activeElement);
+      panel.hidden = !open;
+      $('addDownloadBtn').setAttribute('aria-expanded', String(open));
+      setText($('addDownloadLabel'), open ? 'common.close' : 'downloads.add');
+      if (open) $('magnet').focus();
+      else if (restoreFocus) $('addDownloadBtn').focus();
+    }
+    $('addDownloadBtn').onclick = () => setSourceOpen($('sourcePanel').hidden);
+    $('sourcePanel').addEventListener('keydown', event => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        setSourceOpen(false);
+      }
+    });
+
     $('form').onsubmit = async e => {
       e.preventDefault();
       const magnet = $('magnet').value.trim();
@@ -689,6 +723,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         return;
       }
       pendingResume = null;
+      activeMagnet = magnet;
       setActiveDownload(downloadCatalog.find(download => download.magnet === magnet)?.id || null);
       const request = beginFlowRequest();
       const requestId = request.id;
@@ -708,10 +743,16 @@ import { t, setText, number, errorKey } from './i18n.js';
         setFileList(files);
         $('step-files').style.display = '';
         showMsg('magnetMsg', '');
+        if ($('magnet').value.trim() === magnet) {
+          setSourceOpen(false);
+          $('magnet').value = '';
+          $('filelist').focus();
+        }
         loadDownloads({ quiet: true });
       } catch (e) {
         if (e.name === 'AbortError') return;
         if (isStale(requestId)) return;
+        if ($('sourcePanel').hidden) setSourceOpen(true);
         showError('magnetMsg', e, 'errors.files');
         return;
       } finally {
@@ -728,7 +769,7 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
 
     $('selectTracks').onclick = async () => {
-      const magnet = $('magnet').value.trim();
+      const magnet = activeMagnet;
       const idx = $('filelist').value;
       if (!magnet || idx === undefined || idx === '') {
         showMsg('fileMsg', 'player.selectFile', true);
@@ -814,7 +855,7 @@ import { t, setText, number, errorKey } from './i18n.js';
     $('filelist').addEventListener('change', () => { pendingResume = null; });
 
     async function startPlayback(resumeTime) {
-      const magnet = $('magnet').value.trim();
+      const magnet = activeMagnet;
       const idx = $('filelist').value;
       const audio = $('audioSelect').value || '0';
       const subtitle = $('subtitleSelect').value || '-1';

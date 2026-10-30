@@ -8,6 +8,7 @@ test.describe("touch error diagnostics", () => {
     page,
   }) => {
     await openPage(page, "/", "ru");
+    await page.locator("#addDownloadBtn").tap();
     const diagnostic =
       'Invalid magnet: missing hash\n<img src=x onerror="alert(1)">\n' + "x".repeat(400);
     await page.route("**/api/torrent/files?*", (route) =>
@@ -56,6 +57,7 @@ for (const [code, key] of [
 ]) {
   test(`${code}: diagnostic disclosure is keyboard accessible`, async ({ page }) => {
     await openPage(page, "/", "en");
+    await page.locator("#addDownloadBtn").click();
     await page.route("**/api/torrent/files?*", (route) =>
       route.fulfill({
         status: 400,
@@ -84,6 +86,7 @@ test("retry clears diagnostics and empty responses do not leave an empty disclos
   page,
 }) => {
   await openPage(page, "/", "en");
+  await page.locator("#addDownloadBtn").click();
   await page.route("**/api/torrent/files?*", (route) =>
     route.fulfill({ status: 400, body: "Invalid magnet" }),
   );
