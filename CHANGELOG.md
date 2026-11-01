@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/NLipatov/cinemator/compare/0.11.0...0.12.0) (2026-11-01)
+
+
+### Features
+
+* **player:** add rotating previews and explicit video selection ([#53](https://github.com/NLipatov/cinemator/issues/53)) ([8ab0b4e](https://github.com/NLipatov/cinemator/commit/8ab0b4e0b5b9802b30ab3e271dfc845a134be64e))
+
 ## [0.11.0](https://github.com/NLipatov/cinemator/compare/0.10.1...0.11.0) (2026-11-01)
 
 
