@@ -431,7 +431,7 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
 
     function renderThumbnail(image, download, file) {
-      const url = file && download.magnet && download.status === 'ready' ? `/api/hls/${encodeURIComponent(download.id)}_${file.index}_a-1_s-1/thumbnail-v2.jpg` : '';
+      const url = file && download.magnet && download.status === 'ready' ? `/api/hls/${encodeURIComponent(download.id)}_${file.index}_a-1_s-1/thumbnail-v3.jpg` : '';
       if (!url) {
         image.removeAttribute('src');
         delete image.dataset.url;

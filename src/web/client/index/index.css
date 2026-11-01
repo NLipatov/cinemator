@@ -770,26 +770,23 @@ button:disabled {
 .download-preview {
   position: absolute;
   inset: 0;
-  width: 500%;
+  width: 1000%;
   max-width: none;
   height: 100%;
   object-fit: fill;
   opacity: 0;
-  transform: translateX(-40%);
+  transform: translateX(-50%);
 }
 
 .download-preview.loaded { opacity: 1; }
 @keyframes preview-frames {
-  0%, 19.99% { transform: translateX(0); }
-  20%, 39.99% { transform: translateX(-20%); }
-  40%, 59.99% { transform: translateX(-40%); }
-  60%, 79.99% { transform: translateX(-60%); }
-  80%, 100% { transform: translateX(-80%); }
+  from { transform: translateX(0); }
+  to { transform: translateX(-100%); }
 }
 @media (prefers-reduced-motion: no-preference) {
   .download-preview.loaded {
-    animation: preview-frames 10s step-end infinite;
-    animation-delay: -4s;
+    animation: preview-frames 20s steps(10) infinite;
+    animation-delay: -10s;
   }
 }
 .download-play-icon {
