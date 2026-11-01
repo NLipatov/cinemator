@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/NLipatov/cinemator/compare/0.14.0...0.14.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **player:** keep mobile controls aligned across fonts ([#59](https://github.com/NLipatov/cinemator/issues/59)) ([cb2b2e4](https://github.com/NLipatov/cinemator/commit/cb2b2e46ab4238db3369a706900c9da6006950fa))
+
 ## [0.14.0](https://github.com/NLipatov/cinemator/compare/0.13.0...0.14.0) (2026-11-01)
 
 
