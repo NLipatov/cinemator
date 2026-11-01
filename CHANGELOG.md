@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/NLipatov/cinemator/compare/0.13.0...0.14.0) (2026-11-01)
+
+
+### Features
+
+* **player:** expand rotating previews to ten frames ([#57](https://github.com/NLipatov/cinemator/issues/57)) ([b35beb0](https://github.com/NLipatov/cinemator/commit/b35beb0a5d9af4b72f3802742ba510d8a245574d))
+
 ## [0.13.0](https://github.com/NLipatov/cinemator/compare/0.12.0...0.13.0) (2026-11-01)
 
 
