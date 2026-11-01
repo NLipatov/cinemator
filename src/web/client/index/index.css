@@ -848,13 +848,76 @@ button:disabled {
   line-height: 1.5;
 }
 .download-expiry,
-.download-file-label,
 .download-resume {
   display: block;
   color: var(--color-muted);
   font-size: 0.78rem;
   line-height: 1.5;
   margin-block-start: 0.2rem;
+}
+.download-videos {
+  grid-column: 1;
+  grid-row: 3;
+  justify-self: start;
+  min-height: 44px;
+  padding: 0.3rem 0;
+  color: var(--color-muted);
+  background: transparent;
+  border: 0;
+  font-size: 0.78rem;
+  font-weight: 500;
+}
+.download-videos:hover,
+.download-videos:focus-visible,
+.download-videos[aria-expanded="true"] {
+  color: var(--color-accent);
+  background: transparent;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+.video-file-menu {
+  position: fixed;
+  z-index: 40;
+  width: min(28rem, calc(100vw - 1rem));
+  max-height: min(24rem, calc(100dvh - 1rem));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.4rem;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-medium);
+  box-shadow: var(--shadow-menu);
+}
+.video-file-option {
+  display: flex;
+  align-items: baseline;
+  gap: 0.65rem;
+  width: 100%;
+  min-height: 44px;
+  padding: 0.65rem;
+  color: var(--color-fg);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-small);
+  font-size: 0.84rem;
+  font-weight: 400;
+  text-align: start;
+}
+.video-file-check { flex: 0 0 1em; visibility: hidden; }
+.video-file-name { overflow-wrap: anywhere; min-width: 0; }
+.video-file-option[aria-checked="true"] .video-file-check { visibility: visible; }
+.video-file-option[aria-checked="true"] { color: var(--color-accent); }
+.video-file-option:hover,
+.video-file-option:focus-visible { background: var(--color-surface-soft); }
+@media (max-width: 44rem) {
+  .video-file-menu {
+    left: 0.5rem !important;
+    right: 0.5rem;
+    top: auto !important;
+    bottom: max(0.5rem, env(safe-area-inset-bottom));
+    width: auto;
+    max-height: 65dvh;
+  }
 }
 .download-row.active .download-title { color: var(--color-accent); }
 .download-menu {
@@ -1295,6 +1358,7 @@ button:disabled {
   margin-bottom: 0.5rem;
 }
 @media (max-width: 44rem) {
+  .player-toolbar { column-gap: 0.25rem; }
   .selected-file {
     flex-basis: 100%;
   }
