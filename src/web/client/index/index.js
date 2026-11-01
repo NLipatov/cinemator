@@ -143,6 +143,8 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
     const optionLabels = new WeakMap();
     let videoFiles = [];
+    let selectedVideoIndex = null;
+    let videoMenuState = null;
     function setOptions(select, options) {
       select.replaceChildren(...options.map(({ value, label }) => {
         const option = new Option(label(), String(value));
@@ -154,26 +156,9 @@ import { t, setText, number, errorKey } from './i18n.js';
       return name.split(/[\\/]/).pop().replace(/\.(mkv|mp4|m4v|mov|avi|webm|ts|m2ts|mpg|mpeg|wmv|flv|ogv)$/i, '');
     }
 
-    function fileDisplayName(file, files, compact = false) {
-      const stem = fileStem(file.name);
-      // Only infer numbered episodes when the whole set shares the same prefix.
-      const numbered = name => fileStem(name).match(/^(.*?)\s+[—–-]\s+(\d{1,3})$/);
-      const match = numbered(file.name);
-      if (match && files.length > 1 && files.every(other => numbered(other.name)?.[1] === match[1]) &&
-          new Set(files.map(other => Number(numbered(other.name)[2]))).size === files.length) {
-        const episode = t('player.episode', { number: Number(match[2]) });
-        return compact ? episode : `${match[1]} · ${episode}`;
-      }
-      // Keep ambiguous names distinct (e.g. two encodings with the same basename).
-      return files.filter(other => fileStem(other.name) === stem).length > 1 ? file.name : stem;
-    }
-
     function setFileList(files) {
       videoFiles = files;
-      setOptions($('filelist'), files.map(f => ({
-        value: f.index,
-        label: () => `${f.name} (${formatBytes(f.size)})`,
-      })));
+      selectedVideoIndex = files[0]?.index ?? null;
     }
     function showMsg(id, key, isErr=false, loader=false, params={}) {
       clearTimeout(msgTimeout);
@@ -372,8 +357,8 @@ import { t, setText, number, errorKey } from './i18n.js';
     function renderPreparationProgress() {
       const download = downloadCatalog.find(item => item.id === activeDownloadID);
       const progress = download?.progress;
-      const matches = progress && progress.fileIndex === Number($('filelist').value);
-      const selected = download?.selectedFileIndex === Number($('filelist').value);
+      const matches = progress && progress.fileIndex === selectedVideoIndex;
+      const selected = download?.selectedFileIndex === selectedVideoIndex;
       let stage = t('progress.selectedVideo');
       let details = '';
       if (matches) {
@@ -434,6 +419,8 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
 
     function toggleDownloadMenu(toggle) {
+      closeVideoMenu();
+      closePlayerMenu();
       const menu = toggle.closest('.download-menu');
       const willOpen = !menu.classList.contains('open');
       closeDownloadMenus();
@@ -444,7 +431,7 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
 
     function renderThumbnail(image, download, file) {
-      const url = file && download.magnet ? `/api/hls/${encodeURIComponent(download.id)}_${file.index}_a-1_s-1/thumbnail.jpg` : '';
+      const url = file && download.magnet && download.status === 'ready' ? `/api/hls/${encodeURIComponent(download.id)}_${file.index}_a-1_s-1/thumbnail-v2.jpg` : '';
       if (!url) {
         image.removeAttribute('src');
         delete image.dataset.url;
@@ -499,7 +486,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         const files = download.files || [];
         const position = readPlaybackPosition(download);
         const selectedIndex = download.id === activeDownloadID && !$('playerWorkspace').hidden ?
-          Number($('filelist').value) : position?.fileIndex ?? download.selectedFileIndex;
+          selectedVideoIndex : position?.fileIndex ?? download.selectedFileIndex;
         const file = files.find(file => file.index === selectedIndex) || files[0];
         row.dataset.fileIndex = file?.index ?? '';
         const title = download.title ? (files.length === 1 ? fileStem(download.title) : download.title) : t('downloads.torrent', { id: download.id.slice(0, 8) });
@@ -511,15 +498,15 @@ import { t, setText, number, errorKey } from './i18n.js';
         expiry.id = `download-expiry-${download.id}`;
         if (expiry.hidden) row.querySelector('.download-open').removeAttribute('aria-describedby');
         else row.querySelector('.download-open').setAttribute('aria-describedby', expiry.id);
-        const fileLabel = row.querySelector('.download-file-label');
-        fileLabel.hidden = files.length <= 1;
-        fileLabel.textContent = file && files.length > 1 ? fileDisplayName(file, files, true) : '';
+        const videosButton = row.querySelector('.download-videos');
+        videosButton.hidden = files.length <= 1;
+        setText(videosButton, 'downloads.videos', { count: files.length });
         const saved = position?.fileIndex === file?.index ? position : null;
         const resume = row.querySelector('.download-resume');
         resume.hidden = !saved;
         if (saved) setText(resume, 'downloads.resume', { time: formatPlaybackTime(saved.time) });
         row.querySelector('.download-open').setAttribute('aria-label', [
-          saved ? t('downloads.resume', { time: formatPlaybackTime(saved.time) }) : t('player.play'), title, fileLabel.textContent,
+          saved ? t('downloads.resume', { time: formatPlaybackTime(saved.time) }) : t('player.play'), title, files.length > 1 ? file?.name : '',
         ].filter(Boolean).join(' · '));
         row.querySelector('[data-action="restart"]').hidden = !download.magnet || !file;
         const duration = saved?.duration;
@@ -536,7 +523,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         renderErrorDetails(row, download.preparationError);
         row.querySelector('.download-progress').hidden = true;
         const progressAtPlayer = download.id === activeDownloadID && !$('warnMsg').hidden &&
-          download.progress?.fileIndex === Number($('filelist').value);
+          download.progress?.fileIndex === selectedVideoIndex;
         if (progressAtPlayer) {
           row.querySelector('.download-meta-text').textContent = progressUnavailable ? t('progress.reconnecting') :
             download.progress.stage === 'playable' && !flowRequestController ? t('downloads.ready') : t('downloads.preparing');
@@ -574,6 +561,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       const openMenu = list.querySelector('.download-menu.open');
       if (openMenu) positionDownloadMenu(openMenu);
       if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
+      if (videoMenuState) renderVideoMenu();
     }
 
     async function loadDownloads({ quiet = false, suppressError = false, progressOnly = false } = {}) {
@@ -655,9 +643,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       setSourceOpen(false);
       setFileList(download.files);
       fileIndex = position?.fileIndex ?? fileIndex;
-      if (Number.isInteger(fileIndex)) {
-        $('filelist').value = String(fileIndex);
-      }
+      if (videoFiles.some(file => file.index === fileIndex)) selectedVideoIndex = fileIndex;
       $('step-files').style.display = '';
       resetTracks();
       $('player-block').style.display = 'none';
@@ -776,6 +762,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       const button = event.target.closest('button[data-action][data-id]');
       if (!button) return;
       const { action, id } = button.dataset;
+      if (action === 'choose-video') return toggleVideoMenu(button, id);
       if (action === 'toggle-menu') return toggleDownloadMenu(button);
       const download = findDownload(id);
       if (action === 'open' || action === 'restart') {
@@ -783,6 +770,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         const fileIndex = Number(button.closest('.download-row').dataset.fileIndex);
         const position = action === 'open' ? readPlaybackPosition(download) : null;
         closeDownloadMenus();
+        closeVideoMenu();
         openDownload(download, position?.fileIndex === fileIndex ? position : null, fileIndex);
       }
       if (action === 'extend') {
@@ -893,6 +881,119 @@ import { t, setText, number, errorKey } from './i18n.js';
       }
     };
 
+    const videoMenuResizeObserver = new ResizeObserver(positionVideoMenu);
+    function closeVideoMenu(restoreFocus = false) {
+      if (!videoMenuState) return;
+      const trigger = videoMenuState.trigger;
+      const focusInside = $('videoMenu').contains(document.activeElement);
+      videoMenuState = null;
+      videoMenuResizeObserver.disconnect();
+      $('videoMenu').hidden = true;
+      trigger.setAttribute('aria-expanded', 'false');
+      if (restoreFocus || focusInside) {
+        (trigger.isConnected && !trigger.hidden ? trigger : $('addDownloadBtn')).focus({ preventScroll: true });
+      }
+    }
+    function positionVideoMenu() {
+      if (!videoMenuState) return;
+      const popup = $('videoMenu');
+      const anchor = videoMenuState.trigger.getBoundingClientRect();
+      const box = popup.getBoundingClientRect();
+      const bottom = videoMenuState.trigger === $('videoMenuButton') ?
+        Math.min(anchor.top - 8, $('video').getBoundingClientRect().bottom) : anchor.top - 8;
+      const above = bottom - box.height;
+      const top = above >= 8 ? above : anchor.bottom + 8;
+      popup.style.left = `${Math.max(8, Math.min(anchor.right - box.width, innerWidth - box.width - 8))}px`;
+      popup.style.top = `${Math.max(8, Math.min(top, innerHeight - box.height - 8))}px`;
+    }
+    function renderVideoMenu() {
+      if (!videoMenuState) return;
+      const { trigger, downloadID } = videoMenuState;
+      const download = downloadID === null ? null : findDownload(downloadID);
+      const files = downloadID === null ? videoFiles : download?.files || [];
+      if (!trigger.isConnected || trigger.hidden || files.length <= 1) {
+        closeVideoMenu();
+        return;
+      }
+      let current = downloadID === null || downloadID === activeDownloadID && !$('playerWorkspace').hidden ?
+        selectedVideoIndex : readPlaybackPosition(download)?.fileIndex ?? download.selectedFileIndex;
+      if (!files.some(file => file.index === current)) current = files[0].index;
+      const popup = $('videoMenu');
+      const items = new Map([...popup.children].map(item => [Number(item.dataset.fileIndex), item]));
+      const focusedIndex = popup.contains(document.activeElement) ? Number(document.activeElement.dataset.fileIndex) : null;
+      files.forEach((file, index) => {
+        let item = items.get(file.index);
+        items.delete(file.index);
+        if (!item) {
+          item = document.createElement('button');
+          item.type = 'button';
+          item.className = 'video-file-option';
+          item.setAttribute('role', 'menuitemradio');
+          item.dataset.fileIndex = String(file.index);
+          item.innerHTML = '<span class="video-file-check" aria-hidden="true">✓</span><span class="video-file-name"></span>';
+        }
+        item.querySelector('.video-file-name').textContent = file.name;
+        item.setAttribute('aria-checked', String(file.index === current));
+        item.tabIndex = file.index === current ? 0 : -1;
+        if (popup.children[index] !== item) popup.insertBefore(item, popup.children[index] || null);
+      });
+      for (const item of items.values()) item.remove();
+      if (focusedIndex !== null && !popup.contains(document.activeElement)) {
+        ([...popup.children].find(item => Number(item.dataset.fileIndex) === focusedIndex) ||
+          popup.querySelector('[aria-checked="true"]')).focus({ preventScroll: true });
+      }
+      positionVideoMenu();
+    }
+    function toggleVideoMenu(trigger, downloadID = null) {
+      const opening = videoMenuState?.trigger !== trigger;
+      closeVideoMenu();
+      closePlayerMenu();
+      closeDownloadMenus();
+      if (!opening) return;
+      videoMenuState = { trigger, downloadID };
+      $('videoMenu').hidden = false;
+      trigger.setAttribute('aria-expanded', 'true');
+      renderVideoMenu();
+      if (!videoMenuState) return;
+      videoMenuResizeObserver.observe($('videoMenu'));
+      const selected = $('videoMenu').querySelector('[aria-checked="true"]');
+      selected.focus({ preventScroll: true });
+      selected.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    $('videoMenuButton').onclick = () => toggleVideoMenu($('videoMenuButton'));
+    $('videoMenu').onclick = event => {
+      const item = event.target.closest('[data-file-index]');
+      if (!item || !videoMenuState) return;
+      const { downloadID } = videoMenuState;
+      const fileIndex = Number(item.dataset.fileIndex);
+      closeVideoMenu(true);
+      if (downloadID === null || downloadID === activeDownloadID && !$('playerWorkspace').hidden) {
+        selectVideoFile(fileIndex);
+      } else {
+        openDownload(findDownload(downloadID), null, fileIndex);
+      }
+    };
+    for (const type of ['click', 'focusin']) document.addEventListener(type, event => {
+      if (videoMenuState && !videoMenuState.trigger.contains(event.target) && !$('videoMenu').contains(event.target)) {
+        closeVideoMenu(type === 'click' && document.activeElement === document.body);
+      }
+    });
+    document.addEventListener('keydown', event => {
+      if (!videoMenuState) return;
+      if (event.key === 'Escape' || event.key === 'Tab') {
+        if (event.key === 'Escape') event.preventDefault();
+        closeVideoMenu(true);
+      } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const items = [...$('videoMenu').children];
+        const current = items.indexOf(document.activeElement);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 :
+          (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
+      }
+    });
+    for (const event of ['resize', 'scroll']) window.addEventListener(event, positionVideoMenu, true);
+
     let openPlayerMenu = null;
     function closePlayerMenu(restoreFocus = false) {
       if (!openPlayerMenu) return;
@@ -904,9 +1005,11 @@ import { t, setText, number, errorKey } from './i18n.js';
       openPlayerMenu = null;
       if (restoreFocus || focusInside) button.focus();
     }
-    for (const name of ['video', 'audio', 'subtitles']) {
+    for (const name of ['audio', 'subtitles']) {
       $(name + 'MenuButton').onclick = () => {
         const opening = openPlayerMenu !== name;
+        closeVideoMenu();
+        closeDownloadMenus();
         closePlayerMenu();
         if (!opening) return;
         openPlayerMenu = name;
@@ -928,15 +1031,19 @@ import { t, setText, number, errorKey } from './i18n.js';
       if (!event.target.closest('.player-setting')) closePlayerMenu();
     });
     function updateSelectedFile() {
-      const file = videoFiles.find(file => String(file.index) === $('filelist').value);
-      $('selectedFile').textContent = file ? fileDisplayName(file, videoFiles) : '';
+      const index = videoFiles.findIndex(file => file.index === selectedVideoIndex);
+      const file = videoFiles[index];
+      $('selectedFile').textContent = file?.name || '';
       $('selectedFile').title = file?.name || '';
+      $('videoMenuButton').hidden = videoFiles.length <= 1;
+      setText($('videoMenuLabel'), 'player.videoPosition', { index: index + 1, count: videoFiles.length });
     }
     function updateSubtitleDelay() {
       $('subtitleDelayRow').style.display = Number($('subtitleSelect').value) >= 0 ? '' : 'none';
     }
     function resetTracks() {
       closePlayerMenu();
+      closeVideoMenu();
       tracksReady = false;
       wantsPlayback = false;
       retryTime = 0;
@@ -963,8 +1070,8 @@ import { t, setText, number, errorKey } from './i18n.js';
 
     async function loadTracks() {
       const magnet = activeMagnet;
-      const idx = $('filelist').value;
-      if (!magnet || !idx) return;
+      const idx = selectedVideoIndex;
+      if (!magnet || idx === null) return;
       const request = beginFlowRequest();
       showMsg('fileMsg', '');
       showWarning();
@@ -1006,7 +1113,9 @@ import { t, setText, number, errorKey } from './i18n.js';
       if (tracksReady) startPlayback();
       else if (!flowRequestController) loadTracks();
     }
-    $('filelist').addEventListener('change', () => {
+    function selectVideoFile(fileIndex) {
+      if (fileIndex === selectedVideoIndex) return;
+      selectedVideoIndex = fileIndex;
       const restart = wantsPlayback;
       cancelFlowRequest();
       pendingResume = null;
@@ -1018,15 +1127,15 @@ import { t, setText, number, errorKey } from './i18n.js';
       showMsg('playerMsg', '');
       removeWarning();
       if (restart) launchPlayback();
-    });
+    }
 
     async function startPlayback(resumeTime) {
       const magnet = activeMagnet;
-      const idx = $('filelist').value;
+      const idx = selectedVideoIndex;
       const audio = $('audioSelect').value || '0';
       const subtitle = $('subtitleSelect').value || '-1';
       const subtitleSelected = parseInt(subtitle, 10) >= 0;
-      if (!magnet || idx === undefined || idx === '') {
+      if (!magnet || idx === null) {
         showMsg('trackMsg', 'player.selectFile', true);
         return;
       }

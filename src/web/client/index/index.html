@@ -56,16 +56,11 @@
             <div id="selectedFile" class="selected-file"></div>
             <div class="player-settings">
             <div class="player-setting">
-              <button id="videoMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="videoMenu">
+              <button id="videoMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="videoMenu" aria-haspopup="menu" hidden>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/></svg>
-                <span data-i18n="player.video">Video</span>
+                <span id="videoMenuLabel"></span>
+                <span aria-hidden="true">▾</span>
               </button>
-              <div id="videoMenu" class="settings-popup" role="region" aria-labelledby="videoMenuButton" hidden>
-                <div class="track-row">
-                  <label for="filelist" data-i18n="player.file">Video</label>
-                  <select id="filelist" class="input-style"></select>
-                </div>
-              </div>
             </div>
             <div class="player-setting">
               <button id="audioMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="audioMenu">
@@ -138,6 +133,8 @@
       <div class="msg" id="downloadsMsg"></div>
     </section>
   </main>
+  <div id="videoMenu" class="video-file-menu" role="menu" aria-label="Video" data-i18n-aria-label="player.video" hidden></div>
+
   <template id="downloadRowTemplate">
     <div class="download-row">
       <button type="button" class="download-open" data-action="open">
@@ -152,10 +149,10 @@
         <span class="download-caption">
           <span class="download-title"></span>
           <span class="download-expiry"></span>
-          <span class="download-file-label" hidden></span>
           <span class="download-resume" hidden></span>
         </span>
       </button>
+      <button type="button" class="download-videos" data-action="choose-video" aria-haspopup="menu" aria-expanded="false" aria-controls="videoMenu" hidden></button>
       <div class="download-menu">
         <button type="button" class="download-more" data-action="toggle-menu"
           aria-label="Download actions" data-i18n-aria-label="downloads.actions" aria-haspopup="menu" aria-expanded="false">

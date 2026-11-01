@@ -98,7 +98,7 @@ for (const input of ["touch", "keyboard"]) {
       const diagnostic = warning.locator("pre");
       await expect(page.locator("#preparationDetails")).toHaveText("Could not prepare video");
       await expect(summary).toBeVisible();
-      await openDetails(summary, page, page.locator("#videoMenuButton"), true);
+      await openDetails(summary, page, page.locator("#audioMenuButton"), true);
       await expect(diagnostic).toBeVisible();
       expect(await diagnostic.textContent()).toBe(download.preparationError);
       await expect(warning.locator("img")).toHaveCount(0);

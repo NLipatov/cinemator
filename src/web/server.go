@@ -394,8 +394,8 @@ func (s *Server) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	if path.Base(clean) == "thumbnail.jpg" {
-		s.handleThumbnail(w, r, fullPath)
+	if name := path.Base(clean); name == "thumbnail.jpg" || name == media.ThumbnailFilename {
+		s.handleThumbnail(w, r, filepath.Join(filepath.Dir(fullPath), media.ThumbnailFilename))
 		return
 	}
 

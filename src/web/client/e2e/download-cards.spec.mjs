@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { openPlayer } from './player-fixture.mjs';
 
-const preview = '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="#345b72"/></svg>';
+const preview = `<svg xmlns="http://www.w3.org/2000/svg" width="3200" height="360">${['#e33','#3d3','#35e','#ed3','#e3d'].map((fill,i)=>`<rect x="${i*640}" width="640" height="360" fill="${fill}"/>`).join('')}</svg>`;
 
 for (const touch of [false, true]) {
   test.describe(touch ? 'touch cards' : 'keyboard cards', () => {
@@ -35,13 +35,13 @@ test('a cached preview loads without preparation and missing previews remain pla
   const row=await openPlayer(page);
   await page.goto('about:blank');
   let imageRequests=0;
-  await page.route('**/api/hls/*/thumbnail.jpg*',route=>{
+  await page.route('**/api/hls/*/thumbnail-v2.jpg*',route=>{
     imageRequests++;
     return route.request().url().includes('/ready_') ? route.fulfill({contentType:'image/svg+xml',body:preview}) : route.fulfill({status:404});
   });
   await page.goto('http://cinemator.test/');
   await expect(row.locator('.download-preview')).toHaveClass(/loaded/);
-  expect(await row.locator('.download-preview').evaluate(img=>img.naturalWidth)).toBe(640);
+  expect(await row.locator('.download-preview').evaluate(img=>img.naturalWidth)).toBe(3200);
   const other=page.locator('.download-row[data-id="other"]');
   await expect(other.locator('.download-play-icon')).toBeVisible();
   await expect(other.locator('.download-preview')).not.toHaveClass(/loaded/);
@@ -146,3 +146,66 @@ for(const language of ['en','ru','zh-Hans','zh-Hant']){
     }
   });
 }
+
+
+test('five preview frames cycle automatically and respect reduced motion',async({page})=>{
+ const row=await openPlayer(page);
+ await page.route('**/api/hls/*/thumbnail-v2.jpg*',r=>r.fulfill({contentType:'image/svg+xml',body:preview}));
+ await page.reload();
+ const image=row.locator('.download-preview');
+ await expect(image).toHaveClass(/loaded/);
+ const frameOffset=()=>image.evaluate(img=>{
+  const box=img.getBoundingClientRect(),tile=img.parentElement.getBoundingClientRect();
+  return Math.round((tile.left-box.left)/tile.width);
+ });
+ await expect.poll(()=>image.evaluate(img=>img.getAnimations().length)).toBe(1);
+ const seen=[];
+ for(let step=0;step<5;step++){
+  await image.evaluate((img,time)=>{const animation=img.getAnimations()[0];animation.pause();animation.currentTime=time;},step*2000+100);
+  const frame=(step+2)%5;
+  await expect.poll(frameOffset).toBe(frame);
+  seen.push(await frameOffset());
+ }
+ expect(new Set(seen).size).toBe(5);
+ await page.emulateMedia({reducedMotion:'reduce'});
+ expect(await image.evaluate(img=>img.getAnimations().length)).toBe(0);
+ expect(await frameOffset()).toBe(2);
+});
+
+test('unfinished downloads keep the default cover until HLS is ready',async({page})=>{
+ const row=await openPlayer(page);
+ await page.goto('about:blank');
+ const download={id:'ready',title:'Preparing video',magnet:'magnet:preparing',status:'preparing',
+  selectedFileIndex:4,files:[{index:4,name:'Video.mkv',size:1024}]};
+ let requests=0;
+ await page.route(/\/api\/downloads(?:\?|$)/,r=>r.fulfill({json:[download]}));
+ await page.route('**/api/hls/*/thumbnail-v2.jpg*',r=>{requests++;return r.fulfill({contentType:'image/svg+xml',body:preview})});
+ await page.goto('http://cinemator.test/');
+ await expect(row).toHaveAttribute('data-status','preparing');
+ const image=row.locator('.download-preview');
+ await expect(image).not.toHaveAttribute('src',/.+/);
+ await expect(row.locator('.download-play-icon')).toBeVisible();
+ expect(requests).toBe(0);
+ download.status='ready';
+ await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+ await expect(image).toHaveClass(/loaded/);
+ expect(requests).toBe(1);
+ download.status='preparing';
+ await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+ await expect(image).not.toHaveClass(/loaded/);
+ await expect(image).not.toHaveAttribute('src',/.+/);
+ await expect(row.locator('.download-play-icon')).toBeVisible();
+});
+
+test.describe('touch previews',()=>{
+ test.use({hasTouch:true,isMobile:true,viewport:{width:390,height:844}});
+ test('previews cycle on a phone and a tap still plays the video',async({page})=>{
+  const row=await openPlayer(page);
+  await page.route('**/api/hls/*/thumbnail-v2.jpg*',r=>r.fulfill({contentType:'image/svg+xml',body:preview}));
+  await page.reload();
+  await expect(row.locator('.download-preview')).toHaveClass(/loaded/);
+  await row.locator('.download-thumbnail').tap();
+  await expect.poll(()=>page.locator('#video').evaluate(video=>video.duration)).toBe(120);
+  expect(await row.locator('.download-preview').evaluate(img=>img.getAnimations().length)).toBe(1);
+ });
+});

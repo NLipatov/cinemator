@@ -14,16 +14,16 @@ test('settings are optional; only one menu opens and keyboard focus returns', as
   await ready(page);
   await expect(page.locator('#playerWorkspace')).toBeHidden();
   await play(page);
-  await expect(page.locator('#selectedFile')).toHaveText('Episode 2');
-  await expect(page.locator('.settings-popup:visible')).toHaveCount(0);
+  await expect(page.locator('#selectedFile')).toHaveText('Episode 2.mkv');
+  await expect(page.locator('.settings-popup:visible, #videoMenu:visible')).toHaveCount(0);
   await page.locator('#videoMenuButton').press('Enter');
-  await expect(page.locator('#filelist')).toBeFocused();
+  await expect(page.getByRole('menuitemradio', {name:'Episode 2.mkv', exact:true})).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(page.locator('#videoMenuButton')).toBeFocused();
   await page.locator('#audioMenuButton').click();
   await expect(page.locator('#audioSelect')).toBeEnabled();
   await page.locator('#subtitlesMenuButton').click();
-  await expect(page.locator('.settings-popup:visible')).toHaveCount(1);
+  await expect(page.locator('.settings-popup:visible, #videoMenu:visible')).toHaveCount(1);
   await expect(page.locator('#subtitleDelayRow')).toBeHidden();
   await page.locator('#subtitleSelect').selectOption('3');
   await expect(page.locator('#subtitleDelayRow')).toBeVisible();
@@ -32,7 +32,7 @@ test('settings are optional; only one menu opens and keyboard focus returns', as
   await page.locator('#subtitleSelect').selectOption('-1');
   await expect(page.locator('#subtitleDelayRow')).toBeHidden();
   await page.locator('.brand').click();
-  await expect(page.locator('.settings-popup:visible')).toHaveCount(0);
+  await expect(page.locator('.settings-popup:visible, #videoMenu:visible')).toHaveCount(0);
   await expect(page.locator('#subtitlesMenuButton')).toBeFocused();
   await expect(page.locator('#play')).toBeHidden();
 });
@@ -92,7 +92,7 @@ test('late metadata from a replaced file cannot select tracks or start the old v
   await page.locator('.download-row[data-id="ready"] [data-action="open"]').click();
   await expect.poll(() => oldRequested).toBe(true);
   await page.locator('#videoMenuButton').click();
-  await page.locator('#filelist').selectOption('2');
+  await page.getByRole('menuitemradio', {name:'Episode 1.mkv', exact:true}).click();
   await expect.poll(() => page.locator('#video').evaluate(v => v.duration)).toBe(120);
   release();
   await expect(page.locator('#selectedFile')).toContainText('Episode 1');
@@ -114,7 +114,7 @@ for (const width of [390, 1280]) {
       expect(box.x).toBeGreaterThanOrEqual(0);
       expect(box.x + box.width).toBeLessThanOrEqual(width);
       expect(box.y).toBeGreaterThanOrEqual(0);
-      expect(box.y + box.height).toBeLessThanOrEqual(video.y + video.height + 1);
+      expect(box.y + box.height).toBeLessThanOrEqual(name === 'video' && width === 390 ? 900 : video.y + video.height + 1);
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   });
@@ -150,7 +150,7 @@ test('late stream response cannot replace the newly selected file', async ({ pag
   await page.locator('.download-row[data-id="ready"] [data-action="open"]').click();
   await expect.poll(() => oldRequested).toBe(true);
   await page.locator('#videoMenuButton').click();
-  await page.locator('#filelist').selectOption('2');
+  await page.getByRole('menuitemradio', {name:'Episode 1.mkv', exact:true}).click();
   await expect.poll(() => page.locator('#video').evaluate(v => v.duration)).toBe(120);
   const src = await page.locator('#video').getAttribute('src');
   release();
@@ -165,10 +165,10 @@ test('cards open directly, close saves progress, and the next tap resumes the sa
   await expect(row.locator('select')).toHaveCount(0);
   await row.locator('.download-title').click();
   await expect(page.locator('#playerWorkspace')).toBeVisible();
-  await expect(page.locator('#filelist')).toHaveValue('4');
+  await expect(page.locator('#videoMenuLabel')).toHaveText('Video: 2/2');
   await expect.poll(() => page.locator('#video').evaluate(v => v.duration)).toBe(120);
   await page.locator('#videoMenuButton').click();
-  await page.locator('#filelist').selectOption('2');
+  await page.getByRole('menuitemradio', {name:'Episode 1.mkv', exact:true}).click();
   await expect.poll(() => page.locator('#video').evaluate(v => v.duration)).toBe(120);
   await page.locator('#video').evaluate(v => { v.currentTime = 38; });
   await expect.poll(() => page.locator('#video').evaluate(v => v.currentTime)).toBe(38);
@@ -176,16 +176,16 @@ test('cards open directly, close saves progress, and the next tap resumes the sa
   await expect(page.locator('#playerWorkspace')).toBeHidden();
   await expect(row.locator('.download-open')).toBeFocused();
   await expect(row.locator('.download-resume')).toHaveText('Continue from 0:38');
-  await expect(row.locator('.download-file-label')).toHaveText('Episode 1');
+  await expect(row.locator('.download-videos')).toHaveText('2 videos');
   await expect(row.locator('.download-watched')).toBeVisible();
   expect(await page.locator('#video').getAttribute('src')).toBeNull();
   await row.locator('.download-thumbnail').click();
-  await expect(page.locator('#filelist')).toHaveValue('2');
+  await expect(page.locator('#videoMenuLabel')).toHaveText('Video: 1/2');
   await expect.poll(() => page.locator('#video').evaluate(v => v.currentTime)).toBe(38);
   await page.locator('#closePlayer').click();
   await row.locator('.download-more').click();
   await row.locator('[data-action="restart"]').click();
-  await expect(page.locator('#filelist')).toHaveValue('2');
+  await expect(page.locator('#videoMenuLabel')).toHaveText('Video: 1/2');
   await expect.poll(() => page.locator('#video').evaluate(v => v.duration)).toBe(120);
   expect(await page.locator('#video').evaluate(v => v.currentTime)).toBe(0);
 });
@@ -227,7 +227,7 @@ test('adding a magnet while watching keeps the player and its position', async (
   await expect(page.locator('#playerWorkspace')).toBeVisible();
   await expect(page.locator('#video')).toHaveAttribute('src', src);
   expect(await page.locator('#video').evaluate(v => v.currentTime)).toBe(24);
-  await expect(page.locator('#filelist')).toHaveValue('4');
+  await expect(page.locator('#videoMenuLabel')).toHaveText('Video: 2/2');
 });
 
 for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
@@ -248,37 +248,6 @@ for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
     }
   });
 }
-
-for (const [language, episode] of [['en', 'Episode 2'], ['ru', 'Серия 2'], ['zh-Hans', '第 2 集'], ['zh-Hant', '第 2 集']]) {
-  test(`${language}: concise episode labels retain the exact file in the Video menu`, async ({ page }) => {
-    const row = await openPlayer(page, {language, files: [
-      {index: 2, name: 'Тихий берег — 01.mkv', size: 512},
-      {index: 4, name: 'Тихий берег — 02.mkv', size: 512},
-    ]});
-    await expect(row.locator('.download-file-label')).toHaveText(episode);
-    await row.locator('[data-action="open"]').click();
-    await expect(page.locator('#selectedFile')).toHaveText(`Тихий берег · ${episode}`);
-    await page.locator('#videoMenuButton').click();
-    await expect(page.locator('#filelist option').last()).toContainText('Тихий берег — 02.mkv');
-    await page.locator('#filelist').selectOption('2');
-    await expect(page.locator('#selectedFile')).not.toContainText(episode);
-    await expect(page.locator('#filelist')).toHaveValue('2');
-  });
-}
-
-test('readable names keep ambiguous versions distinct and do not interpret years as episode numbers', async ({ page }) => {
-  const row = await openPlayer(page, { files: [
-    {index: 2, name: 'Film.mkv', size: 512},
-    {index: 4, name: 'Film.mp4', size: 512},
-    {index: 6, name: 'Archive — 2026.mkv', size: 512},
-  ]});
-  await expect(row.locator('.download-file-label')).toHaveText('Film.mp4');
-  await row.locator('.download-open').click();
-  await page.locator('#videoMenuButton').click();
-  await page.locator('#filelist').selectOption('6');
-  await expect(page.locator('#selectedFile')).toHaveText('Archive — 2026');
-  await expect(page.locator('#filelist')).toHaveValue('6');
-});
 
 for (const width of [390, 1280]) {
   test(`${width}: preparation status is inside the video and closing remains available`, async ({ page }) => {
@@ -355,7 +324,7 @@ for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
       localStorage.removeItem('cinemator-playback:series-saved');
       window.dispatchEvent(new Event('focus'));
     });
-    await expect(row.locator('.download-file-label')).toBeHidden();
+    await expect(row.locator('.download-videos')).toBeHidden();
     await expect(row.locator('.download-resume')).toBeHidden();
     expect(await anchor()).toEqual(before);
   });

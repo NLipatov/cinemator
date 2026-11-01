@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"image/jpeg"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -23,20 +25,20 @@ func TestThumbnailExtractsARealFrameAndReusesTheCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	playlist := filepath.Join(dir, "index.m3u8")
-	if err := os.WriteFile(playlist, []byte("#EXTM3U\n#EXTINF:2,\nvideo_00000.ts\n"), 0644); err != nil {
+	if err := os.WriteFile(playlist, []byte("#EXTM3U\n#EXTINF:2,\nvideo_00000.ts\n#EXT-X-ENDLIST\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := EnsureThumbnail(t.Context(), dir); err != nil {
 		t.Fatal(err)
 	}
-	filename := filepath.Join(dir, "thumbnail.jpg")
+	filename := filepath.Join(dir, ThumbnailFilename)
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		t.Fatal(err)
 	}
 	image, err := jpeg.Decode(bytes.NewReader(data))
-	if err != nil || image.Bounds().Dx() != 640 || image.Bounds().Dy() != 360 {
-		t.Fatalf("thumbnail must be a 640x360 JPEG: %v", err)
+	if err != nil || image.Bounds().Dx() != 3200 || image.Bounds().Dy() != 360 {
+		t.Fatalf("thumbnail must be a 3200x360 JPEG strip: %v", err)
 	}
 	r, g, b, _ := image.At(320, 180).RGBA()
 	if b < 40000 || r > 5000 || g > 5000 {
@@ -62,13 +64,13 @@ func TestThumbnailMissingAndUnsafeSegmentsDoNotPublishAnImage(t *testing.T) {
 	for _, uri := range []string{"", "../video.ts", "https://example.invalid/video.ts", "video.m3u8", "missing.ts"} {
 		t.Run(uri, func(t *testing.T) {
 			dir := t.TempDir()
-			if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n#EXTINF:2,\n"+uri+"\n"), 0644); err != nil {
+			if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n#EXTINF:2,\n"+uri+"\n#EXT-X-ENDLIST\n"), 0644); err != nil {
 				t.Fatal(err)
 			}
 			if err := EnsureThumbnail(t.Context(), dir); err == nil {
 				t.Fatal("missing or unsafe segment unexpectedly succeeded")
 			}
-			if _, err := os.Stat(filepath.Join(dir, "thumbnail.jpg")); !errors.Is(err, os.ErrNotExist) {
+			if _, err := os.Stat(filepath.Join(dir, ThumbnailFilename)); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("thumbnail was published after failure: %v", err)
 			}
 		})
@@ -77,7 +79,7 @@ func TestThumbnailMissingAndUnsafeSegmentsDoNotPublishAnImage(t *testing.T) {
 
 func TestThumbnailCancellationDoesNotPublishAnImage(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n#EXTINF:2,\nvideo_00000.ts\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte("#EXTM3U\n#EXTINF:2,\nvideo_00000.ts\n#EXT-X-ENDLIST\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -85,7 +87,127 @@ func TestThumbnailCancellationDoesNotPublishAnImage(t *testing.T) {
 	if err := EnsureThumbnail(ctx, dir); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancellation error = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, "thumbnail.jpg")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(dir, ThumbnailFilename)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("thumbnail was published after cancellation: %v", err)
+	}
+}
+
+// Color changes within one segment verify sampling by time, including seeking
+// past the first few seconds instead of always decoding the opening.
+func thumbnailColorVideo(t *testing.T, colors []string) string {
+	t.Helper()
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+	dir := t.TempDir()
+	args := []string{"-v", "error", "-filter_complex_threads", "1"}
+	var inputs strings.Builder
+	for i, color := range colors {
+		args = append(args, "-f", "lavfi", "-i", "color=c="+color+":s=320x180:r=10:d=2")
+		fmt.Fprintf(&inputs, "[%d:v]", i)
+	}
+	args = append(args, "-filter_complex", fmt.Sprintf("%sconcat=n=%d:v=1:a=0[v]", inputs.String(), len(colors)), "-map", "[v]", "-c:v", "libx264", "-threads", "1", "-g", "10", "-f", "mpegts", filepath.Join(dir, "video.ts"))
+	if _, err := runCommand(t.Context(), nil, "ffmpeg", args...); err != nil {
+		t.Fatal(err)
+	}
+	playlist := fmt.Sprintf("#EXTM3U\n#EXTINF:%d,\nvideo.ts\n#EXT-X-ENDLIST\n", 2*len(colors))
+	if err := os.WriteFile(filepath.Join(dir, "index.m3u8"), []byte(playlist), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func TestThumbnailSamplesEachFifthAndReplacesLegacyCache(t *testing.T) {
+	for _, layout := range []string{"single segment", "uneven segments"} {
+		t.Run(layout, func(t *testing.T) {
+			dir := thumbnailColorVideo(t, []string{"red", "lime", "blue", "yellow", "magenta"})
+			if layout == "uneven segments" {
+				_, err := runCommand(t.Context(), nil, "ffmpeg", "-v", "error", "-y", "-i", filepath.Join(dir, "video.ts"), "-c:v", "copy", "-hls_time", "3", "-hls_playlist_type", "vod", "-hls_segment_filename", filepath.Join(dir, "chunk_%d.ts"), filepath.Join(dir, "index.m3u8"))
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := os.WriteFile(filepath.Join(dir, "thumbnail.jpg"), []byte("old black preview"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := EnsureThumbnail(t.Context(), dir); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(filepath.Join(dir, ThumbnailFilename))
+			if err != nil {
+				t.Fatal(err)
+			}
+			strip, err := jpeg.Decode(bytes.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := [][3]bool{{true, false, false}, {false, true, false}, {false, false, true}, {true, true, false}, {true, false, true}}
+			for part, channels := range want {
+				r, g, b, _ := strip.At(part*640+320, 180).RGBA()
+				got := [3]uint32{r, g, b}
+				for channel, bright := range channels {
+					if bright && got[channel] < 50000 || !bright && got[channel] > 5000 {
+						t.Fatalf("fifth %d: unexpected RGB %v", part+1, got)
+					}
+				}
+			}
+
+		})
+	}
+}
+
+func TestThumbnailSkipsBlackFifths(t *testing.T) {
+	dir := thumbnailColorVideo(t, []string{"black", "black", "blue", "black", "black"})
+	if err := EnsureThumbnail(t.Context(), dir); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ThumbnailFilename))
+	if err != nil {
+		t.Fatal(err)
+	}
+	strip, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for part := 0; part < 5; part++ {
+		r, g, b, _ := strip.At(part*640+320, 180).RGBA()
+		if b < 40000 || r > 5000 || g > 5000 {
+			t.Fatalf("fifth %d contains a black frame: %d,%d,%d", part+1, r, g, b)
+		}
+	}
+}
+
+func TestThumbnailAllBlackHasNoCachedImage(t *testing.T) {
+	dir := thumbnailColorVideo(t, []string{"black"})
+	if err := EnsureThumbnail(t.Context(), dir); err == nil {
+		t.Fatal("black video unexpectedly produced a preview")
+	}
+	if _, err := os.Stat(filepath.Join(dir, ThumbnailFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("black preview was cached: %v", err)
+	}
+}
+
+func TestThumbnailWaitsForCompleteVideo(t *testing.T) {
+	dir := thumbnailColorVideo(t, []string{"blue"})
+	playlist := filepath.Join(dir, "index.m3u8")
+	complete, err := os.ReadFile(playlist)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(playlist, bytes.ReplaceAll(complete, []byte("#EXT-X-ENDLIST\n"), nil), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureThumbnail(t.Context(), dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unfinished video error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, ThumbnailFilename)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unfinished video produced preview: %v", err)
+	}
+	if err := os.WriteFile(playlist, complete, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureThumbnail(t.Context(), dir); err != nil {
+		t.Fatalf("completed video has no preview: %v", err)
 	}
 }

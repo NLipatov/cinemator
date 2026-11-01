@@ -42,7 +42,7 @@ for (const source of ["HLS", "native"]) {
     const resume = row.locator('.download-resume');
     await expect(resume).toHaveText("Continue from 0:42");
     await row.locator('.download-open').click();
-    await expect(page.locator("#filelist")).toHaveValue("2");
+    await expect(page.locator("#videoMenuLabel")).toHaveText("Video: 1/2");
     await expect.poll(() => page.locator("#video").evaluate((video) => video.currentTime)).toBe(42);
     if (source === "HLS") {
       expect(await page.evaluate(() => window.testHls.options.startPosition)).toBe(42);
@@ -138,7 +138,7 @@ test("switching the video during playback starts the new file at zero", async ({
   await row.locator('.download-open').click();
   await expect.poll(() => page.locator("#video").evaluate(v => v.currentTime)).toBe(42);
   await page.locator("#videoMenuButton").click();
-  await page.locator("#filelist").selectOption("4");
+  await page.getByRole('menuitemradio', {name:'Episode 2.mkv', exact:true}).click();
   await expect.poll(() => page.locator("#video").evaluate(v => v.duration)).toBe(120);
   expect(await page.locator("#video").evaluate(v => v.currentTime)).toBe(0);
   await seek(page, 15);
