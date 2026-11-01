@@ -175,7 +175,6 @@ test('cards open directly, close saves progress, and the next tap resumes the sa
   await page.locator('#closePlayer').click();
   await expect(page.locator('#playerWorkspace')).toBeHidden();
   await expect(row.locator('.download-open')).toBeFocused();
-  await expect(row.locator('.download-resume')).toHaveText('Continue from 0:38');
   await expect(row.locator('.download-videos')).toHaveText('2 videos');
   await expect(row.locator('.download-watched')).toBeVisible();
   expect(await page.locator('#video').getAttribute('src')).toBeNull();
@@ -290,7 +289,7 @@ for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
     await page.route(/\/api\/downloads(?:\?|$)/, route => route.fulfill({json: downloads}));
     await page.evaluate(() => {
       for (const id of ['single-saved', 'series-saved']) {
-        localStorage.setItem(`cinemator-playback:${id}`, JSON.stringify({fileIndex: 4, time: 4455}));
+        localStorage.setItem(`cinemator-playback:${id}`, JSON.stringify({fileIndex: 4, time: 4455, duration: 7200}));
       }
       window.dispatchEvent(new Event('focus'));
     });
@@ -325,7 +324,7 @@ for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
       window.dispatchEvent(new Event('focus'));
     });
     await expect(row.locator('.download-videos')).toBeHidden();
-    await expect(row.locator('.download-resume')).toBeHidden();
+    await expect(row.locator('.download-watched')).toBeHidden();
     expect(await anchor()).toEqual(before);
   });
 }

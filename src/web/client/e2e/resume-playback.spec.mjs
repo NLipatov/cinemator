@@ -7,6 +7,10 @@ async function savedPosition(page) {
   return page.evaluate((key) => JSON.parse(localStorage.getItem(key)), storageKey);
 }
 
+async function watchedFraction(progress) {
+  return progress.evaluate(el => parseFloat(getComputedStyle(el, '::before').width) / el.getBoundingClientRect().width);
+}
+
 async function seedPosition(page, position) {
   await page.evaluate(
     ({ key, position }) => {
@@ -37,10 +41,12 @@ for (const source of ["HLS", "native"]) {
     page,
   }) => {
     const row = await openPlayer(page, { source });
-    await seedPosition(page, { fileIndex: 2, time: 42 });
+    await seedPosition(page, { fileIndex: 2, time: 42, duration: 120 });
     await page.reload();
-    const resume = row.locator('.download-resume');
-    await expect(resume).toHaveText("Continue from 0:42");
+    const progress = row.locator('.download-watched');
+    await expect(progress).toBeVisible();
+    await expect.poll(() => watchedFraction(progress)).toBeCloseTo(42 / 120, 2);
+    await expect(row.locator('.download-caption')).not.toContainText('Continue from');
     await row.locator('.download-open').click();
     await expect(page.locator("#videoMenuLabel")).toHaveText("Video: 1/2");
     await expect.poll(() => page.locator("#video").evaluate((video) => video.currentTime)).toBe(42);
@@ -50,16 +56,16 @@ for (const source of ["HLS", "native"]) {
 
     await seek(page, 55);
     await expect.poll(() => savedPosition(page)).toMatchObject({ fileIndex: 2, time: 55 });
-    await expect(resume).toHaveText("Continue from 0:55");
+    await expect.poll(() => watchedFraction(progress)).toBeCloseTo(55 / 120, 2);
     await page.reload();
-    await expect(resume).toHaveText("Continue from 0:55");
+    await expect.poll(() => watchedFraction(progress)).toBeCloseTo(55 / 120, 2);
     await row.locator('.download-open').click();
     await expect.poll(() => page.locator("#video").evaluate((video) => video.currentTime)).toBe(55);
 
     await seek(page, 119.9);
     await page.locator("#video").evaluate((video) => video.play());
     await expect.poll(() => savedPosition(page)).toBeNull();
-    await expect(resume).toBeHidden();
+    await expect(progress).toBeHidden();
     await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
     expect(await savedPosition(page)).toBeNull();
     await row.locator('[data-action="open"]').click();
@@ -151,7 +157,7 @@ test("invalid saved data and storage write failures do not prevent playback", as
   const row = await openPlayer(page);
   for (const position of [null, { fileIndex: 2, time: -1 }, { fileIndex: 99, time: 42 }]) {
     await seedPosition(page, position);
-    await expect(row.locator('.download-resume')).toBeHidden();
+    await expect(row.locator('.download-watched')).toBeHidden();
   }
   await page.evaluate((key) => {
     localStorage.setItem(key, "not json");
@@ -163,7 +169,7 @@ test("invalid saved data and storage write failures do not prevent playback", as
       setItem.call(this, key, value);
     };
   }, storageKey);
-  await expect(row.locator('.download-resume')).toBeHidden();
+  await expect(row.locator('.download-watched')).toBeHidden();
   await startVideo(page, row);
   await seek(page, 10);
   await page.locator("#video").evaluate((video) => video.play());
@@ -173,16 +179,20 @@ test("invalid saved data and storage write failures do not prevent playback", as
   expect(errors).toEqual([]);
 });
 
-test("resume labels localize and fit a narrow viewport with enlarged text", async ({
+test("playback progress fits a narrow viewport and resume remains accessible without a caption", async ({
   page,
 }, testInfo) => {
   await page.setViewportSize({ width: 320, height: 900 });
   const row = await openPlayer(page);
-  await seedPosition(page, { fileIndex: 2, time: 4455 });
-  const resume = row.locator('.download-resume');
-  await expect(resume).toHaveText("Continue from 1:14:15");
+  await seedPosition(page, { fileIndex: 2, time: 4455, duration: 7200 });
+  const progress = row.locator('.download-watched');
+  await expect(progress).toBeVisible();
+  await expect.poll(() => watchedFraction(progress)).toBeCloseTo(4455 / 7200, 2);
+  await expect(row.locator('.download-open')).toHaveAccessibleName(/Continue from 1:14:15/);
+  await expect(row.locator('.download-caption')).not.toContainText('Continue from');
   await page.locator("#languageSelect").selectOption("ru");
-  await expect(resume).toHaveText("Продолжить с 1:14:15");
+  await expect(row.locator('.download-open')).toHaveAccessibleName(/Продолжить с 1:14:15/);
+  await expect(row.locator('.download-caption')).not.toContainText('Продолжить');
   await page.screenshot({ path: testInfo.outputPath("resume-mobile.png"), fullPage: true });
   await row.locator('.download-open').focus();
   await page.evaluate(() => {
@@ -191,7 +201,7 @@ test("resume labels localize and fit a narrow viewport with enlarged text", asyn
   });
   await expect(row.locator('.download-open')).toBeFocused();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  const box = await resume.boundingBox();
+  const box = await progress.boundingBox();
   expect(box.x + box.width).toBeLessThanOrEqual(320);
   await page.screenshot({ path: testInfo.outputPath("resume-large-text.png"), fullPage: true });
 });
