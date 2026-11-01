@@ -14,10 +14,10 @@ import (
 	"strings"
 )
 
-// Version the cache and URL together to replace old first-segment previews.
-const ThumbnailFilename = "thumbnail-v2.jpg"
+// Version the cache and URL together when the preview format changes.
+const ThumbnailFilename = "thumbnail-v3.jpg"
 
-// EnsureThumbnail caches a horizontal strip of five frames, one from each fifth
+// EnsureThumbnail caches a horizontal strip of ten frames, one from each tenth
 // of a completed local video. It never reads or starts the torrent source.
 // The caller serializes cache misses; publishing the JPEG is atomic.
 func EnsureThumbnail(ctx context.Context, dir string) error {
@@ -47,17 +47,18 @@ func EnsureThumbnail(ctx context.Context, dir string) error {
 	if duration <= 0 {
 		return fmt.Errorf("thumbnail requires a video duration")
 	}
-	var frames [5]image.Image
+	var frames [10]image.Image
+	partDuration := duration / float64(len(frames))
 	var fallback image.Image
 	for part := range frames {
-		// Retry a black frame at another random point in the same fifth. Avoid
+		// Retry a black frame at another random point in the same tenth. Avoid
 		// exact boundaries and limit decoding independently of the video's length.
 		for attempt := 0; attempt < 3; attempt++ {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			target := (float64(part) + 0.1 + 0.8*rand.Float64()) * duration / 5
-			remaining := (float64(part+1)*duration/5 - target)
+			target := (float64(part) + 0.1 + 0.8*rand.Float64()) * partDuration
+			remaining := float64(part+1)*partDuration - target
 			for _, segment := range segments {
 				if target >= segment.Duration {
 					target -= segment.Duration
@@ -82,10 +83,10 @@ func EnsureThumbnail(ctx context.Context, dir string) error {
 	if fallback == nil {
 		return fmt.Errorf("thumbnail has no non-black frame")
 	}
-	strip := image.NewRGBA(image.Rect(0, 0, 5*640, 360))
+	strip := image.NewRGBA(image.Rect(0, 0, len(frames)*640, 360))
 	for part, frame := range frames {
 		if frame == nil {
-			// A fully black fifth uses another sampled scene rather than a black tile.
+			// A fully black tenth uses another sampled scene rather than a black tile.
 			frame = fallback
 		}
 		draw.Draw(strip, image.Rect(part*640, 0, (part+1)*640, 360), frame, image.Point{}, draw.Src)

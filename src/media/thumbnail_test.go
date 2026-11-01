@@ -37,8 +37,8 @@ func TestThumbnailExtractsARealFrameAndReusesTheCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	image, err := jpeg.Decode(bytes.NewReader(data))
-	if err != nil || image.Bounds().Dx() != 3200 || image.Bounds().Dy() != 360 {
-		t.Fatalf("thumbnail must be a 3200x360 JPEG strip: %v", err)
+	if err != nil || image.Bounds().Dx() != 6400 || image.Bounds().Dy() != 360 {
+		t.Fatalf("thumbnail must be a 6400x360 JPEG strip: %v", err)
 	}
 	r, g, b, _ := image.At(320, 180).RGBA()
 	if b < 40000 || r > 5000 || g > 5000 {
@@ -117,10 +117,10 @@ func thumbnailColorVideo(t *testing.T, colors []string) string {
 	return dir
 }
 
-func TestThumbnailSamplesEachFifthAndReplacesLegacyCache(t *testing.T) {
+func TestThumbnailSamplesEachTenthAndReplacesLegacyCache(t *testing.T) {
 	for _, layout := range []string{"single segment", "uneven segments"} {
 		t.Run(layout, func(t *testing.T) {
-			dir := thumbnailColorVideo(t, []string{"red", "lime", "blue", "yellow", "magenta"})
+			dir := thumbnailColorVideo(t, []string{"red", "lime", "blue", "yellow", "magenta", "cyan", "white", "orange", "purple", "teal"})
 			if layout == "uneven segments" {
 				_, err := runCommand(t.Context(), nil, "ffmpeg", "-v", "error", "-y", "-i", filepath.Join(dir, "video.ts"), "-c:v", "copy", "-hls_time", "3", "-hls_playlist_type", "vod", "-hls_segment_filename", filepath.Join(dir, "chunk_%d.ts"), filepath.Join(dir, "index.m3u8"))
 				if err != nil {
@@ -128,8 +128,10 @@ func TestThumbnailSamplesEachFifthAndReplacesLegacyCache(t *testing.T) {
 				}
 			}
 
-			if err := os.WriteFile(filepath.Join(dir, "thumbnail.jpg"), []byte("old black preview"), 0644); err != nil {
-				t.Fatal(err)
+			for _, name := range []string{"thumbnail.jpg", "thumbnail-v2.jpg"} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("old preview"), 0644); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := EnsureThumbnail(t.Context(), dir); err != nil {
 				t.Fatal(err)
@@ -142,13 +144,13 @@ func TestThumbnailSamplesEachFifthAndReplacesLegacyCache(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := [][3]bool{{true, false, false}, {false, true, false}, {false, false, true}, {true, true, false}, {true, false, true}}
+			want := [][3]int{{255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 0}, {255, 0, 255}, {0, 255, 255}, {255, 255, 255}, {255, 165, 0}, {128, 0, 128}, {0, 128, 128}}
 			for part, channels := range want {
 				r, g, b, _ := strip.At(part*640+320, 180).RGBA()
-				got := [3]uint32{r, g, b}
-				for channel, bright := range channels {
-					if bright && got[channel] < 50000 || !bright && got[channel] > 5000 {
-						t.Fatalf("fifth %d: unexpected RGB %v", part+1, got)
+				got := [3]int{int(r >> 8), int(g >> 8), int(b >> 8)}
+				for channel, value := range channels {
+					if delta := got[channel] - value; delta < -12 || delta > 12 {
+						t.Fatalf("tenth %d: RGB %v, want %v", part+1, got, channels)
 					}
 				}
 			}
@@ -157,7 +159,7 @@ func TestThumbnailSamplesEachFifthAndReplacesLegacyCache(t *testing.T) {
 	}
 }
 
-func TestThumbnailSkipsBlackFifths(t *testing.T) {
+func TestThumbnailSkipsBlackTenths(t *testing.T) {
 	dir := thumbnailColorVideo(t, []string{"black", "black", "blue", "black", "black"})
 	if err := EnsureThumbnail(t.Context(), dir); err != nil {
 		t.Fatal(err)
@@ -170,10 +172,10 @@ func TestThumbnailSkipsBlackFifths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for part := 0; part < 5; part++ {
+	for part := 0; part < 10; part++ {
 		r, g, b, _ := strip.At(part*640+320, 180).RGBA()
 		if b < 40000 || r > 5000 || g > 5000 {
-			t.Fatalf("fifth %d contains a black frame: %d,%d,%d", part+1, r, g, b)
+			t.Fatalf("tenth %d contains a black frame: %d,%d,%d", part+1, r, g, b)
 		}
 	}
 }
