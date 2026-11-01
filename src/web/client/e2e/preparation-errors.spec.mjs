@@ -31,12 +31,12 @@ for (const input of ["touch", "keyboard"]) {
   test.describe(`${input} preparation diagnostics`, () => {
     test.use({ hasTouch: input === "touch", viewport: { width: 320, height: 900 } });
 
-    async function openDetails(summary, page, precedingControl) {
+    async function openDetails(summary, page, precedingControl, backwards = false) {
       if (input === "touch") {
         await summary.tap();
       } else {
         await precedingControl.focus();
-        await page.keyboard.press("Tab");
+        await page.keyboard.press(backwards ? "Shift+Tab" : "Tab");
         await expect(summary).toBeFocused();
         await page.keyboard.press("Enter");
       }
@@ -51,10 +51,10 @@ for (const input of ["touch", "keyboard"]) {
       const diagnostic = row.locator("pre");
       await expect(summary).toBeVisible();
       await expect(diagnostic).toBeHidden();
-      await openDetails(summary, page, row.locator('[data-action="delete"]'));
+      await openDetails(summary, page, row.locator('.download-more'));
       await expect(diagnostic).toBeVisible();
       expect(await diagnostic.textContent()).toBe(download.preparationError);
-      await expect(row.locator("img")).toHaveCount(0);
+      await expect(row.locator(".error-details img")).toHaveCount(0);
       await expect(page.locator("#step-files")).toBeHidden();
       expect(await summary.evaluate((element) => !!element.closest("button"))).toBe(false);
 
@@ -78,10 +78,7 @@ for (const input of ["touch", "keyboard"]) {
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(
           true,
         );
-        const positions = await page
-          .locator(".download-action.delete")
-          .evaluateAll((buttons) => buttons.map((button) => button.getBoundingClientRect().left));
-        expect(Math.abs(positions[0] - positions[1])).toBeLessThanOrEqual(1);
+
       }
 
       download.preparationError = "";
@@ -93,15 +90,15 @@ for (const input of ["touch", "keyboard"]) {
       page,
     }) => {
       const download = await openFailedDownload(page);
-      await page.locator('.download-row[data-id="failed"] .download-open').click();
-      await page.locator("#selectTracks").click();
-      await expect(page.locator("#step-tracks")).toBeVisible();
+      await page.route("**/api/hls/prepare?*", route => route.request().method() === "GET" ? new Promise(() => {}) : route.fallback());
+      await page.locator('.download-row[data-id="failed"] [data-action="open"]').click();
+      await expect(page.locator("#player-block")).toBeVisible();
       const warning = page.locator("#warnMsg");
       const summary = warning.locator("summary");
       const diagnostic = warning.locator("pre");
       await expect(page.locator("#preparationDetails")).toHaveText("Could not prepare video");
       await expect(summary).toBeVisible();
-      await openDetails(summary, page, page.locator("#play"));
+      await openDetails(summary, page, page.locator("#videoMenuButton"), true);
       await expect(diagnostic).toBeVisible();
       expect(await diagnostic.textContent()).toBe(download.preparationError);
       await expect(warning.locator("img")).toHaveCount(0);
@@ -122,7 +119,7 @@ for (const input of ["touch", "keyboard"]) {
 
       download.status = "preparing";
       download.preparationError = "";
-      await page.locator("#selectTracks").click();
+      await page.evaluate(() => window.dispatchEvent(new Event("focus")));
       await expect(warning.locator("details")).toHaveCount(0);
       await expect(page.locator("#preparationDetails")).toBeEmpty();
     });
@@ -153,10 +150,9 @@ for (const source of ["HLS", "native media"]) {
       };
     });
     await openFailedDownload(page);
-    await page.locator('.download-row[data-id="failed"] .download-open').click();
-    await page.locator("#selectTracks").click();
-    await page.locator("#play").click();
+    await page.locator('.download-row[data-id="failed"] [data-action="open"]').click();
     await expect(page.locator("#player-block")).toBeVisible();
+    await expect.poll(() => page.evaluate(() => !!window.testHls?.handlers.get("error"))).toBe(true);
     const text = source === "HLS" ? "manifestLoadError" : "Native media error";
     await page.evaluate((source) => {
       if (source === "HLS")

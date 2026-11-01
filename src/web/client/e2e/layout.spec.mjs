@@ -9,10 +9,11 @@ async function openPage(page, path, language) {
     // Expose track controls as they would appear after loading media metadata.
     await page.evaluate(() => {
       document.body.classList.add("has-player");
+      document.querySelector("#playerWorkspace").hidden = false;
       document
         .querySelectorAll(".step, #subtitleDelayRow")
         .forEach((element) => (element.style.display = "grid"));
-      document.querySelector('[data-action="toggle-extend"]').click();
+      document.querySelector('[data-action="toggle-menu"]').click();
     });
   }
 }
@@ -42,7 +43,7 @@ async function layoutProblems(page) {
     if (document.documentElement.scrollWidth > innerWidth)
       problems.push("page overflows horizontally");
     for (const element of document.querySelectorAll(
-      "button:not(.download-open), label, .field-label, .panel-title, .delay-value, .download-title, .download-meta-text, .download-size",
+      "button:not(.download-open), label, .field-label, .panel-title, .delay-value, .download-title, .download-expiry, .download-meta-text, .download-size",
     )) {
       if (!element.getClientRects().length || !element.textContent.trim()) continue;
       const style = getComputedStyle(element),
@@ -69,17 +70,12 @@ async function layoutProblems(page) {
       document.querySelector(".topbar").getBoundingClientRect().bottom
     )
       problems.push("header overlaps page content");
-    const deletePositions = [...document.querySelectorAll(".download-action.delete")].map(
-      (element) => element.getBoundingClientRect().left,
-    );
-    if (deletePositions.some((left) => Math.abs(left - deletePositions[0]) > 1))
-      problems.push("delete buttons are misaligned");
     const source = document.querySelector(".source-panel")?.getBoundingClientRect();
     const downloads = document.querySelector(".downloads-panel")?.getBoundingClientRect();
     if (source && downloads && (Math.abs(source.left - downloads.left) > 1 ||
       Math.abs(source.right - downloads.right) > 1))
       problems.push("downloads do not share the source panel width");
-    for (const element of document.querySelectorAll(".download-size, .download-meta-text")) {
+    for (const element of document.querySelectorAll(".download-size, .download-meta-text, .download-expiry")) {
       // Numeric values and their units must stay on the same visual line.
       for (const match of element.textContent.matchAll(/\d[\d.,\u00a0\u202f]*[\u00a0 ]+(?:[\p{Script=Latin}\p{Script=Cyrillic}]+|年|个月|個月|周|週|天|小时|小時|分钟|分鐘)/gu)) {
         const range = document.createRange();

@@ -22,17 +22,22 @@ test("adding a download preserves drafts and keeps the selected video independen
   await expect(magnet).toHaveValue(source);
 
   let requestedSource;
+  const files = [{ index: 0, name: "Video.mkv", size: 1024 }];
+  await page.route("**/api/downloads", route => route.fulfill({json: requestedSource ? [{
+    id: 'added', title: 'Video.mkv', magnet: source, files, status: 'ready', size: 1024,
+  }] : []}));
   await page.route("**/api/torrent/files?*", route => {
     requestedSource = new URL(route.request().url()).searchParams.get("magnet");
     return route.fulfill({ json: [{ index: 0, name: "Video.mkv", size: 1024 }] });
   });
   await magnet.press("Enter");
-  await expect(page.locator("#step-files")).toBeVisible();
+  await expect(page.locator('.download-row[data-id="added"]')).toBeVisible();
+  await expect(page.locator("#playerWorkspace")).toBeHidden();
   expect(requestedSource).toBe(source);
   await expect(panel).toBeHidden();
   await expect(add).toHaveAttribute("aria-expanded", "false");
   await expect(magnet).toHaveValue("");
-  await expect(page.locator("#filelist")).toBeFocused();
+  await expect(page.locator('[data-action="open"]')).toBeFocused();
 
   await add.click();
   await magnet.fill("magnet:new-draft");
@@ -45,9 +50,12 @@ test("adding a download preserves drafts and keeps the selected video independen
   await page.route("**/api/media/info?*", route => route.fulfill({
     json: { audioTracks: [{ index: 0 }, { index: 1 }], subtitles: [] },
   }));
-  await page.locator("#selectTracks").click();
-  await expect(page.locator("#step-tracks")).toBeVisible();
+  await page.locator('[data-action="open"]').click();
+  await page.locator("#audioMenuButton").click();
+  await expect(page.locator("#audioMenu")).toBeVisible();
+  await expect(page.locator("#audioSelect")).toBeEnabled();
   expect(preparedSource).toBe(source);
+  await page.keyboard.press("Escape");
   await add.click();
   await expect(magnet).toHaveValue("magnet:new-draft");
   await page.locator("#languageSelect").selectOption("en");
@@ -68,6 +76,10 @@ test("an empty library still offers adding a download", async ({ page }) => {
 
 test("a completed lookup does not erase a newer draft", async ({ page }) => {
   await openPage(page, "/", "en");
+  await page.route("**/api/downloads", route => route.fulfill({json: [{
+    id: 'added', title: 'Video.mkv', magnet: 'magnet:first', status: 'ready', size: 1024,
+    files: [{index: 0, name: 'Video.mkv', size: 1024}],
+  }]}));
   let release;
   const response = new Promise(resolve => { release = resolve; });
   await page.route("**/api/torrent/files?*", async route => {
@@ -83,19 +95,21 @@ test("a completed lookup does not erase a newer draft", async ({ page }) => {
   } finally {
     release();
   }
-  await expect(page.locator("#step-files")).toBeVisible();
+  await expect(page.locator('.download-row[data-id="added"]')).toBeVisible();
+  await expect(page.locator("#playerWorkspace")).toBeHidden();
   await expect(page.locator("#sourcePanel")).toBeVisible();
   await expect(page.locator("#magnet")).toHaveValue("magnet:next-draft");
+  await expect(page.locator('.download-row[data-id="added"] .download-title')).toHaveText("Video");
 });
 
 const expiryDays = [26000, 60, 7, 10, 21, 5 / 24, 10 / (24 * 60), -730, null];
 for (const [language, labels] of [
-  ["ru", ["До автоудаления: 71 год", "До автоудаления: 2 месяца", "До автоудаления: 1 неделя",
-    "До автоудаления: 1 неделя и 3 дня", "До автоудаления: 3 недели",
-    "До автоудаления: 5 ч", "До автоудаления: 10 мин", "Срок хранения истёк 2 года назад", "Без автоудаления"]],
-  ["en", ["Auto-delete in 71 years", "Auto-delete in 2 months", "Auto-delete in 1 week",
-    "Auto-delete in 1 week and 3 days", "Auto-delete in 3 weeks",
-    "Auto-delete in 5h", "Auto-delete in 10m", "Storage period ended 2 years ago", "No automatic deletion"]],
+  ["ru", ["Удалится через 71 год", "Удалится через 2 месяца", "Удалится через 1 неделю",
+    "Удалится через 1 неделю и 3 дня", "Удалится через 3 недели",
+    "Удалится через 5 ч", "Удалится через 10 мин", "Срок хранения истёк 2 года назад", "Без автоудаления"]],
+  ["en", ["Deletes in 71 years", "Deletes in 2 months", "Deletes in 1 week",
+    "Deletes in 1 week and 3 days", "Deletes in 3 weeks",
+    "Deletes in 5h", "Deletes in 10m", "Storage period ended 2 years ago", "No automatic deletion"]],
   ["zh-Hans", ["71 年后自动删除", "2 个月后自动删除", "1 周后自动删除",
     "1 周 3 天后自动删除", "3 周后自动删除",
     "5 小时后自动删除", "10 分钟后自动删除", "保留期限已于2 年前到期", "不会自动删除"]],
@@ -115,6 +129,9 @@ for (const [language, labels] of [
     }));
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
     await expect(page.locator(".download-meta-text")).toHaveText(labels);
+    await expect(page.locator(".download-expiry")).toHaveText(labels);
+    await expect(page.locator(".download-expiry").first()).toBeVisible();
+    await expect(page.locator(".download-options:visible")).toHaveCount(0);
   });
 }
 
@@ -130,9 +147,9 @@ test("Russian years and months use the correct plural forms", async ({ page }) =
   }));
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(page.locator(".download-meta-text")).toHaveText([
-    "До автоудаления: 1 год", "До автоудаления: 2 года", "До автоудаления: 5 лет",
-    "До автоудаления: 21 год", "До автоудаления: 1 месяц", "До автоудаления: 2 месяца",
-    "До автоудаления: 5 месяцев",
+    "Удалится через 1 год", "Удалится через 2 года", "Удалится через 5 лет",
+    "Удалится через 21 год", "Удалится через 1 месяц", "Удалится через 2 месяца",
+    "Удалится через 5 месяцев",
   ]);
 });
 
@@ -149,12 +166,12 @@ test("weeks retain remaining days and handle rounding and expired durations", as
   }));
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(page.locator(".download-meta-text")).toHaveText([
-    "До автоудаления: 1 день", "До автоудаления: 2 дня", "До автоудаления: 5 дней",
-    "До автоудаления: 6 дней", "До автоудаления: 1 неделя", "До автоудаления: 1 неделя",
-    "До автоудаления: 1 неделя и 1 день", "До автоудаления: 1 неделя и 2 дня",
-    "До автоудаления: 1 неделя и 5 дней", "До автоудаления: 1 неделя и 6 дней",
-    "До автоудаления: 2 недели", "До автоудаления: 2 недели", "До автоудаления: 3 недели",
-    "До автоудаления: 3 недели и 1 день", "До автоудаления: 4 недели и 1 день",
-    "До автоудаления: 1 месяц", "Срок хранения истёк 1 неделю назад", "Срок хранения истёк 1 неделю и 3 дня назад",
+    "Удалится через 1 день", "Удалится через 2 дня", "Удалится через 5 дней",
+    "Удалится через 6 дней", "Удалится через 1 неделю", "Удалится через 1 неделю",
+    "Удалится через 1 неделю и 1 день", "Удалится через 1 неделю и 2 дня",
+    "Удалится через 1 неделю и 5 дней", "Удалится через 1 неделю и 6 дней",
+    "Удалится через 2 недели", "Удалится через 2 недели", "Удалится через 3 недели",
+    "Удалится через 3 недели и 1 день", "Удалится через 4 недели и 1 день",
+    "Удалится через 1 месяц", "Срок хранения истёк 1 неделю назад", "Срок хранения истёк 1 неделю и 3 дня назад",
   ]);
 });
