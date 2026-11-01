@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cinemator/config"
@@ -21,10 +22,11 @@ import (
 )
 
 type Server struct {
-	mgr     torrentManager
-	cfg     config.Config
-	auth    *authenticator
-	version string
+	mgr         torrentManager
+	cfg         config.Config
+	auth        *authenticator
+	version     string
+	thumbnailMu sync.Mutex
 }
 
 func NewServer(cfg config.Config, version string) (*Server, error) {
@@ -392,6 +394,10 @@ func (s *Server) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	if path.Base(clean) == "thumbnail.jpg" {
+		s.handleThumbnail(w, r, fullPath)
+		return
+	}
 
 	// Track activity for cleanup/keepalive
 	if dir := strings.SplitN(clean, "/", 2)[0]; dir != "" {
@@ -423,6 +429,33 @@ func (s *Server) handleGetHlsChunk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.ServeFile(w, r, fullPath)
+}
+
+func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request, filename string) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if _, err := os.Stat(filename); err != nil {
+		// Serialize extraction, including concurrent requests for the same frame.
+		// Previews do not touch stream activity or extend download retention.
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		s.thumbnailMu.Lock()
+		err = ctx.Err()
+		if err == nil {
+			err = media.EnsureThumbnail(ctx, filepath.Dir(filename))
+		}
+		s.thumbnailMu.Unlock()
+		if err != nil {
+			w.Header().Set("Cache-Control", "no-store")
+			http.Error(w, "preview not available", http.StatusNotFound)
+			return
+		}
+	}
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	http.ServeFile(w, r, filename)
 }
 
 func waitForPath(ctx context.Context, path string, timeout time.Duration) error {

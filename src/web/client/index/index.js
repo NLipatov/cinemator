@@ -85,13 +85,21 @@ import { t, setText, number, errorKey } from './i18n.js';
     let downloadPollingTimer = null;
     const downloadSamples = new Map();
     let progressUnavailable = false;
-    let openExtendDownloadID = null;
+    let openDownloadMenuID = null;
+    const downloadMenuResizeObserver = new ResizeObserver(() => {
+      const menu = document.querySelector('.download-menu.open');
+      if (menu) positionDownloadMenu(menu);
+    });
     let activeDownloadID = null;
     let activeMagnet = '';
     let pendingResume = null;
+    let tracksReady = false;
+    let wantsPlayback = false;
+    let retryTime = 0;
     let savePlaybackPosition = null;
     let requestSeq = 0;
     let flowRequestController = null;
+    let filesRequestController = null;
     const downloadFallbackInitialMs = 5000;
     const downloadFallbackPollingMs = 30000;
     const isStale = id => id !== requestSeq;
@@ -129,10 +137,12 @@ import { t, setText, number, errorKey } from './i18n.js';
       oldVideo.removeAttribute('src');
       oldVideo.load();
       const newVideo = oldVideo.cloneNode(false);
+      newVideo.style.opacity = '';
       oldVideo.parentNode.replaceChild(newVideo, oldVideo);
       newVideo.id = 'video';
     }
     const optionLabels = new WeakMap();
+    let videoFiles = [];
     function setOptions(select, options) {
       select.replaceChildren(...options.map(({ value, label }) => {
         const option = new Option(label(), String(value));
@@ -140,7 +150,26 @@ import { t, setText, number, errorKey } from './i18n.js';
         return option;
       }));
     }
+    function fileStem(name) {
+      return name.split(/[\\/]/).pop().replace(/\.(mkv|mp4|m4v|mov|avi|webm|ts|m2ts|mpg|mpeg|wmv|flv|ogv)$/i, '');
+    }
+
+    function fileDisplayName(file, files, compact = false) {
+      const stem = fileStem(file.name);
+      // Only infer numbered episodes when the whole set shares the same prefix.
+      const numbered = name => fileStem(name).match(/^(.*?)\s+[—–-]\s+(\d{1,3})$/);
+      const match = numbered(file.name);
+      if (match && files.length > 1 && files.every(other => numbered(other.name)?.[1] === match[1]) &&
+          new Set(files.map(other => Number(numbered(other.name)[2]))).size === files.length) {
+        const episode = t('player.episode', { number: Number(match[2]) });
+        return compact ? episode : `${match[1]} · ${episode}`;
+      }
+      // Keep ambiguous names distinct (e.g. two encodings with the same basename).
+      return files.filter(other => fileStem(other.name) === stem).length > 1 ? file.name : stem;
+    }
+
     function setFileList(files) {
+      videoFiles = files;
       setOptions($('filelist'), files.map(f => ({
         value: f.index,
         label: () => `${f.name} (${formatBytes(f.size)})`,
@@ -298,7 +327,13 @@ import { t, setText, number, errorKey } from './i18n.js';
         try {
           const key = `cinemator-playback:${download.id}`;
           if (video.ended) localStorage.removeItem(key);
-          else localStorage.setItem(key, JSON.stringify({ fileIndex, time }));
+          else {
+            const position = { fileIndex, time };
+            // An unfinished EVENT playlist reports only its prepared duration.
+            if (download.status === 'ready' && download.selectedFileIndex === fileIndex &&
+                Number.isFinite(video.duration) && video.duration > 0) position.duration = video.duration;
+            localStorage.setItem(key, JSON.stringify(position));
+          }
         } catch {
           return;
         }
@@ -367,51 +402,75 @@ import { t, setText, number, errorKey } from './i18n.js';
       $('preparationVideo').textContent = matches && !progressUnavailable ? preparedVideo(progress) : '';
     }
 
-    function closeExtendMenus(except = null) {
-      let preservedID = null;
-      document.querySelectorAll('.download-menu.open').forEach(menu => {
-        const toggle = menu.querySelector('button[data-action="toggle-extend"]');
-        if (menu === except) {
-          preservedID = toggle ? toggle.dataset.id : openExtendDownloadID;
-          return;
-        }
-        menu.classList.remove('open');
-        const popup = menu.querySelector('.download-extend-menu');
-        if (popup) popup.hidden = true;
-        if (toggle) toggle.setAttribute('aria-expanded', 'false');
-      });
-      openExtendDownloadID = preservedID;
-    }
-
-    function toggleExtendMenu(toggle) {
-      const menu = toggle.closest('.download-menu');
+    function closeDownloadMenus(restoreFocus = false) {
+      const menu = document.querySelector('.download-menu.open');
       if (!menu) return;
-      const popup = menu.querySelector('.download-extend-menu');
-      if (!popup) return;
-      const willOpen = popup.hidden;
-      closeExtendMenus(menu);
-      popup.hidden = !willOpen;
-      menu.classList.toggle('open', willOpen);
-      toggle.setAttribute('aria-expanded', String(willOpen));
-      openExtendDownloadID = willOpen ? toggle.dataset.id : null;
+      downloadMenuResizeObserver.disconnect();
+      menu.classList.remove('open');
+      menu.querySelector('.download-options').hidden = true;
+      const toggle = menu.querySelector('.download-more');
+      toggle.setAttribute('aria-expanded', 'false');
+      openDownloadMenuID = null;
+      if (restoreFocus) toggle.focus({ preventScroll: true });
     }
 
-    function openExtendMenu(menu) {
-      const popup = menu.querySelector('.download-extend-menu');
-      const toggle = menu.querySelector('button[data-action="toggle-extend"]');
-      if (!popup || !toggle) return;
-      popup.hidden = false;
+    function positionDownloadMenu(menu) {
+      const popup = menu.querySelector('.download-options');
+      const anchor = menu.querySelector('.download-more').getBoundingClientRect();
+      const box = popup.getBoundingClientRect();
+      popup.style.setProperty('--menu-left', `${Math.max(8, anchor.right - box.width)}px`);
+      popup.style.setProperty('--menu-top', `${anchor.bottom + box.height + 8 <= innerHeight ? anchor.bottom + 4 : anchor.top - box.height - 4}px`);
+      popup.style.setProperty('--menu-height', `${box.height}px`);
+    }
+
+    function openDownloadMenu(menu) {
+      menu.querySelector('.download-options').hidden = false;
       menu.classList.add('open');
+      const toggle = menu.querySelector('.download-more');
       toggle.setAttribute('aria-expanded', 'true');
-      openExtendDownloadID = toggle.dataset.id;
+      openDownloadMenuID = toggle.dataset.id;
+      positionDownloadMenu(menu);
+      downloadMenuResizeObserver.observe(menu.querySelector('.download-options'));
+    }
+
+    function toggleDownloadMenu(toggle) {
+      const menu = toggle.closest('.download-menu');
+      const willOpen = !menu.classList.contains('open');
+      closeDownloadMenus();
+      if (willOpen) {
+        openDownloadMenu(menu);
+        [...menu.querySelectorAll('[role="menuitem"]')].find(item => item.getClientRects().length)?.focus({ preventScroll: true });
+      }
+    }
+
+    function renderThumbnail(image, download, file) {
+      const url = file && download.magnet ? `/api/hls/${encodeURIComponent(download.id)}_${file.index}_a-1_s-1/thumbnail.jpg` : '';
+      if (!url) {
+        image.removeAttribute('src');
+        delete image.dataset.url;
+        image.classList.remove('loaded');
+        return;
+      }
+      const changed = image.dataset.url !== url;
+      if (!changed && (!image.dataset.retryAt || Date.now() < Number(image.dataset.retryAt))) return;
+      image.dataset.url = url;
+      delete image.dataset.retryAt;
+      image.classList.remove('loaded');
+      image.onload = () => image.classList.add('loaded');
+      image.onerror = () => {
+        image.classList.remove('loaded');
+        image.dataset.retryAt = String(Date.now() + 30000);
+      };
+      image.src = url + (changed ? '' : `?retry=${Math.floor(Date.now() / 30000)}`);
     }
 
     function renderDownloads(downloads) {
       const list = $('downloadsList');
       $('downloadsCount').textContent = number(downloads.length);
       const focused = list.contains(document.activeElement) ? document.activeElement : null;
-      const restoreExtendID = openExtendDownloadID;
-      openExtendDownloadID = null;
+      const restoreMenuID = openDownloadMenuID;
+      openDownloadMenuID = null;
+      downloadMenuResizeObserver.disconnect();
       if (!downloads.length) {
         const empty = document.createElement('div');
         empty.className = 'downloads-empty';
@@ -437,11 +496,40 @@ import { t, setText, number, errorKey } from './i18n.js';
         } else {
           row.querySelector('.download-open').removeAttribute('aria-current');
         }
-        row.querySelector('.download-title').textContent = download.title || t('downloads.torrent', { id: download.id.slice(0, 8) });
-        const resume = row.querySelector('.download-resume');
+        const files = download.files || [];
         const position = readPlaybackPosition(download);
-        resume.hidden = !position;
-        if (position) setText(resume, 'downloads.resume', { time: formatPlaybackTime(position.time) });
+        const selectedIndex = download.id === activeDownloadID && !$('playerWorkspace').hidden ?
+          Number($('filelist').value) : position?.fileIndex ?? download.selectedFileIndex;
+        const file = files.find(file => file.index === selectedIndex) || files[0];
+        row.dataset.fileIndex = file?.index ?? '';
+        const title = download.title ? (files.length === 1 ? fileStem(download.title) : download.title) : t('downloads.torrent', { id: download.id.slice(0, 8) });
+        row.querySelector('.download-title').textContent = title;
+        const expiry = row.querySelector('.download-expiry');
+        const expiresAt = new Date(download.expiresAt);
+        expiry.hidden = download.status !== 'ready' && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getUTCFullYear() <= 1);
+        expiry.textContent = formatExpiry(download.expiresAt);
+        expiry.id = `download-expiry-${download.id}`;
+        if (expiry.hidden) row.querySelector('.download-open').removeAttribute('aria-describedby');
+        else row.querySelector('.download-open').setAttribute('aria-describedby', expiry.id);
+        const fileLabel = row.querySelector('.download-file-label');
+        fileLabel.hidden = files.length <= 1;
+        fileLabel.textContent = file && files.length > 1 ? fileDisplayName(file, files, true) : '';
+        const saved = position?.fileIndex === file?.index ? position : null;
+        const resume = row.querySelector('.download-resume');
+        resume.hidden = !saved;
+        if (saved) setText(resume, 'downloads.resume', { time: formatPlaybackTime(saved.time) });
+        row.querySelector('.download-open').setAttribute('aria-label', [
+          saved ? t('downloads.resume', { time: formatPlaybackTime(saved.time) }) : t('player.play'), title, fileLabel.textContent,
+        ].filter(Boolean).join(' · '));
+        row.querySelector('[data-action="restart"]').hidden = !download.magnet || !file;
+        const duration = saved?.duration;
+        const durationLabel = row.querySelector('.download-duration');
+        durationLabel.hidden = !Number.isFinite(duration) || duration <= 0;
+        if (!durationLabel.hidden) durationLabel.textContent = formatPlaybackTime(duration);
+        const watched = row.querySelector('.download-watched');
+        watched.hidden = durationLabel.hidden;
+        if (!watched.hidden) watched.style.setProperty('--watched-percent', `${Math.min(100, 100 * saved.time / duration)}%`);
+        renderThumbnail(row.querySelector('.download-preview'), download, file);
         row.querySelector('.download-size').textContent = formatDownloadSize(download);
         row.querySelector('.download-meta-text').textContent = formatDownloadState(download);
         row.querySelector('.download-meta-text').classList.remove('has-progress');
@@ -463,18 +551,28 @@ import { t, setText, number, errorKey } from './i18n.js';
           if (!bar.hidden) bar.value = Math.min(1, download.progress.downloadedBytes / download.progress.totalBytes);
         }
 
-        const extendMenu = row.querySelector('.download-menu');
-        extendMenu.hidden = download.status !== 'ready';
-        if (download.status === 'ready' && download.id === restoreExtendID) {
-          openExtendMenu(extendMenu);
+        const status = row.querySelector('.download-card-status');
+        status.hidden = download.status === 'ready' || download.status === 'awaiting_selection' && files.length > 0;
+        status.textContent = progressAtPlayer ? t('downloads.preparing') : download.progress ?
+          `${preparationStage(download.progress)} · ${preparedVideo(download.progress)}` : formatDownloadState(download);
+        const menu = row.querySelector('.download-menu');
+        menu.querySelector('.download-extend-group').hidden = download.status !== 'ready';
+        menu.querySelectorAll('[role="menuitem"]').forEach(item => { item.tabIndex = -1; });
+        const toggle = menu.querySelector('.download-more');
+        toggle.setAttribute('aria-label', `${t('downloads.actions')} · ${title}`);
+        toggle.removeAttribute('data-i18n-aria-label');
+        if (download.id === restoreMenuID) {
+          openDownloadMenu(menu);
         } else {
-          extendMenu.classList.remove('open');
-          extendMenu.querySelector('.download-extend-menu').hidden = true;
-          extendMenu.querySelector('[data-action="toggle-extend"]').setAttribute('aria-expanded', 'false');
+          menu.classList.remove('open');
+          menu.querySelector('.download-options').hidden = true;
+          toggle.setAttribute('aria-expanded', 'false');
         }
         if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
       });
       for (const row of rows.values()) row.remove();
+      const openMenu = list.querySelector('.download-menu.open');
+      if (openMenu) positionDownloadMenu(openMenu);
       if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
     }
 
@@ -541,7 +639,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       });
     }
 
-    function openDownload(download, position = null) {
+    function openDownload(download, position = null, fileIndex = download?.selectedFileIndex) {
       if (!download || !download.magnet || !download.files || download.files.length === 0) {
         showMsg('downloadsMsg', 'downloads.incomplete', true);
         return;
@@ -549,24 +647,52 @@ import { t, setText, number, errorKey } from './i18n.js';
       cancelFlowRequest();
       destroyVideoAndHls();
       pendingResume = position ? { ...position, magnet: download.magnet } : null;
+      if (!position) {
+        try { localStorage.removeItem(`cinemator-playback:${download.id}`); } catch {}
+      }
       setActiveDownload(download.id);
       activeMagnet = download.magnet;
       setSourceOpen(false);
       setFileList(download.files);
-      const fileIndex = position?.fileIndex ?? download.selectedFileIndex;
+      fileIndex = position?.fileIndex ?? fileIndex;
       if (Number.isInteger(fileIndex)) {
         $('filelist').value = String(fileIndex);
       }
       $('step-files').style.display = '';
-      $('step-tracks').style.display = 'none';
+      resetTracks();
       $('player-block').style.display = 'none';
       showMsg('magnetMsg', '');
       showMsg('fileMsg', '');
       showMsg('trackMsg', '');
       showMsg('downloadsMsg', '');
       removeWarning();
-      if (position) $('selectTracks').click();
+      updateSelectedFile();
+      launchPlayback();
+      window.scrollTo({ top: 0 });
+      $('closePlayer').focus({ preventScroll: true });
     }
+
+    function closePlayer({ restoreFocus = true } = {}) {
+      const id = activeDownloadID;
+      cancelFlowRequest();
+      destroyVideoAndHls();
+      pendingResume = null;
+      activeMagnet = '';
+      setActiveDownload(null);
+      resetTracks();
+      removeWarning();
+      $('playerWorkspace').hidden = true;
+      $('player-block').style.display = 'none';
+      $('step-files').style.display = 'none';
+      showMsg('playerMsg', '');
+      showMsg('fileMsg', '');
+      showMsg('trackMsg', '');
+      if (restoreFocus) {
+        const row = Array.from($('downloadsList').children).find(row => row.dataset.id === id);
+        (row?.querySelector('.download-open') || $('addDownloadBtn')).focus();
+      }
+    }
+    $('closePlayer').onclick = () => closePlayer();
 
     async function extendDownload(id, days) {
       showMsg('downloadsMsg', 'downloads.extending', false, true);
@@ -593,17 +719,11 @@ import { t, setText, number, errorKey } from './i18n.js';
         const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (!res.ok) throw await responseError(res, 'errors.delete');
         if (deletingCurrentDownload && activeDownloadID === id) {
-          cancelFlowRequest();
-          destroyVideoAndHls();
-          setActiveDownload(null);
-          activeMagnet = '';
-          $('filelist').textContent = '';
-          $('step-files').style.display = 'none';
-          $('step-tracks').style.display = 'none';
-          $('player-block').style.display = 'none';
-          removeWarning();
+          closePlayer({ restoreFocus: false });
+          $('addDownloadBtn').focus();
         }
         await loadDownloads({ quiet: true });
+        if (!document.activeElement || document.activeElement === document.body) $('addDownloadBtn').focus();
         showMsg('downloadsMsg', 'downloads.deleted');
       } catch (e) {
         showError('downloadsMsg', e, 'errors.delete');
@@ -652,32 +772,52 @@ import { t, setText, number, errorKey } from './i18n.js';
       });
     }
 
-    $('downloadsList').addEventListener('click', e => {
-      const extendToggle = e.target.closest('button[data-action="toggle-extend"][data-id]');
-      if (extendToggle) {
-        toggleExtendMenu(extendToggle);
-        return;
+    $('downloadsList').addEventListener('click', event => {
+      const button = event.target.closest('button[data-action][data-id]');
+      if (!button) return;
+      const { action, id } = button.dataset;
+      if (action === 'toggle-menu') return toggleDownloadMenu(button);
+      const download = findDownload(id);
+      if (action === 'open' || action === 'restart') {
+        savePlaybackPosition?.();
+        const fileIndex = Number(button.closest('.download-row').dataset.fileIndex);
+        const position = action === 'open' ? readPlaybackPosition(download) : null;
+        closeDownloadMenus();
+        openDownload(download, position?.fileIndex === fileIndex ? position : null, fileIndex);
       }
-      const btn = e.target.closest('button[data-action][data-id]');
-      if (btn) {
-        if (btn.dataset.action === 'open') openDownload(findDownload(btn.dataset.id));
-        if (btn.dataset.action === 'resume') {
-          const download = findDownload(btn.dataset.id);
-          if (download) openDownload(download, readPlaybackPosition(download));
-        }
-        if (btn.dataset.action === 'extend') {
-          closeExtendMenus();
-          extendDownload(btn.dataset.id, parseInt(btn.dataset.days || '7', 10));
-        }
-        if (btn.dataset.action === 'delete') deleteDownload(btn.dataset.id);
-        return;
+      if (action === 'extend') {
+        closeDownloadMenus(true);
+        extendDownload(id, Number(button.dataset.days));
+      }
+      if (action === 'delete') {
+        closeDownloadMenus(true);
+        deleteDownload(id);
       }
     });
-    document.addEventListener('click', e => {
-      if (!e.target.closest('.download-menu')) closeExtendMenus();
+    document.addEventListener('click', event => {
+      if (!event.target.closest('.download-menu')) closeDownloadMenus();
     });
-    document.addEventListener('keydown', e => {
-      if (e.key === 'Escape') closeExtendMenus();
+    document.addEventListener('focusin', event => {
+      if (!event.target.closest('.download-menu')) closeDownloadMenus();
+    });
+    document.addEventListener('keydown', event => {
+      const menu = document.querySelector('.download-menu.open');
+      if (!menu) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeDownloadMenus(true);
+      } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const items = [...menu.querySelectorAll('[role="menuitem"]')].filter(item => item.getClientRects().length);
+        const current = items.indexOf(document.activeElement);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 :
+          (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
+      }
+    });
+    for (const event of ['resize', 'scroll']) window.addEventListener(event, () => {
+      const menu = document.querySelector('.download-menu.open');
+      if (menu) positionDownloadMenu(menu);
     });
     window.addEventListener('focus', () => {
       loadDownloads({ quiet: true, suppressError: true });
@@ -722,137 +862,163 @@ import { t, setText, number, errorKey } from './i18n.js';
         showMsg('magnetMsg', 'player.magnetRequired', true);
         return;
       }
-      pendingResume = null;
-      activeMagnet = magnet;
-      setActiveDownload(downloadCatalog.find(download => download.magnet === magnet)?.id || null);
-      const request = beginFlowRequest();
-      const requestId = request.id;
-      destroyVideoAndHls();
+      filesRequestController?.abort();
+      const controller = new AbortController();
+      filesRequestController = controller;
       showMsg('magnetMsg', 'player.loadingFiles', false, true);
-      $('filelist').textContent = '';
-      $('step-files').style.display = 'none';
-      $('step-tracks').style.display = 'none';
-      $('player-block').style.display = 'none';
-      removeWarning();
       try {
-        const res = await apiFetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: request.signal });
+        const res = await apiFetch('/api/torrent/files?magnet=' + encodeURIComponent(magnet), { signal: controller.signal });
         if (!res.ok) throw await responseError(res, 'errors.files');
         const files = await res.json();
-        if (isStale(requestId)) return;
+        if (filesRequestController !== controller) return;
         if (!files.length) throw new Error('errors.noFiles');
-        setFileList(files);
-        $('step-files').style.display = '';
+        await loadDownloads({ quiet: true });
+        if (filesRequestController !== controller) return;
         showMsg('magnetMsg', '');
         if ($('magnet').value.trim() === magnet) {
           setSourceOpen(false);
           $('magnet').value = '';
-          $('filelist').focus();
+          const download = downloadCatalog.find(item => item.magnet === magnet);
+          const row = Array.from($('downloadsList').children).find(row => row.dataset.id === download?.id);
+          (row?.querySelector('.download-open') || $('addDownloadBtn')).focus();
         }
-        loadDownloads({ quiet: true });
       } catch (e) {
         if (e.name === 'AbortError') return;
-        if (isStale(requestId)) return;
+        if (filesRequestController !== controller) return;
         if ($('sourcePanel').hidden) setSourceOpen(true);
         showError('magnetMsg', e, 'errors.files');
         return;
       } finally {
-        finishFlowRequest(request);
+        if (filesRequestController === controller) filesRequestController = null;
       }
     };
 
+    let openPlayerMenu = null;
+    function closePlayerMenu(restoreFocus = false) {
+      if (!openPlayerMenu) return;
+      const button = $(openPlayerMenu + 'MenuButton');
+      const popup = $(openPlayerMenu + 'Menu');
+      const focusInside = popup.contains(document.activeElement);
+      popup.hidden = true;
+      button.setAttribute('aria-expanded', 'false');
+      openPlayerMenu = null;
+      if (restoreFocus || focusInside) button.focus();
+    }
+    for (const name of ['video', 'audio', 'subtitles']) {
+      $(name + 'MenuButton').onclick = () => {
+        const opening = openPlayerMenu !== name;
+        closePlayerMenu();
+        if (!opening) return;
+        openPlayerMenu = name;
+        $(name + 'Menu').hidden = false;
+        $(name + 'MenuButton').setAttribute('aria-expanded', 'true');
+        $(name + 'Menu').querySelector('select').focus();
+      };
+    }
+    document.addEventListener('click', event => {
+      if (!event.target.closest('.player-setting')) closePlayerMenu(document.activeElement === document.body);
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && openPlayerMenu) {
+        event.preventDefault();
+        closePlayerMenu(true);
+      }
+    });
+    document.addEventListener('focusin', event => {
+      if (!event.target.closest('.player-setting')) closePlayerMenu();
+    });
+    function updateSelectedFile() {
+      const file = videoFiles.find(file => String(file.index) === $('filelist').value);
+      $('selectedFile').textContent = file ? fileDisplayName(file, videoFiles) : '';
+      $('selectedFile').title = file?.name || '';
+    }
+    function updateSubtitleDelay() {
+      $('subtitleDelayRow').style.display = Number($('subtitleSelect').value) >= 0 ? '' : 'none';
+    }
+    function resetTracks() {
+      closePlayerMenu();
+      tracksReady = false;
+      wantsPlayback = false;
+      retryTime = 0;
+      setText($('play'), 'player.play');
+      $('play').hidden = false;
+      setOptions($('audioSelect'), [{ value: 0, label: () => t('player.default') }]);
+      setOptions($('subtitleSelect'), [{ value: -1, label: () => t('player.none') }]);
+      $('audioSelect').disabled = true;
+      $('subtitleSelect').disabled = true;
+      updateSubtitleDelay();
+    }
     function formatTrackLabel(track, type) {
-      let label = t(type === 'audio' ? 'player.track' : 'player.subtitle', { index: track.index + 1 });
-      if (track.language) label += ` [${track.language}]`;
-      if (track.title) label += ` - ${track.title}`;
+      // Media containers commonly use ISO 639-2 bibliographic codes.
+      const aliases = { eng: 'en', rus: 'ru', zho: 'zh', chi: 'zh', jpn: 'ja', kor: 'ko', fra: 'fr', fre: 'fr', deu: 'de', ger: 'de', spa: 'es', ita: 'it', por: 'pt', ukr: 'uk' };
+      let language = track.language;
+      if (language && language !== 'und') {
+        try { language = new Intl.DisplayNames([document.documentElement.lang], { type: 'language' }).of(aliases[language.toLowerCase()] || language); } catch {}
+      } else language = '';
+      let label = language || t(type === 'audio' ? 'player.track' : 'player.subtitle', { index: track.index + 1 });
+      if (track.title) label += ` — ${track.title}`;
       if (track.codec) label += ` (${track.codec})`;
       return label;
     }
 
-    $('selectTracks').onclick = async () => {
+    async function loadTracks() {
       const magnet = activeMagnet;
       const idx = $('filelist').value;
-      if (!magnet || idx === undefined || idx === '') {
-        showMsg('fileMsg', 'player.selectFile', true);
-        return;
-      }
+      if (!magnet || !idx) return;
       const request = beginFlowRequest();
-      const requestId = request.id;
-      showMsg('fileMsg', 'player.loadingTracks', false, true);
-      $('step-tracks').style.display = 'none';
+      showMsg('fileMsg', '');
       showWarning();
       try {
-        const prepare = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}`, {
-          method: 'POST',
-          signal: request.signal,
-        });
+        const prepare = await apiFetch(`/api/hls/prepare?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { method: 'POST', signal: request.signal });
+        if (isStale(request.id)) return;
         if (!prepare.ok) throw await responseError(prepare, 'errors.startPreparation');
         loadDownloads({ quiet: true });
         const res = await apiFetch(`/api/media/info?magnet=${encodeURIComponent(magnet)}&file=${idx}`, { signal: request.signal });
         if (!res.ok) throw await responseError(res, 'errors.mediaInfo');
         const info = await res.json();
-        if (isStale(requestId)) return;
-        loadDownloads({ quiet: true });
-
-        const audioCount = info.audioTracks ? info.audioTracks.length : 0;
-        const subCount = info.subtitles ? info.subtitles.length : 0;
-        const audioSelect = $('audioSelect');
-        const subSelect = $('subtitleSelect');
-        const audioRow = audioSelect.closest('.track-row');
-        const subRow = subSelect.closest('.track-row');
-
-        // If nothing to choose, play immediately
-        if (audioCount <= 1 && subCount === 0) {
-          showMsg('fileMsg', '');
-          setOptions(audioSelect, [{ value: 0, label: () => t('player.default') }]);
-          setOptions(subSelect, [{ value: -1, label: () => t('player.none') }]);
-          if (audioRow) audioRow.style.display = 'none';
-          if (subRow) subRow.style.display = 'none';
-          $('play').click();
-          return;
-        }
-
-        // Audio tracks
-        if (audioCount > 1) {
-          setOptions(audioSelect, info.audioTracks.map(t => ({
-            value: t.index,
-            label: () => formatTrackLabel(t, 'audio'),
-          })));
-          if (audioRow) audioRow.style.display = '';
-        } else {
-          setOptions(audioSelect, [{ value: 0, label: () => t('player.default') }]);
-          if (audioRow) audioRow.style.display = 'none';
-        }
-
-        // Subtitles
-        setOptions(subSelect, [{ value: -1, label: () => t('player.none') }]);
-        if (subCount > 0) {
-          setOptions(subSelect, [
-            { value: -1, label: () => t('player.none') },
-            ...info.subtitles.map(t => ({
-              value: t.index,
-              label: () => formatTrackLabel(t, 'subtitle'),
-            })),
-          ]);
-          if (subRow) subRow.style.display = '';
-          $('subtitleDelayRow').style.display = '';
-        } else {
-          if (subRow) subRow.style.display = 'none';
-          $('subtitleDelayRow').style.display = 'none';
-        }
-
-        $('step-tracks').style.display = '';
+        if (isStale(request.id)) return;
+        setOptions($('audioSelect'), info.audioTracks?.length ? info.audioTracks.map(track => ({ value: track.index, label: () => formatTrackLabel(track, 'audio') })) : [{ value: 0, label: () => t('player.default') }]);
+        setOptions($('subtitleSelect'), [{ value: -1, label: () => t('player.none') }, ...(info.subtitles || []).map(track => ({ value: track.index, label: () => formatTrackLabel(track, 'subtitle') }))]);
+        tracksReady = true;
+        $('audioSelect').disabled = false;
+        $('subtitleSelect').disabled = false;
+        updateSubtitleDelay();
         showMsg('fileMsg', '');
-      } catch (e) {
-        if (e.name === 'AbortError') return;
-        if (isStale(requestId)) return;
         removeWarning();
-        showError('fileMsg', e, 'errors.tracks');
-      } finally {
-        finishFlowRequest(request);
-      }
-    };
+        if (wantsPlayback) startPlayback();
+      } catch (error) {
+        if (error.name === 'AbortError' || isStale(request.id)) return;
+        removeWarning();
+        showError('fileMsg', error, 'errors.tracks');
+        setText($('play'), 'player.retry');
+        $('play').hidden = false;
+      } finally { finishFlowRequest(request); }
+    }
 
-    $('filelist').addEventListener('change', () => { pendingResume = null; });
+    function launchPlayback() {
+      wantsPlayback = true;
+      $('playerWorkspace').hidden = false;
+      $('step-files').style.display = '';
+      closePlayerMenu(true);
+      $('player-block').style.display = '';
+      document.body.classList.add('has-player');
+      $('play').hidden = true;
+      if (tracksReady) startPlayback();
+      else if (!flowRequestController) loadTracks();
+    }
+    $('filelist').addEventListener('change', () => {
+      const restart = wantsPlayback;
+      cancelFlowRequest();
+      pendingResume = null;
+      destroyVideoAndHls({ resetLayout: !restart });
+      resetTracks();
+      updateSelectedFile();
+      showMsg('fileMsg', '');
+      showMsg('trackMsg', '');
+      showMsg('playerMsg', '');
+      removeWarning();
+      if (restart) launchPlayback();
+    });
 
     async function startPlayback(resumeTime) {
       const magnet = activeMagnet;
@@ -864,12 +1030,15 @@ import { t, setText, number, errorKey } from './i18n.js';
         showMsg('trackMsg', 'player.selectFile', true);
         return;
       }
-      resumeTime ??= pendingResume?.magnet === magnet && pendingResume.fileIndex === Number(idx) ? pendingResume.time : 0;
+      resumeTime ??= pendingResume?.magnet === magnet && pendingResume.fileIndex === Number(idx) ? pendingResume.time : retryTime;
+      retryTime = resumeTime;
       const request = beginFlowRequest();
       const requestId = request.id;
       const wasPlaying = $('player-block').style.display !== 'none' || document.body.classList.contains('has-player');
       destroyVideoAndHls({ resetLayout: !wasPlaying });
-      $('player-block').style.display = 'none';
+      $('player-block').style.display = '';
+      document.body.classList.add('has-player');
+      $('play').hidden = true;
       removeWarning();
       showWarning();
       showMsg('trackMsg', '');
@@ -901,21 +1070,19 @@ import { t, setText, number, errorKey } from './i18n.js';
         if (isStale(requestId)) return;
         removeWarning();
         showError('trackMsg', e, 'errors.stream');
+        setText($('play'), 'player.retry');
+        $('play').hidden = false;
         return;
       } finally {
         finishFlowRequest(request);
       }
     }
 
-    $('play').onclick = () => startPlayback();
+    $('play').onclick = launchPlayback;
     ['audioSelect', 'subtitleSelect'].forEach(id => {
-      const el = $(id);
-      if (!el) return;
-      el.addEventListener('change', () => {
-        if ($('player-block').style.display !== 'none') {
-          const t = $('video').currentTime || 0;
-          startPlayback(t);
-        }
+      $(id).addEventListener('change', () => {
+        updateSubtitleDelay();
+        if (wantsPlayback && tracksReady) startPlayback($('video').readyState > 0 ? $('video').currentTime : retryTime);
       });
     });
 
@@ -962,6 +1129,9 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
 
     function showPlaybackError(details) {
+      retryTime = $('video').readyState > 0 ? $('video').currentTime : retryTime;
+      setText($('play'), 'player.retry');
+      $('play').hidden = false;
       removeWarning();
       showError('playerMsg', { detail: details }, 'player.playbackError');
     }
@@ -971,7 +1141,8 @@ import { t, setText, number, errorKey } from './i18n.js';
       video.style.opacity = 0;
       setTimeout(() => { video.style.opacity = 1; }, 120);
       lastStreamActivityAt = Date.now();
-      video.addEventListener('error', () => showPlaybackError('Native media error'));
+      const current = () => video === $('video');
+      video.addEventListener('error', () => { if (current()) showPlaybackError('Native media error'); });
 
       const reapplySubtitleDelay = () => applySubtitleDelay(video, subtitleDelay);
       if (enableSubtitles) {
@@ -986,6 +1157,8 @@ import { t, setText, number, errorKey } from './i18n.js';
         }
       }
       function markStreamActive() {
+        if (!current()) return;
+        $('play').hidden = true;
         lastStreamActivityAt = Date.now();
         showMsg('playerMsg', '');
         hideWarningOnce();
@@ -996,6 +1169,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         hls.attachMedia(video);
 
         hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (!current()) return;
           lastStreamActivityAt = Date.now();
           if (resumeTime > 0) {
             video.currentTime = resumeTime;
@@ -1009,16 +1183,19 @@ import { t, setText, number, errorKey } from './i18n.js';
         });
         if (enableSubtitles) {
           hls.on(Hls.Events.SUBTITLE_TRACK_LOADED, () => {
+            if (!current()) return;
             showSubtitleTextTracks(video);
             reapplySubtitleDelay();
           });
           hls.on(Hls.Events.SUBTITLE_TRACK_SWITCH, () => {
+            if (!current()) return;
             showSubtitleTextTracks(video);
             reapplySubtitleDelay();
           });
         }
         hls.on(Hls.Events.FRAG_LOADED, markStreamActive);
         hls.on(Hls.Events.ERROR, (evt, data) => {
+          if (!current()) return;
           const levelEmpty = data.details === 'levelEmptyError' ||
             (Hls.ErrorDetails && data.details === Hls.ErrorDetails.LEVEL_EMPTY_ERROR);
           if (levelEmpty && (fragLoaded || Date.now() - lastStreamActivityAt < 8000)) {
@@ -1031,6 +1208,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         video.src = src;
         video.addEventListener('loadedmetadata', () => {
+          if (!current()) return;
           video.currentTime = resumeTime;
         }, { once: true });
         video.addEventListener('canplay', markStreamActive, { once: true });
@@ -1075,4 +1253,5 @@ import { t, setText, number, errorKey } from './i18n.js';
         const label = optionLabels.get(option);
         if (label) option.textContent = label();
       }
+      updateSelectedFile();
     });

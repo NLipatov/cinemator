@@ -123,6 +123,7 @@ test("retry clears diagnostics and empty responses do not leave an empty disclos
     }),
   );
   await page.locator("#nextBtn").click();
-  await expect(page.locator("#step-files")).toBeVisible();
+  await expect(page.locator("#sourcePanel")).toBeHidden();
+  await expect(page.locator("#playerWorkspace")).toBeHidden();
   await expect(message).toBeEmpty();
 });
