@@ -847,8 +847,7 @@ button:disabled {
   font-weight: 600;
   line-height: 1.5;
 }
-.download-expiry,
-.download-resume {
+.download-expiry {
   display: block;
   color: var(--color-muted);
   font-size: 0.78rem;

@@ -502,9 +502,6 @@ import { t, setText, number, errorKey } from './i18n.js';
         videosButton.hidden = files.length <= 1;
         setText(videosButton, 'downloads.videos', { count: files.length });
         const saved = position?.fileIndex === file?.index ? position : null;
-        const resume = row.querySelector('.download-resume');
-        resume.hidden = !saved;
-        if (saved) setText(resume, 'downloads.resume', { time: formatPlaybackTime(saved.time) });
         row.querySelector('.download-open').setAttribute('aria-label', [
           saved ? t('downloads.resume', { time: formatPlaybackTime(saved.time) }) : t('player.play'), title, files.length > 1 ? file?.name : '',
         ].filter(Boolean).join(' · '));

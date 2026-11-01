@@ -20,10 +20,11 @@ for (const touch of [false, true]) {
         video.currentTime=36;await done;
       });
       await page.locator('#closePlayer').click();
-      await expect(row.locator('.download-resume')).toHaveText('Continue from 0:36');
+      await expect(row.locator('.download-caption')).not.toContainText('Continue from');
       await expect(row.locator('.download-duration')).toHaveText('2:00');
       expect(await row.locator('.download-watched').evaluate(el=>getComputedStyle(el,'::before').width)).not.toBe('0px');
       await page.reload();
+      await expect(row.locator('.download-watched')).toBeVisible();
       if(touch) await row.locator('.download-title').tap();
       else await row.locator('.download-open').press('Space');
       await expect.poll(()=>page.locator('#video').evaluate(video=>video.currentTime)).toBe(36);
@@ -85,7 +86,7 @@ test('an unfinished HLS playlist is not presented as the full video duration',as
   await row.locator('.download-open').click();
   await expect.poll(()=>page.locator('#video').evaluate(video=>video.duration)).toBe(120);
   await page.locator('#video').evaluate(video=>{video.currentTime=36;});
-  await expect(row.locator('.download-resume')).toHaveText('Continue from 0:36');
+  await expect.poll(()=>page.evaluate(()=>JSON.parse(localStorage.getItem('cinemator-playback:ready')))).toMatchObject({fileIndex:4,time:36});
   await expect(row.locator('.download-duration')).toBeHidden();
   await expect(row.locator('.download-watched')).toBeHidden();
   download.status='ready';
