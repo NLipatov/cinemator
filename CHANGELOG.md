@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/NLipatov/cinemator/compare/0.10.1...0.11.0) (2026-11-01)
+
+
+### Features
+
+* **player:** add media cards and compact playback menus ([#50](https://github.com/NLipatov/cinemator/issues/50)) ([932c499](https://github.com/NLipatov/cinemator/commit/932c4991aef7169086b717c0ae2bcc458335195e))
+
 ## [0.10.1](https://github.com/NLipatov/cinemator/compare/0.10.0...0.10.1) (2026-10-30)
 
 
