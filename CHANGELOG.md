@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/NLipatov/cinemator/compare/0.12.0...0.13.0) (2026-11-01)
+
+
+### Features
+
+* **player:** simplify playback progress cards ([#55](https://github.com/NLipatov/cinemator/issues/55)) ([e70e1da](https://github.com/NLipatov/cinemator/commit/e70e1da69494013977ec72970bdb2727aae1bbed))
+
 ## [0.12.0](https://github.com/NLipatov/cinemator/compare/0.11.0...0.12.0) (2026-11-01)
 
 
