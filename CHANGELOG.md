@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/NLipatov/cinemator/compare/0.10.0...0.10.1) (2026-10-30)
+
+
+### Bug Fixes
+
+* **ui:** improve localized downloads and retention display ([#48](https://github.com/NLipatov/cinemator/issues/48)) ([a6ae98b](https://github.com/NLipatov/cinemator/commit/a6ae98bd9b03e4bfd4649d9aa41b2a732450eea6))
+
 ## [0.10.0](https://github.com/NLipatov/cinemator/compare/0.9.1...0.10.0) (2026-10-28)
 
 
