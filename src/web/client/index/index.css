@@ -1354,14 +1354,33 @@ button:disabled {
   margin-bottom: 0.5rem;
 }
 @media (max-width: 44rem) {
-  .player-toolbar { column-gap: 0.25rem; }
+  .player-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+    column-gap: 0.25rem;
+  }
   .selected-file {
-    flex-basis: 100%;
+    grid-column: 1 / -1;
   }
   .player-settings {
-    flex: 1 1 auto;
+    grid-column: 1;
+    grid-row: 2;
+    min-width: 0;
+  }
+  .player-setting {
+    min-width: 0;
+  }
+  .close-player {
+    grid-column: 2;
+    grid-row: 2;
+  }
+  #play {
+    grid-column: 1 / -1;
+    justify-self: start;
   }
   .settings-toggle {
+    max-width: 100%;
     padding-inline: 0.45rem;
   }
 }

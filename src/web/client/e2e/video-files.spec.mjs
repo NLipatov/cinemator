@@ -120,6 +120,38 @@ test('file, sound and action menus are mutually exclusive and close outside',asy
 
 test.describe('touch file picker',()=>{
  test.use({hasTouch:true,isMobile:true,viewport:{width:390,height:844}});
+ for(const language of ['en','ru','zh-Hans','zh-Hant']){
+  test(`${language}: wide and enlarged text keeps close beside the mobile settings`,async({page})=>{
+   const row=await openPlayer(page,{files,language});
+   // Reproduce wider Linux font metrics even when the host defaults to Noto Sans.
+   await page.addStyleTag({content:':root { --font-main: "DejaVu Sans", monospace; }'});
+   await row.locator('.download-open').tap();
+   await expect.poll(()=>page.locator('#video').evaluate(v=>v.duration)).toBe(120);
+   for(const width of [390,320]){
+    await page.setViewportSize({width,height:844});
+    for(const fontSize of [16,32]){
+     await page.evaluate(size=>document.documentElement.style.fontSize=`${size}px`,fontSize);
+     const controls=page.locator('#videoMenuButton, #audioMenuButton, #subtitlesMenuButton, #closePlayer');
+     const boxes=await controls.evaluateAll(elements=>elements.map(el=>{
+      const {x,y,width,height}=el.getBoundingClientRect();
+      return {x,y,width,height,overflow:el.scrollWidth>el.clientWidth+1};
+     }));
+     const close=boxes.at(-1);
+     expect(Math.abs(boxes[0].y-close.y),`${width}px / ${fontSize}px`).toBeLessThan(1);
+     for(const box of boxes){
+      expect(box.x).toBeGreaterThanOrEqual(0);
+      expect(box.x+box.width).toBeLessThanOrEqual(width);
+      expect(box.height).toBeGreaterThanOrEqual(44);
+      expect(box.overflow).toBe(false);
+     }
+     for(const box of boxes.slice(0,-1))expect(box.x+box.width).toBeLessThanOrEqual(close.x);
+     expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+    }
+   }
+   await page.locator('#closePlayer').tap();
+   await expect(page.locator('#playerWorkspace')).toBeHidden();
+  });
+ }
  test('the count opens a list and tapping a filename starts that file',async({page})=>{
   const row=await openPlayer(page,{files,language:'ru'});
   await row.locator('.download-videos').tap();
