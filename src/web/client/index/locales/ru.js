@@ -45,6 +45,8 @@ export default {
   'player.file': 'Видеофайл',
   'player.video': 'Видео',
   'player.videoPosition': 'Видео: {index}/{count}',
+  'player.previousVideo': 'Предыдущее видео',
+  'player.nextVideo': 'Следующее видео',
   'player.sound': 'Звук',
   'player.close': 'Закрыть плеер',
   'player.retry': 'Повторить',

@@ -45,6 +45,8 @@ export default {
   'player.file': 'Video file',
   'player.video': 'Video',
   'player.videoPosition': 'Video: {index}/{count}',
+  'player.previousVideo': 'Previous video',
+  'player.nextVideo': 'Next video',
   'player.sound': 'Sound',
   'player.close': 'Close player',
   'player.retry': 'Retry',

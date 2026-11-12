@@ -1302,6 +1302,21 @@ button:disabled {
   flex-wrap: wrap;
   gap: 0.25rem;
 }
+.video-navigation {
+  display: flex;
+  align-items: flex-start;
+  max-width: 100%;
+}
+.video-navigation .video-skip {
+  flex: 0 0 44px;
+  padding: 0;
+}
+#videoMenuButton {
+  flex: 1 1 auto;
+}
+#videoMenuLabel {
+  min-width: 0;
+}
 .player-controls {
   position: relative;
   padding: 0.1rem 0 0.5rem;
