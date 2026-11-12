@@ -45,6 +45,8 @@ export default {
   'player.file': '视频文件',
   'player.video': '视频',
   'player.videoPosition': '视频：{index}/{count}',
+  'player.previousVideo': '上一个视频',
+  'player.nextVideo': '下一个视频',
   'player.sound': '声音',
   'player.close': '关闭播放器',
   'player.retry': '重试',

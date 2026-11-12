@@ -45,6 +45,8 @@ export default {
   'player.file': '影片檔案',
   'player.video': '影片',
   'player.videoPosition': '影片：{index}/{count}',
+  'player.previousVideo': '上一部影片',
+  'player.nextVideo': '下一部影片',
   'player.sound': '聲音',
   'player.close': '關閉播放器',
   'player.retry': '重試',

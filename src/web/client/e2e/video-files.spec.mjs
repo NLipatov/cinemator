@@ -44,6 +44,8 @@ test('single-file cards and players omit the file switcher',async({page})=>{
  await row.locator('.download-open').click();
  await expect.poll(()=>page.locator('#video').evaluate(v=>v.duration)).toBe(120);
  await expect(page.locator('#videoMenuButton')).toBeHidden();
+ await expect(page.locator('#previousVideo')).toBeHidden();
+ await expect(page.locator('#nextVideo')).toBeHidden();
  await expect(page.locator('#selectedFile')).toHaveText('02.mp4');
 });
 
@@ -131,7 +133,7 @@ test.describe('touch file picker',()=>{
     await page.setViewportSize({width,height:844});
     for(const fontSize of [16,32]){
      await page.evaluate(size=>document.documentElement.style.fontSize=`${size}px`,fontSize);
-     const controls=page.locator('#videoMenuButton, #audioMenuButton, #subtitlesMenuButton, #closePlayer');
+     const controls=page.locator('#previousVideo, #videoMenuButton, #nextVideo, #audioMenuButton, #subtitlesMenuButton, #closePlayer');
      const boxes=await controls.evaluateAll(elements=>elements.map(el=>{
       const {x,y,width,height}=el.getBoundingClientRect();
       return {x,y,width,height,overflow:el.scrollWidth>el.clientWidth+1};

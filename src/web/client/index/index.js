@@ -145,6 +145,15 @@ import { t, setText, number, errorKey } from './i18n.js';
     let videoFiles = [];
     let selectedVideoIndex = null;
     let videoMenuState = null;
+    const audioPreferences = new Map();
+    function preferredAudioIndex(downloadID) {
+      if (audioPreferences.has(downloadID)) return audioPreferences.get(downloadID);
+      try {
+        const index = JSON.parse(localStorage.getItem(`cinemator-audio:${downloadID}`));
+        if (Number.isSafeInteger(index) && index >= 0) return index;
+      } catch {}
+      return null;
+    }
     function setOptions(select, options) {
       select.replaceChildren(...options.map(({ value, label }) => {
         const option = new Option(label(), String(value));
@@ -663,6 +672,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       activeMagnet = '';
       setActiveDownload(null);
       resetTracks();
+      updateMediaSession();
       removeWarning();
       $('playerWorkspace').hidden = true;
       $('player-block').style.display = 'none';
@@ -1033,7 +1043,40 @@ import { t, setText, number, errorKey } from './i18n.js';
       $('selectedFile').textContent = file?.name || '';
       $('selectedFile').title = file?.name || '';
       $('videoMenuButton').hidden = videoFiles.length <= 1;
+      $('videoNavigation').hidden = videoFiles.length <= 1;
+      $('previousVideo').disabled = index <= 0;
+      $('nextVideo').disabled = index < 0 || index >= videoFiles.length - 1;
       setText($('videoMenuLabel'), 'player.videoPosition', { index: index + 1, count: videoFiles.length });
+      updateMediaSession();
+    }
+    function navigateVideo(direction) {
+      if (!wantsPlayback) return;
+      const index = videoFiles.findIndex(file => file.index === selectedVideoIndex);
+      const file = index >= 0 ? videoFiles[index + direction] : null;
+      if (file) {
+        const focused = document.activeElement;
+        selectVideoFile(file.index);
+        if ((focused === $('previousVideo') || focused === $('nextVideo')) && focused.disabled) $('videoMenuButton').focus();
+      }
+    }
+    $('previousVideo').onclick = () => navigateVideo(-1);
+    $('nextVideo').onclick = () => navigateVideo(1);
+
+    function updateMediaSession() {
+      const session = navigator.mediaSession;
+      if (!session) return;
+      const index = videoFiles.findIndex(file => file.index === selectedVideoIndex);
+      const active = wantsPlayback && index >= 0;
+      for (const [action, direction] of [['previoustrack', -1], ['nexttrack', 1]]) {
+        const available = active && videoFiles[index + direction];
+        try { session.setActionHandler(action, available ? () => navigateVideo(direction) : null); } catch {}
+      }
+      if (typeof MediaMetadata === 'function') {
+        session.metadata = active ? new MediaMetadata({
+          title: videoFiles[index].name,
+          album: findDownload(activeDownloadID)?.title || '',
+        }) : null;
+      }
     }
     function updateSubtitleDelay() {
       $('subtitleDelayRow').style.display = Number($('subtitleSelect').value) >= 0 ? '' : 'none';
@@ -1082,6 +1125,8 @@ import { t, setText, number, errorKey } from './i18n.js';
         const info = await res.json();
         if (isStale(request.id)) return;
         setOptions($('audioSelect'), info.audioTracks?.length ? info.audioTracks.map(track => ({ value: track.index, label: () => formatTrackLabel(track, 'audio') })) : [{ value: 0, label: () => t('player.default') }]);
+        const preferred = preferredAudioIndex(activeDownloadID);
+        if (info.audioTracks?.some(track => track.index === preferred)) $('audioSelect').value = String(preferred);
         setOptions($('subtitleSelect'), [{ value: -1, label: () => t('player.none') }, ...(info.subtitles || []).map(track => ({ value: track.index, label: () => formatTrackLabel(track, 'subtitle') }))]);
         tracksReady = true;
         $('audioSelect').disabled = false;
@@ -1101,6 +1146,7 @@ import { t, setText, number, errorKey } from './i18n.js';
 
     function launchPlayback() {
       wantsPlayback = true;
+      updateMediaSession();
       $('playerWorkspace').hidden = false;
       $('step-files').style.display = '';
       closePlayerMenu(true);
@@ -1117,6 +1163,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       cancelFlowRequest();
       pendingResume = null;
       destroyVideoAndHls({ resetLayout: !restart });
+      try { localStorage.removeItem(`cinemator-playback:${activeDownloadID}`); } catch {}
       resetTracks();
       updateSelectedFile();
       showMsg('fileMsg', '');
@@ -1187,6 +1234,13 @@ import { t, setText, number, errorKey } from './i18n.js';
     $('play').onclick = launchPlayback;
     ['audioSelect', 'subtitleSelect'].forEach(id => {
       $(id).addEventListener('change', () => {
+        if (id === 'audioSelect' && activeDownloadID && tracksReady) {
+          const index = Number($('audioSelect').value);
+          if (Number.isSafeInteger(index) && index >= 0) {
+            audioPreferences.set(activeDownloadID, index);
+            try { localStorage.setItem(`cinemator-audio:${activeDownloadID}`, String(index)); } catch {}
+          }
+        }
         updateSubtitleDelay();
         if (wantsPlayback && tracksReady) startPlayback($('video').readyState > 0 ? $('video').currentTime : retryTime);
       });
