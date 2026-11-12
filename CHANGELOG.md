@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.15.0](https://github.com/NLipatov/cinemator/compare/0.14.0...0.15.0) (2026-11-12)
+
+
+### Features
+
+* **player:** add video navigation and remember audio preferences ([#61](https://github.com/NLipatov/cinemator/issues/61)) ([cfc5971](https://github.com/NLipatov/cinemator/commit/cfc5971633e8e4ab993a407fabc1a99304ab884b))
+
+
+### Bug Fixes
+
+* **player:** keep mobile controls aligned across fonts ([#59](https://github.com/NLipatov/cinemator/issues/59)) ([cb2b2e4](https://github.com/NLipatov/cinemator/commit/cb2b2e46ab4238db3369a706900c9da6006950fa))
+
 ## [0.14.0](https://github.com/NLipatov/cinemator/compare/0.13.0...0.14.0) (2026-11-01)
 
 
