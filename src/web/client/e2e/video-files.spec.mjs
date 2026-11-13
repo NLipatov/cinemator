@@ -123,7 +123,7 @@ test('file, sound and action menus are mutually exclusive and close outside',asy
 test.describe('touch file picker',()=>{
  test.use({hasTouch:true,isMobile:true,viewport:{width:390,height:844}});
  for(const language of ['en','ru','zh-Hans','zh-Hant']){
-  test(`${language}: wide and enlarged text keeps close beside the mobile settings`,async({page})=>{
+  test(`${language}: wide and enlarged text keeps close beside the title and controls inside the viewport`,async({page})=>{
    const row=await openPlayer(page,{files,language});
    // Reproduce wider Linux font metrics even when the host defaults to Noto Sans.
    await page.addStyleTag({content:':root { --font-main: "DejaVu Sans", monospace; }'});
@@ -139,14 +139,17 @@ test.describe('touch file picker',()=>{
       return {x,y,width,height,overflow:el.scrollWidth>el.clientWidth+1};
      }));
      const close=boxes.at(-1);
-     expect(Math.abs(boxes[0].y-close.y),`${width}px / ${fontSize}px`).toBeLessThan(1);
+     const title=await page.locator('.player-identity').boundingBox();
+     expect(Math.abs(title.y-close.y),`${width}px / ${fontSize}px`).toBeLessThan(1);
+     expect(title.x+title.width).toBeLessThanOrEqual(close.x);
+     expect(boxes[0].y).toBeGreaterThanOrEqual(title.y+title.height);
      for(const box of boxes){
       expect(box.x).toBeGreaterThanOrEqual(0);
       expect(box.x+box.width).toBeLessThanOrEqual(width);
       expect(box.height).toBeGreaterThanOrEqual(44);
       expect(box.overflow).toBe(false);
      }
-     for(const box of boxes.slice(0,-1))expect(box.x+box.width).toBeLessThanOrEqual(close.x);
+
      expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
     }
    }
@@ -163,6 +166,8 @@ test.describe('touch file picker',()=>{
   await expect(page.locator('#videoMenuLabel')).toHaveText('Видео: 1/3');
   const selector=await page.locator('#videoMenuButton').boundingBox();
   const close=await page.locator('#closePlayer').boundingBox();
-  expect(Math.abs(selector.y-close.y)).toBeLessThan(1);
+  const title=await page.locator('.player-identity').boundingBox();
+  expect(Math.abs(title.y-close.y)).toBeLessThan(1);
+  expect(selector.y).toBeGreaterThanOrEqual(title.y+title.height);
  });
 });

@@ -16,13 +16,13 @@ function streams(page) {
 
 async function ready(page, ordinal, audio) {
   await expect(page.locator('#selectedFile')).toHaveText(files[ordinal].name);
-  await expect(page.locator('#audioSelect')).toHaveValue(String(audio));
+  await expect(page.locator('#audioTracks [aria-checked="true"]')).toHaveAttribute('data-value', String(audio));
   await expect.poll(() => page.locator('#video').evaluate(video => video.duration)).toBe(120);
 }
 
 async function chooseAudio(page, index) {
   await page.locator('#audioMenuButton').click();
-  await page.locator('#audioSelect').selectOption(String(index));
+  await page.locator(`#audioTracks [data-value="${index}"]`).click();
   await expect.poll(() => page.locator('#video').evaluate(video => video.duration)).toBe(120);
   await page.keyboard.press('Escape');
 }
@@ -101,7 +101,7 @@ test('explicit audio changes replace the preference only for that download', asy
   await row.locator('.download-open').click();
   await ready(page, 2, 0);
   await page.locator('.download-row[data-id="other"] .download-open').click();
-  await expect(page.locator('#audioSelect')).toHaveValue('1');
+  await expect(page.locator('#audioTracks [aria-checked="true"]')).toHaveAttribute('data-value', '1');
   await expect.poll(() => page.locator('#video').evaluate(video => video.duration)).toBe(120);
 });
 
@@ -155,7 +155,7 @@ test('rapid navigation ignores the previous file metadata and keeps the audio pr
   await page.locator('#nextVideo').click();
   await ready(page, 3, 1);
   release();
-  await expect(page.locator('#audioSelect option')).toHaveCount(2);
+  await expect(page.locator('#audioTracks .track-label')).toHaveCount(2);
   await ready(page, 3, 1);
   expect(requests.map(({file, audio}) => ({file, audio}))).toEqual([{file: 25, audio: 1}]);
 });

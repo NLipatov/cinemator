@@ -348,6 +348,36 @@ button:disabled {
   pointer-events: none;
 }
 
+#appMenuButton { width: 44px; padding: 0; }
+#appMenu {
+  inset: calc(var(--header-height) + 0.5rem) max(var(--page-gutter), calc((100vw - var(--page-max)) / 2)) auto auto;
+  width: min(18rem, calc(100vw - 1rem));
+  max-height: calc(100dvh - var(--header-height) - 1rem);
+  overflow: auto;
+  margin: 0;
+  padding: 0.5rem;
+  color: var(--color-fg);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-medium);
+  box-shadow: var(--shadow-menu);
+}
+#appMenu h2 { margin: 0; padding: 0.5rem; font-size: 0.9rem; }
+#appMenu .theme-toggle, #appMenu .auth-logout {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.65rem 0.5rem;
+  text-align: start;
+  border-color: transparent;
+  border-radius: var(--radius-small);
+  background: transparent;
+  font-size: 0.84rem;
+}
+#appMenu button:hover, #appMenu button:focus-visible { background: var(--color-surface-soft); }
+#appMenu .brand-version { display: block; padding: 0.75rem 0.5rem 0.25rem; border-top: 1px solid var(--color-border); }
+
 .app-shell {
   width: min(100%, var(--page-max));
   margin: 0 auto;
@@ -359,7 +389,8 @@ button:disabled {
   align-items: start;
 }
 
-.source-panel,
+.downloads-panel,
+.player-controls,
 .panel,
 .login-card {
   color: var(--color-fg);
@@ -370,8 +401,8 @@ button:disabled {
 
 .source-panel {
   width: 100%;
-  padding: clamp(1rem, 2.5vw, 1.5rem);
-  border-radius: var(--radius-large);
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--color-border);
 }
 
 .source-form {
@@ -531,7 +562,7 @@ button:disabled {
   display: block;
   height: 100%;
 }
-.player-preparation {
+.player-preparation, .player-error {
   --color-fg: #f2f4f8;
   --color-muted: #c1c9d4;
   position: absolute;
@@ -542,6 +573,9 @@ button:disabled {
   color: var(--color-muted);
   background: rgb(0 0 0 / 78%);
 }
+.player-error { background: #111318; }
+.player-error .msg.error { color: var(--color-fg); }
+.player-error .error-details { color: var(--color-muted); }
 .preparation-content {
   width: min(100%, 32rem);
   min-width: 0;
@@ -634,6 +668,11 @@ button:disabled {
   animation: spin 800ms linear infinite;
 }
 
+.downloads-panel,
+.player-controls {
+  padding: 12px clamp(12px, 1.5vw, 20px);
+}
+
 .downloads-panel {
   grid-area: downloads;
   width: 100%;
@@ -647,7 +686,8 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  padding-inline: 0.25rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--color-border);
 }
 
 .downloads-heading {
@@ -713,19 +753,34 @@ button:disabled {
 }
 
 .downloads-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 18rem), 1fr));
+  container-type: inline-size;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 1.75rem 1.5rem;
   align-items: start;
 }
 
 .download-row {
+  flex: 0 1 100%;
   position: relative;
   min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-medium);
+  background: var(--color-bg);
   display: grid;
   grid-template-columns: minmax(0, 1fr) 44px;
   grid-template-rows: auto auto;
   align-items: start;
+}
+
+@container (min-width: 37.5rem) {
+  .download-row { flex-basis: calc((100% - 1.5rem) / 2); }
+}
+
+@container (min-width: 57rem) {
+  .download-row { flex-basis: calc((100% - 3rem) / 3); }
 }
 
 .download-open {
@@ -789,6 +844,7 @@ button:disabled {
     animation-delay: -10s;
   }
 }
+.has-player .download-preview.loaded { animation-play-state: paused; }
 .download-play-icon {
   position: absolute;
   inset: 0;
@@ -871,19 +927,6 @@ button:disabled {
   text-decoration: underline;
   text-underline-offset: 0.2em;
 }
-.video-file-menu {
-  position: fixed;
-  z-index: 40;
-  width: min(28rem, calc(100vw - 1rem));
-  max-height: min(24rem, calc(100dvh - 1rem));
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  padding: 0.4rem;
-  background: var(--color-surface);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-medium);
-  box-shadow: var(--shadow-menu);
-}
 .video-file-option {
   display: flex;
   align-items: baseline;
@@ -900,21 +943,11 @@ button:disabled {
   text-align: start;
 }
 .video-file-check { flex: 0 0 1em; visibility: hidden; }
-.video-file-name { overflow-wrap: anywhere; min-width: 0; }
+.video-file-name, .track-label { overflow-wrap: anywhere; min-width: 0; }
 .video-file-option[aria-checked="true"] .video-file-check { visibility: visible; }
 .video-file-option[aria-checked="true"] { color: var(--color-accent); }
 .video-file-option:hover,
 .video-file-option:focus-visible { background: var(--color-surface-soft); }
-@media (max-width: 44rem) {
-  .video-file-menu {
-    left: 0.5rem !important;
-    right: 0.5rem;
-    top: auto !important;
-    bottom: max(0.5rem, env(safe-area-inset-bottom));
-    width: auto;
-    max-height: 65dvh;
-  }
-}
 .download-row.active .download-title { color: var(--color-accent); }
 .download-menu {
   grid-column: 2;
@@ -1006,7 +1039,7 @@ button:disabled {
 .download-row[data-status=failed] .download-card-status,
 .download-row > .error-details { color: var(--color-error); }
 .downloads-empty {
-  grid-column: 1 / -1;
+  flex: 0 1 100%;
   padding: 2.5rem 1.25rem;
   color: var(--color-muted);
   font-size: 0.85rem;
@@ -1284,43 +1317,50 @@ button:disabled {
 
 /* The viewing area and its compact settings share the full content width. */
 .player-toolbar {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content 44px;
   align-items: center;
-  flex-wrap: wrap;
   gap: 0.75rem;
 }
-.selected-file {
-  flex: 1 1 16rem;
-  min-width: 0;
+.player-identity { min-width: 0; }
+.player-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 650;
+  line-height: 1.4;
   overflow-wrap: anywhere;
-  font-size: 0.9rem;
-  font-weight: 500;
+}
+.selected-file {
+  min-width: 0;
+  margin-top: 0.15rem;
+  overflow-wrap: anywhere;
+  color: var(--color-muted);
+  font-size: 0.8rem;
   line-height: 1.5;
 }
 .player-settings {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-}
-.video-navigation {
-  display: flex;
-  align-items: flex-start;
-  max-width: 100%;
-}
-.video-navigation .video-skip {
-  flex: 0 0 44px;
-  padding: 0;
-}
-#videoMenuButton {
-  flex: 1 1 auto;
-}
-#videoMenuLabel {
+  align-items: start;
+  gap: 0.35rem;
   min-width: 0;
 }
+.player-setting { min-width: 0; }
+.video-navigation {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr) 44px;
+  align-items: start;
+  width: max-content;
+  max-width: 100%;
+}
+.video-navigation .video-skip { padding: 0; }
+#videoMenuButton { min-width: max-content; }
+#videoMenuLabel { white-space: nowrap; overflow-wrap: normal; }
 .player-controls {
   position: relative;
-  padding: 0.1rem 0 0.5rem;
+  container-type: inline-size;
 }
+#play { justify-self: center; }
+.close-player { grid-column: 3; grid-row: 1; }
 .player-controls .msg:empty, .player-stage .msg:empty {
   display: none;
 }
@@ -1346,63 +1386,73 @@ button:disabled {
   border-color: var(--color-border);
 }
 .settings-popup {
-  position: absolute;
-  top: calc(100% + 0.5rem);
-  right: 0;
-  z-index: 30;
-  width: min(28rem, 100%);
-  max-height: 65vh;
-  overflow: auto;
-  padding: 1rem;
-  display: grid;
-  gap: 1rem;
+  position: fixed;
+  z-index: 40;
+  width: min(28rem, calc(100vw - 1rem));
+  max-height: min(28rem, calc(100dvh - 1rem));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0.4rem;
   background: var(--color-surface);
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-medium);
   box-shadow: var(--shadow-menu);
 }
-.has-player .settings-popup {
-  top: auto;
-  bottom: calc(100% + 0.5rem);
+.menu-heading {
+  position: sticky;
+  top: -0.4rem;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.2rem 0.25rem 0.35rem 0.65rem;
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
 }
-.has-player .player-stage {
-  margin-bottom: 0.5rem;
+.menu-heading h2 { margin: 0; font-size: 0.9rem; line-height: 1.4; }
+.menu-close { flex: 0 0 44px; padding: 0; }
+#subtitleDelayRow { padding: 0.75rem; border-top: 1px solid var(--color-border); }
+.has-player .player-stage { margin-bottom: 0.5rem; }
+.download-current {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--color-accent);
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+@container (max-width: 62rem) {
+  .player-toolbar { grid-template-columns: minmax(0, 1fr) 44px; align-items: start; gap: 0.25rem; }
+  .selected-file { display: none; }
+  .player-identity { grid-column: 1; grid-row: 1; }
+  .close-player { grid-column: 2; grid-row: 1; }
+  .player-settings {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    flex-wrap: wrap;
+    justify-content: center;
+    padding-block-start: 0.25rem;
+    border-top: 1px solid var(--color-border);
+  }
+}
+@container (max-width: 36rem) {
+  .player-settings { display: grid; grid-template-columns: repeat(2, minmax(0, max-content)); gap: 0 0.25rem; }
+  .video-navigation { grid-column: 1 / -1; justify-self: center; }
+  .player-setting:not(.video-navigation) > .settings-toggle { width: 100%; justify-content: center; }
+  #videoMenuButton { min-width: 0; }
+  #videoMenuLabel { white-space: normal; }
+  .settings-toggle { max-width: 100%; padding-inline: 0.45rem; }
 }
 @media (max-width: 44rem) {
-  .player-toolbar {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: start;
-    column-gap: 0.25rem;
+  .player-controls { padding-block: 0.5rem; }
+  .settings-popup {
+    left: 0.5rem !important;
+    right: 0.5rem;
+    top: auto !important;
+    bottom: max(0.5rem, env(safe-area-inset-bottom));
+    width: auto;
+    max-height: 65dvh;
   }
-  .selected-file {
-    grid-column: 1 / -1;
-  }
-  .player-settings {
-    grid-column: 1;
-    grid-row: 2;
-    min-width: 0;
-  }
-  .player-setting {
-    min-width: 0;
-  }
-  .close-player {
-    grid-column: 2;
-    grid-row: 2;
-  }
-  #play {
-    grid-column: 1 / -1;
-    justify-self: start;
-  }
-  .settings-toggle {
-    max-width: 100%;
-    padding-inline: 0.45rem;
-  }
-}
-
-.close-player {
-  margin-inline-start: auto;
-  min-width: 44px;
 }
 
 .delay-controls button {

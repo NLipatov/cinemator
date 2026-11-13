@@ -1,4 +1,5 @@
 export default {
+  'common.application': 'Application',
   'common.language': 'Language',
   'common.theme': 'Switch theme',
   'common.loading': 'Loading…',
@@ -47,6 +48,10 @@ export default {
   'player.videoPosition': 'Video: {index}/{count}',
   'player.previousVideo': 'Previous video',
   'player.nextVideo': 'Next video',
+  'player.soundValue': 'Sound: {value}',
+  'player.subtitlesValue': 'Subtitles: {value}',
+  'player.off': 'Off',
+  'downloads.nowPlaying': 'Now playing',
   'player.sound': 'Sound',
   'player.close': 'Close player',
   'player.retry': 'Retry',

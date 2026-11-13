@@ -71,10 +71,16 @@ async function layoutProblems(page) {
     )
       problems.push("header overlaps page content");
     const source = document.querySelector(".source-panel")?.getBoundingClientRect();
-    const downloads = document.querySelector(".downloads-panel")?.getBoundingClientRect();
-    if (source && downloads && (Math.abs(source.left - downloads.left) > 1 ||
-      Math.abs(source.right - downloads.right) > 1))
-      problems.push("downloads do not share the source panel width");
+    const downloads = document.querySelector(".downloads-panel");
+    if (source && downloads) {
+      const box = downloads.getBoundingClientRect(), style = getComputedStyle(downloads);
+      const left = box.left + parseFloat(style.borderLeftWidth) + parseFloat(style.paddingLeft);
+      const right = box.right - parseFloat(style.borderRightWidth) - parseFloat(style.paddingRight);
+      const cards = document.querySelector(".downloads-list").getBoundingClientRect();
+      if (Math.abs(source.left - left) > 1 || Math.abs(source.right - right) > 1 ||
+        Math.abs(cards.left - left) > 1 || Math.abs(cards.right - right) > 1)
+        problems.push("source form and cards do not fill the downloads panel content width");
+    }
     for (const element of document.querySelectorAll(".download-size, .download-meta-text, .download-expiry")) {
       // Numeric values and their units must stay on the same visual line.
       for (const match of element.textContent.matchAll(/\d[\d.,\u00a0\u202f]*[\u00a0 ]+(?:[\p{Script=Latin}\p{Script=Cyrillic}]+|年|个月|個月|周|週|天|小时|小時|分钟|分鐘)/gu)) {

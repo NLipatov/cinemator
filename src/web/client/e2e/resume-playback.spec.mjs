@@ -129,7 +129,7 @@ test("resume starts immediately with multiple tracks and switching preserves the
   await expect.poll(() => page.locator("#video").evaluate(v => v.currentTime)).toBe(42);
   await seek(page, 50);
   await page.locator("#audioMenuButton").click();
-  await page.locator("#audioSelect").selectOption("1");
+  await page.locator('#audioTracks [data-value="1"]').click();
   await expect.poll(() => page.locator("#video").evaluate(v => v.currentTime)).toBe(50);
   expect(await savedPosition(page)).toMatchObject({ fileIndex: 2, time: 50 });
   await row.locator('.download-more').click();

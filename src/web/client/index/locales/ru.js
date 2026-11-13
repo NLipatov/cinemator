@@ -1,4 +1,5 @@
 export default {
+  'common.application': 'Приложение',
   'common.language': 'Язык',
   'common.theme': 'Сменить тему',
   'common.loading': 'Загрузка…',
@@ -47,6 +48,10 @@ export default {
   'player.videoPosition': 'Видео: {index}/{count}',
   'player.previousVideo': 'Предыдущее видео',
   'player.nextVideo': 'Следующее видео',
+  'player.soundValue': 'Звук: {value}',
+  'player.subtitlesValue': 'Субтитры: {value}',
+  'player.off': 'выкл.',
+  'downloads.nowPlaying': 'Сейчас воспроизводится',
   'player.sound': 'Звук',
   'player.close': 'Закрыть плеер',
   'player.retry': 'Повторить',

@@ -53,7 +53,7 @@ test("adding a download preserves drafts and keeps the selected video independen
   await page.locator('[data-action="open"]').click();
   await page.locator("#audioMenuButton").click();
   await expect(page.locator("#audioMenu")).toBeVisible();
-  await expect(page.locator("#audioSelect")).toBeEnabled();
+  await expect(page.locator('#audioTracks [aria-checked="true"]')).toBeEnabled();
   expect(preparedSource).toBe(source);
   await page.keyboard.press("Escape");
   await add.click();

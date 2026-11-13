@@ -21,6 +21,20 @@ import { t, setText, number, errorKey } from './i18n.js';
     function showError(id, error, fallback) {
       showMsg(id, errorKey(error, fallback), true);
       renderErrorDetails($(id), error.detail);
+      if (['playerMsg', 'fileMsg', 'trackMsg'].includes(id)) {
+        removeWarning();
+        $('playerError').hidden = false;
+        $('video').controls = false;
+        setText($('play'), 'player.retry');
+        $('play').hidden = false;
+      }
+    }
+
+    function clearPlaybackError() {
+      $('playerError').hidden = true;
+      $('play').hidden = true;
+      $('video').controls = true;
+      for (const id of ['playerMsg', 'fileMsg', 'trackMsg']) showMsg(id, '');
     }
 
     function renderErrorDetails(container, diagnostic) {
@@ -51,6 +65,15 @@ import { t, setText, number, errorKey } from './i18n.js';
         })
         .catch(() => {});
     }
+
+    $('appMenu').addEventListener('toggle', event => {
+      $('appMenuButton').setAttribute('aria-expanded', String(event.newState === 'open'));
+      if (event.newState === 'open') {
+        closeDownloadMenus();
+        closePlayerMenu();
+        closeVideoMenu();
+      }
+    });
 
     const logoutBtn = $('logoutBtn');
     if (logoutBtn) {
@@ -142,6 +165,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       newVideo.id = 'video';
     }
     const optionLabels = new WeakMap();
+    const optionSummaries = new WeakMap();
     let videoFiles = [];
     let selectedVideoIndex = null;
     let videoMenuState = null;
@@ -154,12 +178,47 @@ import { t, setText, number, errorKey } from './i18n.js';
       } catch {}
       return null;
     }
-    function setOptions(select, options) {
-      select.replaceChildren(...options.map(({ value, label }) => {
-        const option = new Option(label(), String(value));
-        optionLabels.set(option, label);
+    function setOptions(container, options) {
+      container.replaceChildren(...options.map(({ value, label, summary = label }, index) => {
+        const option = document.createElement('button');
+        option.type = 'button';
+        option.className = 'video-file-option';
+        option.dataset.value = String(value);
+        option.setAttribute('role', 'menuitemradio');
+        option.setAttribute('aria-checked', String(index === 0));
+        option.tabIndex = index === 0 ? 0 : -1;
+        option.disabled = !tracksReady;
+        option.innerHTML = '<span class="video-file-check" aria-hidden="true">✓</span><span class="track-label"></span>';
+        const text = option.querySelector('.track-label');
+        text.textContent = label();
+        optionLabels.set(text, label);
+        optionSummaries.set(option, summary);
         return option;
       }));
+    }
+    function selectedTrack(id) {
+      return $(id).querySelector('[aria-checked="true"]')?.dataset.value;
+    }
+    function selectTrack(id, value) {
+      for (const option of $(id).children) {
+        const selected = option.dataset.value === String(value);
+        option.setAttribute('aria-checked', String(selected));
+        option.tabIndex = selected ? 0 : -1;
+      }
+    }
+    function updateTrackLabels() {
+      for (const [id, label, key] of [
+        ['audioTracks', 'audioMenuLabel', 'player.sound'],
+        ['subtitleTracks', 'subtitlesMenuLabel', 'player.subtitles'],
+      ]) {
+        const option = $(id).querySelector('[aria-checked="true"]');
+        const value = optionSummaries.get(option)?.();
+        setText($(label), tracksReady ? key + 'Value' : key, { value });
+      }
+    }
+    function downloadTitle(download) {
+      return download?.title ? (download.files?.length === 1 ? fileStem(download.title) : download.title) :
+        t('downloads.torrent', { id: download?.id.slice(0, 8) || '' });
     }
     function fileStem(name) {
       return name.split(/[\\/]/).pop().replace(/\.(mkv|mp4|m4v|mov|avi|webm|ts|m2ts|mpg|mpeg|wmv|flv|ogv)$/i, '');
@@ -190,6 +249,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       }
     }
     function showWarning() {
+      clearPlaybackError();
       clearSubtitleWait();
       $('warnMsg').hidden = false;
       renderPreparationProgress();
@@ -484,6 +544,8 @@ import { t, setText, number, errorKey } from './i18n.js';
         row.dataset.id = download.id;
         row.dataset.status = download.status;
         row.classList.toggle('active', download.id === activeDownloadID);
+        row.querySelector('.download-current').hidden = download.id !== activeDownloadID;
+        setText(row.querySelector('.download-current'), 'downloads.nowPlaying');
         row.querySelectorAll('button[data-action]').forEach(button => {
           button.dataset.id = download.id;
         });
@@ -498,7 +560,7 @@ import { t, setText, number, errorKey } from './i18n.js';
           selectedVideoIndex : position?.fileIndex ?? download.selectedFileIndex;
         const file = files.find(file => file.index === selectedIndex) || files[0];
         row.dataset.fileIndex = file?.index ?? '';
-        const title = download.title ? (files.length === 1 ? fileStem(download.title) : download.title) : t('downloads.torrent', { id: download.id.slice(0, 8) });
+        const title = downloadTitle(download);
         row.querySelector('.download-title').textContent = title;
         const expiry = row.querySelector('.download-expiry');
         const expiresAt = new Date(download.expiresAt);
@@ -623,6 +685,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       document.querySelectorAll('.download-row[data-id]').forEach(row => {
         const isActive = row.dataset.id === id;
         row.classList.toggle('active', isActive);
+        row.querySelector('.download-current').hidden = !isActive;
         const openBtn = row.querySelector('.download-open');
         if (!openBtn) return;
         if (isActive) {
@@ -707,16 +770,20 @@ import { t, setText, number, errorKey } from './i18n.js';
       const download = findDownload(id);
       if (!download || !window.confirm(t('downloads.confirmDelete', { title: download.title || id }))) return;
       const deletingCurrentDownload = activeDownloadID === id;
+      const index = downloadCatalog.findIndex(item => item.id === id);
+      const neighbor = downloadCatalog[index + 1] || downloadCatalog[index - 1];
       showMsg('downloadsMsg', 'downloads.deleting', false, true);
       try {
         const res = await apiFetch(`/api/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' });
         if (!res.ok) throw await responseError(res, 'errors.delete');
         if (deletingCurrentDownload && activeDownloadID === id) {
           closePlayer({ restoreFocus: false });
-          $('addDownloadBtn').focus();
         }
         await loadDownloads({ quiet: true });
-        if (!document.activeElement || document.activeElement === document.body) $('addDownloadBtn').focus();
+        if (deletingCurrentDownload || !document.activeElement || document.activeElement === document.body) {
+          const row = [...$('downloadsList').children].find(row => row.dataset.id === neighbor?.id);
+          (row?.querySelector('.download-open') || $('addDownloadBtn')).focus({ preventScroll: true });
+        }
         showMsg('downloadsMsg', 'downloads.deleted');
       } catch (e) {
         showError('downloadsMsg', e, 'errors.delete');
@@ -903,10 +970,12 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
     function positionVideoMenu() {
       if (!videoMenuState) return;
-      const popup = $('videoMenu');
-      const anchor = videoMenuState.trigger.getBoundingClientRect();
+      positionSettingsMenu($('videoMenu'), videoMenuState.trigger);
+    }
+    function positionSettingsMenu(popup, trigger) {
+      const anchor = trigger.getBoundingClientRect();
       const box = popup.getBoundingClientRect();
-      const bottom = videoMenuState.trigger === $('videoMenuButton') ?
+      const bottom = $('playerWorkspace').contains(trigger) ?
         Math.min(anchor.top - 8, $('video').getBoundingClientRect().bottom) : anchor.top - 8;
       const above = bottom - box.height;
       const top = above >= 8 ? above : anchor.bottom + 8;
@@ -925,7 +994,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       let current = downloadID === null || downloadID === activeDownloadID && !$('playerWorkspace').hidden ?
         selectedVideoIndex : readPlaybackPosition(download)?.fileIndex ?? download.selectedFileIndex;
       if (!files.some(file => file.index === current)) current = files[0].index;
-      const popup = $('videoMenu');
+      const popup = $('videoOptions');
       const items = new Map([...popup.children].map(item => [Number(item.dataset.fileIndex), item]));
       const focusedIndex = popup.contains(document.activeElement) ? Number(document.activeElement.dataset.fileIndex) : null;
       files.forEach((file, index) => {
@@ -992,7 +1061,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         closeVideoMenu(true);
       } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) {
         event.preventDefault();
-        const items = [...$('videoMenu').children];
+        const items = [...$('videoOptions').children];
         const current = items.indexOf(document.activeElement);
         const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 :
           (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
@@ -1002,6 +1071,11 @@ import { t, setText, number, errorKey } from './i18n.js';
     for (const event of ['resize', 'scroll']) window.addEventListener(event, positionVideoMenu, true);
 
     let openPlayerMenu = null;
+    const playerMenuResizeObserver = new ResizeObserver(positionPlayerMenu);
+    function positionPlayerMenu() {
+      if (openPlayerMenu) positionSettingsMenu($(openPlayerMenu + 'Menu'), $(openPlayerMenu + 'MenuButton'));
+    }
+    for (const event of ['resize', 'scroll']) window.addEventListener(event, positionPlayerMenu, true);
     function closePlayerMenu(restoreFocus = false) {
       if (!openPlayerMenu) return;
       const button = $(openPlayerMenu + 'MenuButton');
@@ -1010,6 +1084,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       popup.hidden = true;
       button.setAttribute('aria-expanded', 'false');
       openPlayerMenu = null;
+      playerMenuResizeObserver.disconnect();
       if (restoreFocus || focusInside) button.focus();
     }
     for (const name of ['audio', 'subtitles']) {
@@ -1022,24 +1097,41 @@ import { t, setText, number, errorKey } from './i18n.js';
         openPlayerMenu = name;
         $(name + 'Menu').hidden = false;
         $(name + 'MenuButton').setAttribute('aria-expanded', 'true');
-        $(name + 'Menu').querySelector('select').focus();
+        const popup = $(name + 'Menu');
+        positionPlayerMenu();
+        playerMenuResizeObserver.observe(popup);
+        const selected = popup.querySelector('[aria-checked="true"]:not(:disabled)') || popup.querySelector('[data-close-menu]');
+        selected.focus({ preventScroll: true });
+        selected.scrollIntoView({ block: 'nearest' });
       };
     }
     document.addEventListener('click', event => {
-      if (!event.target.closest('.player-setting')) closePlayerMenu(document.activeElement === document.body);
+      if (openPlayerMenu && !$(openPlayerMenu + 'Menu').contains(event.target) && !$(openPlayerMenu + 'MenuButton').contains(event.target)) closePlayerMenu(document.activeElement === document.body);
     });
     document.addEventListener('keydown', event => {
-      if (event.key === 'Escape' && openPlayerMenu) {
+      if (!openPlayerMenu) return;
+      if (event.key === 'Escape') {
         event.preventDefault();
         closePlayerMenu(true);
+      } else if (['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key) && event.target.closest('.track-options')) {
+        event.preventDefault();
+        const items = [...$(openPlayerMenu + 'Menu').querySelectorAll('[role="menuitemradio"]:not(:disabled)')];
+        const current = items.indexOf(document.activeElement);
+        const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 :
+          (current + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+        items[next]?.focus();
       }
     });
     document.addEventListener('focusin', event => {
-      if (!event.target.closest('.player-setting')) closePlayerMenu();
+      if (openPlayerMenu && !$(openPlayerMenu + 'Menu').contains(event.target) && !$(openPlayerMenu + 'MenuButton').contains(event.target)) closePlayerMenu();
+    });
+    document.querySelectorAll('[data-close-menu]').forEach(button => {
+      button.onclick = () => button.closest('#videoMenu') ? closeVideoMenu(true) : closePlayerMenu(true);
     });
     function updateSelectedFile() {
       const index = videoFiles.findIndex(file => file.index === selectedVideoIndex);
       const file = videoFiles[index];
+      $('playerTitle').textContent = downloadTitle(findDownload(activeDownloadID));
       $('selectedFile').textContent = file?.name || '';
       $('selectedFile').title = file?.name || '';
       $('videoMenuButton').hidden = videoFiles.length <= 1;
@@ -1079,7 +1171,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       }
     }
     function updateSubtitleDelay() {
-      $('subtitleDelayRow').style.display = Number($('subtitleSelect').value) >= 0 ? '' : 'none';
+      $('subtitleDelayRow').style.display = Number(selectedTrack('subtitleTracks')) >= 0 ? '' : 'none';
     }
     function resetTracks() {
       closePlayerMenu();
@@ -1087,22 +1179,24 @@ import { t, setText, number, errorKey } from './i18n.js';
       tracksReady = false;
       wantsPlayback = false;
       retryTime = 0;
-      setText($('play'), 'player.play');
-      $('play').hidden = false;
-      setOptions($('audioSelect'), [{ value: 0, label: () => t('player.default') }]);
-      setOptions($('subtitleSelect'), [{ value: -1, label: () => t('player.none') }]);
-      $('audioSelect').disabled = true;
-      $('subtitleSelect').disabled = true;
+      clearPlaybackError();
+      setOptions($('audioTracks'), [{ value: 0, label: () => t('player.default') }]);
+      setOptions($('subtitleTracks'), [{ value: -1, label: () => t('player.none'), summary: () => t('player.off') }]);
+      updateTrackLabels();
       updateSubtitleDelay();
     }
-    function formatTrackLabel(track, type) {
+    function trackLanguage(track) {
       // Media containers commonly use ISO 639-2 bibliographic codes.
       const aliases = { eng: 'en', rus: 'ru', zho: 'zh', chi: 'zh', jpn: 'ja', kor: 'ko', fra: 'fr', fre: 'fr', deu: 'de', ger: 'de', spa: 'es', ita: 'it', por: 'pt', ukr: 'uk' };
       let language = track.language;
       if (language && language !== 'und') {
         try { language = new Intl.DisplayNames([document.documentElement.lang], { type: 'language' }).of(aliases[language.toLowerCase()] || language); } catch {}
       } else language = '';
-      let label = language || t(type === 'audio' ? 'player.track' : 'player.subtitle', { index: track.index + 1 });
+      return language;
+    }
+    function formatTrackLabel(track, type) {
+      const language = trackLanguage(track);
+      let label = language ? `${number(track.index + 1)} · ${language}` : t(type === 'audio' ? 'player.track' : 'player.subtitle', { index: track.index + 1 });
       if (track.title) label += ` — ${track.title}`;
       if (track.codec) label += ` (${track.codec})`;
       return label;
@@ -1124,13 +1218,12 @@ import { t, setText, number, errorKey } from './i18n.js';
         if (!res.ok) throw await responseError(res, 'errors.mediaInfo');
         const info = await res.json();
         if (isStale(request.id)) return;
-        setOptions($('audioSelect'), info.audioTracks?.length ? info.audioTracks.map(track => ({ value: track.index, label: () => formatTrackLabel(track, 'audio') })) : [{ value: 0, label: () => t('player.default') }]);
-        const preferred = preferredAudioIndex(activeDownloadID);
-        if (info.audioTracks?.some(track => track.index === preferred)) $('audioSelect').value = String(preferred);
-        setOptions($('subtitleSelect'), [{ value: -1, label: () => t('player.none') }, ...(info.subtitles || []).map(track => ({ value: track.index, label: () => formatTrackLabel(track, 'subtitle') }))]);
         tracksReady = true;
-        $('audioSelect').disabled = false;
-        $('subtitleSelect').disabled = false;
+        setOptions($('audioTracks'), info.audioTracks?.length ? info.audioTracks.map(track => ({ value: track.index, label: () => formatTrackLabel(track, 'audio'), summary: () => trackLanguage(track) || track.title || number(track.index + 1) })) : [{ value: 0, label: () => t('player.default') }]);
+        const preferred = preferredAudioIndex(activeDownloadID);
+        if (info.audioTracks?.some(track => track.index === preferred)) selectTrack('audioTracks', preferred);
+        setOptions($('subtitleTracks'), [{ value: -1, label: () => t('player.none'), summary: () => t('player.off') }, ...(info.subtitles || []).map(track => ({ value: track.index, label: () => formatTrackLabel(track, 'subtitle'), summary: () => trackLanguage(track) || track.title || number(track.index + 1) }))]);
+        updateTrackLabels();
         updateSubtitleDelay();
         showMsg('fileMsg', '');
         removeWarning();
@@ -1176,8 +1269,8 @@ import { t, setText, number, errorKey } from './i18n.js';
     async function startPlayback(resumeTime) {
       const magnet = activeMagnet;
       const idx = selectedVideoIndex;
-      const audio = $('audioSelect').value || '0';
-      const subtitle = $('subtitleSelect').value || '-1';
+      const audio = selectedTrack('audioTracks') || '0';
+      const subtitle = selectedTrack('subtitleTracks') || '-1';
       const subtitleSelected = parseInt(subtitle, 10) >= 0;
       if (!magnet || idx === null) {
         showMsg('trackMsg', 'player.selectFile', true);
@@ -1232,17 +1325,23 @@ import { t, setText, number, errorKey } from './i18n.js';
     }
 
     $('play').onclick = launchPlayback;
-    ['audioSelect', 'subtitleSelect'].forEach(id => {
-      $(id).addEventListener('change', () => {
-        if (id === 'audioSelect' && activeDownloadID && tracksReady) {
-          const index = Number($('audioSelect').value);
+    ['audioTracks', 'subtitleTracks'].forEach(id => {
+      $(id).addEventListener('click', event => {
+        const option = event.target.closest('[data-value]');
+        if (!option || option.disabled || !tracksReady) return;
+        const changed = option.dataset.value !== selectedTrack(id);
+        selectTrack(id, option.dataset.value);
+        updateTrackLabels();
+        closePlayerMenu(true);
+        if (id === 'audioTracks' && activeDownloadID && tracksReady) {
+          const index = Number(selectedTrack('audioTracks'));
           if (Number.isSafeInteger(index) && index >= 0) {
             audioPreferences.set(activeDownloadID, index);
             try { localStorage.setItem(`cinemator-audio:${activeDownloadID}`, String(index)); } catch {}
           }
         }
         updateSubtitleDelay();
-        if (wantsPlayback && tracksReady) startPlayback($('video').readyState > 0 ? $('video').currentTime : retryTime);
+        if (changed && wantsPlayback) startPlayback($('video').readyState > 0 ? $('video').currentTime : retryTime);
       });
     });
 
@@ -1320,7 +1419,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         if (!current()) return;
         $('play').hidden = true;
         lastStreamActivityAt = Date.now();
-        showMsg('playerMsg', '');
+        clearPlaybackError();
         hideWarningOnce();
       }
       if (typeof Hls !== 'undefined' && Hls.isSupported()) {
@@ -1380,7 +1479,7 @@ import { t, setText, number, errorKey } from './i18n.js';
         }, { once: true });
       } else {
         removeWarning();
-        showMsg('playerMsg', 'player.hlsUnsupported', true);
+        showError('playerMsg', new Error('player.hlsUnsupported'), 'player.hlsUnsupported');
       }
     }
 
@@ -1409,9 +1508,10 @@ import { t, setText, number, errorKey } from './i18n.js';
       renderDownloads(downloadCatalog);
       renderPreparationProgress();
       updateDelayDisplay();
-      for (const option of document.querySelectorAll('select option')) {
+      for (const option of document.querySelectorAll('.track-label')) {
         const label = optionLabels.get(option);
         if (label) option.textContent = label();
       }
       updateSelectedFile();
+      updateTrackLabels();
     });

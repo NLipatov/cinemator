@@ -169,6 +169,21 @@ test('ten preview frames cycle automatically and respect reduced motion',async({
   seen.push(await frameOffset());
  }
  expect(new Set(seen).size).toBe(10);
+ // The clipped window must line up with exactly one sprite cell, even when
+ // the card width is fractional. Rounding the offset alone can hide two frames.
+ for(const width of [320,390,1280]){
+  await page.setViewportSize({width,height:900});
+  for(let step=0;step<10;step++){
+   await image.evaluate((img,time)=>{img.getAnimations()[0].currentTime=time;},step*2000+100);
+   const geometry=await image.evaluate(img=>{
+    const strip=img.getBoundingClientRect(),tile=img.parentElement.getBoundingClientRect();
+    return {ratio:strip.width/tile.width,offset:(tile.left-strip.left)/tile.width,clipping:getComputedStyle(img.parentElement).overflow};
+   });
+   expect(geometry.ratio).toBeCloseTo(10,3);
+   expect(geometry.offset).toBeCloseTo((step+5)%10,3);
+   expect(geometry.clipping).toBe('hidden');
+  }
+ }
  await page.emulateMedia({reducedMotion:'reduce'});
  expect(await image.evaluate(img=>img.getAnimations().length)).toBe(0);
  expect(await frameOffset()).toBe(5);
@@ -210,4 +225,44 @@ test.describe('touch previews',()=>{
   await expect.poll(()=>page.locator('#video').evaluate(video=>video.duration)).toBe(120);
   expect(await row.locator('.download-preview').evaluate(img=>img.getAnimations().length)).toBe(1);
  });
+});
+
+test('preview rotation pauses throughout viewing and resumes when returning to the library', async ({page}) => {
+ const row=await openPlayer(page);
+ await page.route('**/api/hls/*/thumbnail-v3.jpg*',r=>r.fulfill({contentType:'image/svg+xml',body:preview}));
+ await page.reload();
+ const image=row.locator('.download-preview');
+ await expect(image).toHaveClass(/loaded/);
+ await expect(image).toHaveCSS('animation-play-state','running');
+ await row.locator('.download-open').click();
+ await expect(image).toHaveCSS('animation-play-state','paused');
+ await page.locator('#video').evaluate(v=>v.pause());
+ await expect(image).toHaveCSS('animation-play-state','paused');
+ await page.locator('#previousVideo').click();
+ await expect(image).toHaveCSS('animation-play-state','paused');
+ await page.locator('#closePlayer').click();
+ await expect(image).toHaveCSS('animation-play-state','running');
+});
+
+test('a large library keeps its order and nearby focus when a card is deleted', async ({page}) => {
+ await page.setViewportSize({width:1280,height:900});
+ await openPlayer(page);
+ let downloads=Array.from({length:30},(_,i)=>({id:`item-${i}`,title:`Video ${i+1}`,magnet:`magnet:item-${i}`,status:'ready',files:[{index:0,name:'01.mp4',size:1024}]}));
+ await page.route(/\/api\/downloads(?:\?|$)/,r=>r.fulfill({json:downloads}));
+ await page.route('**/api/downloads/item-20',r=>{
+  expect(r.request().method()).toBe('DELETE');
+  downloads=downloads.filter(d=>d.id!=='item-20');
+  return r.fulfill({status:204});
+ });
+ await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+ await expect(page.locator('.download-row')).toHaveCount(30);
+ const row=page.locator('.download-row[data-id="item-20"]');
+ await row.locator('.download-more').click();
+ const scroll=await page.evaluate(()=>scrollY);
+ page.once('dialog',d=>d.accept());
+ await row.locator('[data-action="delete"]').click();
+ await expect(page.locator('.download-row')).toHaveCount(29);
+ await expect(page.locator('.download-row[data-id="item-21"] .download-open')).toBeFocused();
+ expect(Math.abs(await page.evaluate(()=>scrollY)-scroll)).toBeLessThan(1);
+ expect(await page.locator('.download-row').evaluateAll(rows=>rows.map(r=>r.dataset.id))).toEqual(downloads.map(d=>d.id));
 });
