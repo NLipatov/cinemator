@@ -699,6 +699,7 @@ button:disabled {
 }
 
 .downloads-panel {
+  container-type: inline-size;
   grid-area: downloads;
   width: 100%;
   display: grid;
@@ -778,17 +779,15 @@ button:disabled {
 }
 
 .downloads-list {
-  container-type: inline-size;
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-auto-rows: 1fr;
   gap: 1.75rem 1.5rem;
-  align-items: start;
 }
 
 .download-row {
   row-gap: 1rem;
-  flex: 0 1 100%;
+  grid-column: span 2;
   position: relative;
   min-width: 0;
   padding: clamp(0.5rem, 4vw, 1rem);
@@ -798,15 +797,20 @@ button:disabled {
   display: grid;
   grid-template-columns: minmax(0, 1fr) var(--icon-control-size);
   grid-template-rows: auto auto;
+  align-content: start;
   align-items: start;
 }
 
-@container (min-width: 37.5rem) {
-  .download-row { flex-basis: calc((100% - 1.5rem) / 2); }
+/* Half-card columns keep incomplete rows centered without changing card widths. */
+@container (37.5rem <= width < 57rem) {
+  .downloads-list { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .download-row:last-child:nth-child(odd) { grid-column: 2 / span 2; }
 }
 
 @container (min-width: 57rem) {
-  .download-row { flex-basis: calc((100% - 3rem) / 3); }
+  .downloads-list { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .download-row:last-child:nth-child(3n + 1) { grid-column: 3 / span 2; }
+  .download-row:nth-last-child(2):nth-child(3n + 1) { grid-column: 2 / span 2; }
 }
 
 .download-open {
@@ -1068,7 +1072,7 @@ button:disabled {
 .download-row[data-status=failed] .download-card-status,
 .download-row > .error-details { color: var(--color-error); }
 .downloads-empty {
-  flex: 0 1 100%;
+  grid-column: 1 / -1;
   padding: 2.5rem 1.25rem;
   color: var(--color-muted);
   font-size: 0.85rem;

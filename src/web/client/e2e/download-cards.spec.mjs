@@ -266,3 +266,38 @@ test('a large library keeps its order and nearby focus when a card is deleted', 
  expect(Math.abs(await page.evaluate(()=>scrollY)-scroll)).toBeLessThan(1);
  expect(await page.locator('.download-row').evaluateAll(rows=>rows.map(r=>r.dataset.id))).toEqual(downloads.map(d=>d.id));
 });
+
+test('mixed download cards stay equal in height and incomplete rows remain centered', async ({page}) => {
+ await openPlayer(page, {language:'ru'});
+ const files=[{index:4,name:'01.mp4',size:512},{index:5,name:'02.mp4',size:512}];
+ let downloads=Array.from({length:7},(_,i)=>({
+  id:`card-${i}`,title:i===3?'Видео с длинным названием, которое занимает несколько строк':'Видео',
+  magnet:`magnet:card-${i}`,status:i===1?'downloading':i===2?'failed':'ready',
+  files:i%2?files:[files[0]],expiresAt:i%2?'2099-01-01T00:00:00Z':undefined,
+ }));
+ await page.route(/\/api\/downloads(?:\?|$)/,r=>r.fulfill({json:downloads}));
+ for(let count=7;count>0;count--){
+  downloads=downloads.slice(0,count);
+  await page.evaluate(()=>window.dispatchEvent(new Event('focus')));
+  const cards=page.locator('.download-row');
+  await expect(cards).toHaveCount(count);
+  for(const width of [390,768,1280]){
+   await page.setViewportSize({width,height:900});
+   const bounds=await cards.evaluateAll(rows=>rows.map(row=>{
+    const {x,y,width,height}=row.getBoundingClientRect();return {x,y,width,height};
+   }));
+   for(const card of bounds){
+    expect(Math.abs(card.height-bounds[0].height)).toBeLessThan(1);
+    expect(Math.abs(card.width-bounds[0].width)).toBeLessThan(1);
+   }
+   const expectedColumns=width===1280?3:width===768?2:1;
+   const firstRow=bounds.filter(b=>Math.abs(b.y-bounds[0].y)<1);
+   expect(firstRow).toHaveLength(Math.min(count,expectedColumns));
+   const lastRow=bounds.filter(b=>Math.abs(b.y-bounds.at(-1).y)<1);
+   const list=await page.locator('.downloads-list').boundingBox();
+   const center=(lastRow[0].x+lastRow.at(-1).x+lastRow.at(-1).width)/2;
+   expect(Math.abs(center-(list.x+list.width/2))).toBeLessThan(1);
+   expect(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);
+  }
+ }
+});

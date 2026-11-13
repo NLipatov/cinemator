@@ -293,14 +293,15 @@ for (const width of [390, 1280]) {
 }
 
 for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
-  test(`${language}: preview stays anchored with optional episodes and saved progress`, async ({ page }) => {
+  test(`${language}: cards have equal heights and anchored previews with optional videos and saved progress`, async ({ page }) => {
     await openPlayer(page, {language});
     const files = [
       {index: 2, name: 'Series — 01.mkv', size: 512},
       {index: 4, name: 'Series — 02.mkv', size: 512},
     ];
     const downloads = ['single', 'series', 'single-saved', 'series-saved'].map(id => ({
-      id, title: 'A collection', magnet: `magnet:${id}`, status: 'ready', size: 1024,
+      id, title: id === 'single-saved' ? 'A collection with a longer title that wraps across several lines' : 'A collection',
+      magnet: `magnet:${id}`, status: 'ready', size: 1024,
       selectedFileIndex: 4, expiresAt: '2099-01-01T00:00:00Z',
       files: id.startsWith('series') ? files : [files[1]],
     }));
@@ -319,10 +320,10 @@ for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
         const positions = await page.locator('.download-row').evaluateAll(rows => rows.map(row => {
           const card = row.getBoundingClientRect();
           const play = row.querySelector('.download-thumbnail').getBoundingClientRect();
-          return {left: play.left-card.left, right: card.right-play.right, top: play.top-card.top, width: play.width};
+          return {left: play.left-card.left, right: card.right-play.right, top: play.top-card.top, width: play.width, height: card.height};
         }));
         for (const position of positions) {
-          for (const key of ['left', 'right', 'top', 'width']) {
+          for (const key of ['left', 'right', 'top', 'width', 'height']) {
             expect(Math.abs(position[key]-positions[0][key]), `${width}px / ${fontSize}px / ${key}`).toBeLessThanOrEqual(1);
           }
         }
