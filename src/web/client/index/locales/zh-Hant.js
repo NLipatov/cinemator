@@ -1,7 +1,10 @@
 export default {
   'common.application': '應用程式',
   'common.language': '語言',
-  'common.theme': '切換主題',
+  'common.theme': '主題',
+  'theme.system': '跟隨系統',
+  'theme.light': '淺色',
+  'theme.dark': '深色',
   'common.loading': '載入中…',
   'common.details': '詳細資訊',
   'common.close': '關閉',

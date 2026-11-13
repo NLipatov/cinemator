@@ -248,6 +248,13 @@ for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
       for (const width of [320, 390, 1280]) {
         await page.setViewportSize({width, height: 1000});
         expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+        for (const row of await page.locator('.download-row').all()) {
+          const preview = await row.locator('.download-thumbnail').boundingBox();
+          const more = await row.locator('.download-more').boundingBox();
+          const title = await row.locator('.download-title').boundingBox();
+          expect(more.y - preview.y - preview.height).toBeGreaterThanOrEqual(fontSize - 1);
+          expect(Math.abs(more.y - title.y)).toBeLessThan(1);
+        }
         for (const control of await page.locator('.download-open, .download-more').all()) {
           const box = await control.boundingBox();
           expect(box.width).toBeGreaterThan(40);

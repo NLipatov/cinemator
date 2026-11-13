@@ -1,7 +1,10 @@
 export default {
   'common.application': 'Приложение',
   'common.language': 'Язык',
-  'common.theme': 'Сменить тему',
+  'common.theme': 'Тема',
+  'theme.system': 'Как в системе',
+  'theme.light': 'Светлая',
+  'theme.dark': 'Тёмная',
   'common.loading': 'Загрузка…',
   'common.details': 'Подробности',
   'common.close': 'Закрыть',

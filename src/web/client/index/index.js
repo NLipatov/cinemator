@@ -472,9 +472,11 @@ import { t, setText, number, errorKey } from './i18n.js';
       const popup = menu.querySelector('.download-options');
       const anchor = menu.querySelector('.download-more').getBoundingClientRect();
       const box = popup.getBoundingClientRect();
-      popup.style.setProperty('--menu-left', `${Math.max(8, anchor.right - box.width)}px`);
-      popup.style.setProperty('--menu-top', `${anchor.bottom + box.height + 8 <= innerHeight ? anchor.bottom + 4 : anchor.top - box.height - 4}px`);
-      popup.style.setProperty('--menu-height', `${box.height}px`);
+      const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+      const gap = 0.5 * rem;
+      popup.style.setProperty('--menu-left', `${Math.max(gap, anchor.right - box.width) / rem}rem`);
+      popup.style.setProperty('--menu-top', `${(anchor.bottom + box.height + gap <= innerHeight ? anchor.bottom + gap / 2 : anchor.top - box.height - gap / 2) / rem}rem`);
+      popup.style.setProperty('--menu-height', `${box.height / rem}rem`);
     }
 
     function openDownloadMenu(menu) {
@@ -975,12 +977,14 @@ import { t, setText, number, errorKey } from './i18n.js';
     function positionSettingsMenu(popup, trigger) {
       const anchor = trigger.getBoundingClientRect();
       const box = popup.getBoundingClientRect();
+      const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
+      const gap = 0.5 * rem;
       const bottom = $('playerWorkspace').contains(trigger) ?
-        Math.min(anchor.top - 8, $('video').getBoundingClientRect().bottom) : anchor.top - 8;
+        Math.min(anchor.top - gap, $('video').getBoundingClientRect().bottom) : anchor.top - gap;
       const above = bottom - box.height;
-      const top = above >= 8 ? above : anchor.bottom + 8;
-      popup.style.left = `${Math.max(8, Math.min(anchor.right - box.width, innerWidth - box.width - 8))}px`;
-      popup.style.top = `${Math.max(8, Math.min(top, innerHeight - box.height - 8))}px`;
+      const top = above >= gap ? above : anchor.bottom + gap;
+      popup.style.left = `${Math.max(gap, Math.min(anchor.right - box.width, innerWidth - box.width - gap)) / rem}rem`;
+      popup.style.top = `${Math.max(gap, Math.min(top, innerHeight - box.height - gap)) / rem}rem`;
     }
     function renderVideoMenu() {
       if (!videoMenuState) return;
