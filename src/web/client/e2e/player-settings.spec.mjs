@@ -243,6 +243,12 @@ test('adding a magnet while watching keeps the player and its position', async (
 for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
   test(`${language}: card previews and actions fit narrow and enlarged layouts`, async ({ page }) => {
     await openPlayer(page, {language});
+    await page.route(/\/api\/downloads(?:\?|$)/, route => route.fulfill({json: [
+      {id: 'minutes', title: 'Soon', status: 'ready', expiresAt: new Date(Date.now() + 10 * 60000).toISOString()},
+      {id: 'ended', title: 'Expired', status: 'ready', expiresAt: '2020-01-01T00:00:00Z'},
+    ]}));
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect(page.locator('.download-row[data-id="minutes"]')).toBeVisible();
     for (const fontSize of [16, 32]) {
       await page.evaluate(size => { document.documentElement.style.fontSize = `${size}px`; }, fontSize);
       for (const width of [320, 390, 1280]) {
@@ -251,9 +257,19 @@ for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
         for (const row of await page.locator('.download-row').all()) {
           const preview = await row.locator('.download-thumbnail').boundingBox();
           const more = await row.locator('.download-more').boundingBox();
+          const storage = await row.locator('.download-storage-button').boundingBox();
           const title = await row.locator('.download-title').boundingBox();
-          expect(more.y - preview.y - preview.height).toBeGreaterThanOrEqual(fontSize - 1);
-          expect(Math.abs(more.y - title.y)).toBeLessThan(1);
+          const topInset = more.y - preview.y;
+          const rightInset = preview.x + preview.width - more.x - more.width;
+          expect(topInset).toBeGreaterThan(0);
+          expect(Math.abs(topInset - rightInset)).toBeLessThan(1);
+          expect(Math.abs(title.x - preview.x - rightInset)).toBeLessThan(1);
+          expect(more.y + more.height).toBeLessThanOrEqual(preview.y + preview.height);
+          expect(Math.abs(storage.x - preview.x - rightInset)).toBeLessThan(1);
+          expect(Math.abs(storage.y - more.y)).toBeLessThan(1);
+          expect(storage.x + storage.width).toBeLessThan(more.x);
+          expect(storage.height).toBeGreaterThanOrEqual(44);
+          expect(await row.locator('.download-storage-button').evaluate(button => button.scrollWidth <= button.clientWidth)).toBe(true);
         }
         for (const control of await page.locator('.download-open, .download-more').all()) {
           const box = await control.boundingBox();
@@ -293,14 +309,15 @@ for (const width of [390, 1280]) {
 }
 
 for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
-  test(`${language}: preview stays anchored with optional episodes and saved progress`, async ({ page }) => {
+  test(`${language}: cards have equal heights and anchored previews with optional videos and saved progress`, async ({ page }) => {
     await openPlayer(page, {language});
     const files = [
       {index: 2, name: 'Series — 01.mkv', size: 512},
       {index: 4, name: 'Series — 02.mkv', size: 512},
     ];
     const downloads = ['single', 'series', 'single-saved', 'series-saved'].map(id => ({
-      id, title: 'A collection', magnet: `magnet:${id}`, status: 'ready', size: 1024,
+      id, title: id === 'single-saved' ? 'A collection with a longer title that wraps across several lines' : 'A collection',
+      magnet: `magnet:${id}`, status: 'ready', size: 1024,
       selectedFileIndex: 4, expiresAt: '2099-01-01T00:00:00Z',
       files: id.startsWith('series') ? files : [files[1]],
     }));
@@ -319,10 +336,10 @@ for (const language of ['en', 'ru', 'zh-Hans', 'zh-Hant']) {
         const positions = await page.locator('.download-row').evaluateAll(rows => rows.map(row => {
           const card = row.getBoundingClientRect();
           const play = row.querySelector('.download-thumbnail').getBoundingClientRect();
-          return {left: play.left-card.left, right: card.right-play.right, top: play.top-card.top, width: play.width};
+          return {left: play.left-card.left, right: card.right-play.right, top: play.top-card.top, width: play.width, height: card.height};
         }));
         for (const position of positions) {
-          for (const key of ['left', 'right', 'top', 'width']) {
+          for (const key of ['left', 'right', 'top', 'width', 'height']) {
             expect(Math.abs(position[key]-positions[0][key]), `${width}px / ${fontSize}px / ${key}`).toBeLessThanOrEqual(1);
           }
         }

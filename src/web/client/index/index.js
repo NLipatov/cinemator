@@ -319,6 +319,17 @@ import { t, setText, number, errorKey } from './i18n.js';
       return `${formatBytes(diskSize)} / ${formatBytes(download.size)}`;
     }
 
+    function compactExpiry(value) {
+      const expires = new Date(value);
+      if (!Number.isFinite(expires.getTime()) || expires.getUTCFullYear() <= 1) return '∞';
+      const remaining = expires.getTime() - Date.now();
+      if (remaining <= 0) return t('downloads.shortExpired');
+      const minutes = Math.max(1, Math.round(remaining / 60000));
+      const units = [['year', 525600], ['month', 43200], ['week', 10080], ['day', 1440], ['hour', 60], ['minute', 1]];
+      const [unit, size] = units.find(([, size]) => minutes >= size);
+      return t('downloads.short.' + unit, {count: Math.floor(minutes / size)}).replaceAll(' ', '\u00a0');
+    }
+
     function formatDownloadState(download) {
       if (download.status === 'ready') return formatExpiry(download.expiresAt);
       if (download.status === 'preparing') return t('downloads.preparing');
@@ -456,13 +467,17 @@ import { t, setText, number, errorKey } from './i18n.js';
       $('preparationVideo').textContent = matches && !progressUnavailable ? preparedVideo(progress) : '';
     }
 
+    function downloadMenuToggle(menu) {
+      return menu.querySelector(menu.dataset.kind === 'storage' ? '.download-storage-button' : '.download-more');
+    }
+
     function closeDownloadMenus(restoreFocus = false) {
       const menu = document.querySelector('.download-menu.open');
       if (!menu) return;
       downloadMenuResizeObserver.disconnect();
       menu.classList.remove('open');
       menu.querySelector('.download-options').hidden = true;
-      const toggle = menu.querySelector('.download-more');
+      const toggle = downloadMenuToggle(menu);
       toggle.setAttribute('aria-expanded', 'false');
       openDownloadMenuID = null;
       if (restoreFocus) toggle.focus({ preventScroll: true });
@@ -470,11 +485,12 @@ import { t, setText, number, errorKey } from './i18n.js';
 
     function positionDownloadMenu(menu) {
       const popup = menu.querySelector('.download-options');
-      const anchor = menu.querySelector('.download-more').getBoundingClientRect();
+      const anchor = downloadMenuToggle(menu).getBoundingClientRect();
       const box = popup.getBoundingClientRect();
       const rem = parseFloat(getComputedStyle(document.documentElement).fontSize);
       const gap = 0.5 * rem;
-      popup.style.setProperty('--menu-left', `${Math.max(gap, anchor.right - box.width) / rem}rem`);
+      const left = menu.dataset.kind === 'storage' ? anchor.left : anchor.right - box.width;
+      popup.style.setProperty('--menu-left', `${Math.max(gap, Math.min(left, innerWidth - box.width - gap)) / rem}rem`);
       popup.style.setProperty('--menu-top', `${(anchor.bottom + box.height + gap <= innerHeight ? anchor.bottom + gap / 2 : anchor.top - box.height - gap / 2) / rem}rem`);
       popup.style.setProperty('--menu-height', `${box.height / rem}rem`);
     }
@@ -482,8 +498,9 @@ import { t, setText, number, errorKey } from './i18n.js';
     function openDownloadMenu(menu) {
       menu.querySelector('.download-options').hidden = false;
       menu.classList.add('open');
-      const toggle = menu.querySelector('.download-more');
+      const toggle = downloadMenuToggle(menu);
       toggle.setAttribute('aria-expanded', 'true');
+      menu.querySelector('.download-options').setAttribute('aria-label', t(menu.dataset.kind === 'storage' ? 'downloads.storage' : 'downloads.actions'));
       openDownloadMenuID = toggle.dataset.id;
       positionDownloadMenu(menu);
       downloadMenuResizeObserver.observe(menu.querySelector('.download-options'));
@@ -493,9 +510,11 @@ import { t, setText, number, errorKey } from './i18n.js';
       closeVideoMenu();
       closePlayerMenu();
       const menu = toggle.closest('.download-menu');
-      const willOpen = !menu.classList.contains('open');
+      const kind = toggle.dataset.action === 'toggle-storage' ? 'storage' : 'actions';
+      const willOpen = !menu.classList.contains('open') || menu.dataset.kind !== kind;
       closeDownloadMenus();
       if (willOpen) {
+        menu.dataset.kind = kind;
         openDownloadMenu(menu);
         [...menu.querySelectorAll('[role="menuitem"]')].find(item => item.getClientRects().length)?.focus({ preventScroll: true });
       }
@@ -566,10 +585,19 @@ import { t, setText, number, errorKey } from './i18n.js';
         row.querySelector('.download-title').textContent = title;
         const expiry = row.querySelector('.download-expiry');
         const expiresAt = new Date(download.expiresAt);
-        expiry.hidden = download.status !== 'ready' && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getUTCFullYear() <= 1);
+        const hasExpiry = Number.isFinite(expiresAt.getTime()) && expiresAt.getUTCFullYear() > 1;
+        const storage = row.querySelector('.download-storage-button');
+        storage.hidden = download.status !== 'ready' && !hasExpiry;
+        storage.setAttribute('aria-label', `${t('downloads.storage')}: ${formatExpiry(download.expiresAt)} · ${title}`);
+        storage.querySelector('.download-storage-label').textContent = compactExpiry(download.expiresAt);
         expiry.textContent = formatExpiry(download.expiresAt);
         expiry.id = `download-expiry-${download.id}`;
-        if (expiry.hidden) row.querySelector('.download-open').removeAttribute('aria-describedby');
+        const expiryDate = row.querySelector('.download-expiry-date');
+        expiryDate.hidden = !hasExpiry;
+        expiryDate.textContent = hasExpiry ? new Intl.DateTimeFormat(document.documentElement.lang, {dateStyle: 'long', timeStyle: 'short'}).format(expiresAt) : '';
+        if (hasExpiry) expiryDate.dateTime = expiresAt.toISOString();
+        else expiryDate.removeAttribute('datetime');
+        if (storage.hidden) row.querySelector('.download-open').removeAttribute('aria-describedby');
         else row.querySelector('.download-open').setAttribute('aria-describedby', expiry.id);
         const videosButton = row.querySelector('.download-videos');
         videosButton.hidden = files.length <= 1;
@@ -613,12 +641,17 @@ import { t, setText, number, errorKey } from './i18n.js';
         status.textContent = progressAtPlayer ? t('downloads.preparing') : download.progress ?
           `${preparationStage(download.progress)} · ${preparedVideo(download.progress)}` : formatDownloadState(download);
         const menu = row.querySelector('.download-menu');
+        menu.querySelector('.download-options').id = `download-options-${download.id}`;
+        for (const trigger of menu.querySelectorAll(':scope > button')) {
+          trigger.setAttribute('aria-controls', `download-options-${download.id}`);
+          trigger.setAttribute('aria-expanded', 'false');
+        }
         menu.querySelector('.download-extend-group').hidden = download.status !== 'ready';
         menu.querySelectorAll('[role="menuitem"]').forEach(item => { item.tabIndex = -1; });
         const toggle = menu.querySelector('.download-more');
         toggle.setAttribute('aria-label', `${t('downloads.actions')} · ${title}`);
         toggle.removeAttribute('data-i18n-aria-label');
-        if (download.id === restoreMenuID) {
+        if (download.id === restoreMenuID && !(menu.dataset.kind === 'storage' && storage.hidden)) {
           openDownloadMenu(menu);
         } else {
           menu.classList.remove('open');
@@ -630,7 +663,10 @@ import { t, setText, number, errorKey } from './i18n.js';
       for (const row of rows.values()) row.remove();
       const openMenu = list.querySelector('.download-menu.open');
       if (openMenu) positionDownloadMenu(openMenu);
-      if (focused?.isConnected && document.activeElement !== focused) focused.focus({ preventScroll: true });
+      if (focused?.isConnected && document.activeElement !== focused) {
+        const target = focused.getClientRects().length ? focused : focused.closest('.download-row')?.querySelector('.download-storage-button:not([hidden]), .download-more');
+        target?.focus({ preventScroll: true });
+      }
       if (videoMenuState) renderVideoMenu();
     }
 
@@ -839,7 +875,7 @@ import { t, setText, number, errorKey } from './i18n.js';
       if (!button) return;
       const { action, id } = button.dataset;
       if (action === 'choose-video') return toggleVideoMenu(button, id);
-      if (action === 'toggle-menu') return toggleDownloadMenu(button);
+      if (action === 'toggle-menu' || action === 'toggle-storage') return toggleDownloadMenu(button);
       const download = findDownload(id);
       if (action === 'open' || action === 'restart') {
         savePlaybackPosition?.();

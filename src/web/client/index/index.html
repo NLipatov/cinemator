@@ -180,17 +180,24 @@
         </span>
         <span class="download-caption">
           <span class="download-title"></span>
-          <span class="download-expiry"></span>
           <span class="download-current" data-i18n="downloads.nowPlaying" hidden>Now playing</span>
         </span>
       </button>
       <button type="button" class="download-videos" data-action="choose-video" aria-haspopup="menu" aria-expanded="false" aria-controls="videoMenu" hidden></button>
-      <div class="download-menu">
+      <div class="download-menu" data-kind="actions">
+        <button type="button" class="download-storage-button" data-action="toggle-storage" aria-haspopup="menu" aria-expanded="false" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="3.5" y="5.5" width="17" height="15" rx="2.5"/><path d="M7.5 3v5M16.5 3v5M3.5 10.5h17"/></svg>
+          <span class="download-storage-label"></span>
+        </button>
         <button type="button" class="download-more" data-action="toggle-menu"
           aria-label="Download actions" data-i18n-aria-label="downloads.actions" aria-haspopup="menu" aria-expanded="false">
           <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg>
         </button>
         <div class="download-options" role="menu" hidden>
+          <div class="download-storage-summary">
+            <strong class="download-expiry"></strong>
+            <time class="download-expiry-date"></time>
+          </div>
           <div class="download-meta">
             <span class="download-size"></span>
             <span class="download-meta-text"></span>
