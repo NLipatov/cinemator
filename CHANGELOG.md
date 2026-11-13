@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/NLipatov/cinemator/compare/0.16.0...0.17.0) (2026-11-13)
+
+
+### Features
+
+* **ui:** add system theme selection and refine card spacing ([#64](https://github.com/NLipatov/cinemator/issues/64)) ([cbb93ae](https://github.com/NLipatov/cinemator/commit/cbb93aea3b0550f9c1877ed64d6df7b14c729616))
+
 ## [0.16.0](https://github.com/NLipatov/cinemator/compare/0.15.0...0.16.0) (2026-11-13)
 
 
