@@ -38,7 +38,15 @@ for (const language of ['ru', 'en', 'zh-Hans', 'zh-Hant']) {
           expect(Math.abs(title.y - boxes[5].y)).toBeLessThan(1);
           expect(boxes[0].y).toBeGreaterThanOrEqual(title.y + title.height);
           expect(boxes[3].y).toBeGreaterThanOrEqual(boxes[1].y + boxes[1].height);
-          expect(Math.abs(boxes[3].y - boxes[4].y)).toBeLessThan(1);
+          const settings = await page.locator('.player-settings').boundingBox();
+          if (Math.abs(boxes[3].y - boxes[4].y) < 1) {
+            expect(Math.abs((boxes[3].x + boxes[4].x + boxes[4].width) / 2 - (settings.x + settings.width / 2))).toBeLessThan(1);
+          } else {
+            expect(boxes[4].y).toBeGreaterThanOrEqual(boxes[3].y + boxes[3].height);
+            for (const box of [boxes[3], boxes[4]]) {
+              expect(Math.abs(box.x + box.width / 2 - (settings.x + settings.width / 2))).toBeLessThan(1);
+            }
+          }
         }
       }
     }
@@ -163,7 +171,7 @@ for (const width of [390, 1280]) {
     await expect(page.locator('#appVersion')).toHaveText('[test]');
     await expect(page.locator('#logoutBtn')).toBeVisible();
     const before = await page.locator('html').getAttribute('data-theme');
-    await page.locator('#themeToggle').click();
+    await page.locator(`input[name="theme-mode"][value="${before === 'light' ? 'dark' : 'light'}"]`).check();
     await expect(page.locator('html')).not.toHaveAttribute('data-theme', before);
     await page.keyboard.press('Escape');
     await expect(menu).toBeHidden();

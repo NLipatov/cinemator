@@ -1,7 +1,10 @@
 export default {
   'common.application': '应用',
   'common.language': '语言',
-  'common.theme': '切换主题',
+  'common.theme': '主题',
+  'theme.system': '跟随系统',
+  'theme.light': '浅色',
+  'theme.dark': '深色',
   'common.loading': '正在加载…',
   'common.details': '详细信息',
   'common.close': '关闭',

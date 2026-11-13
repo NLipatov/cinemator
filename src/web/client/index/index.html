@@ -25,11 +25,12 @@
         </button>
         <div id="appMenu" popover="auto" aria-labelledby="appMenuTitle">
           <h2 id="appMenuTitle" data-i18n="common.application">Application</h2>
-          <button class="theme-toggle" id="themeToggle" type="button" data-i18n-aria-label="common.theme" aria-label="Switch theme">
-            <span class="icon" id="icon-moon" style="display:none;">☾</span>
-            <span class="icon" id="icon-sun" style="display:none;">☼</span>
-            <span data-i18n="common.theme">Switch theme</span>
-          </button>
+          <fieldset class="theme-options">
+            <legend data-i18n="common.theme">Theme</legend>
+            <label><input type="radio" name="theme-mode" value="system"><span data-i18n="theme.system">Use system setting</span></label>
+            <label><input type="radio" name="theme-mode" value="light"><span data-i18n="theme.light">Light</span></label>
+            <label><input type="radio" name="theme-mode" value="dark"><span data-i18n="theme.dark">Dark</span></label>
+          </fieldset>
           <button class="auth-logout" id="logoutBtn" type="button" hidden data-i18n="auth.signOut">Sign out</button>
           <span class="brand-version" id="appVersion" hidden></span>
         </div>

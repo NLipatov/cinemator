@@ -1,7 +1,10 @@
 export default {
   'common.application': 'Application',
   'common.language': 'Language',
-  'common.theme': 'Switch theme',
+  'common.theme': 'Theme',
+  'theme.system': 'Use system setting',
+  'theme.light': 'Light',
+  'theme.dark': 'Dark',
   'common.loading': 'Loading…',
   'common.details': 'Details',
   'common.close': 'Close',
