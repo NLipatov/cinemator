@@ -21,15 +21,17 @@ test('settings are optional; only one menu opens and keyboard focus returns', as
   await page.keyboard.press('Escape');
   await expect(page.locator('#videoMenuButton')).toBeFocused();
   await page.locator('#audioMenuButton').click();
-  await expect(page.locator('#audioSelect')).toBeEnabled();
+  await expect(page.locator('#audioTracks [aria-checked="true"]')).toBeEnabled();
   await page.locator('#subtitlesMenuButton').click();
   await expect(page.locator('.settings-popup:visible, #videoMenu:visible')).toHaveCount(1);
   await expect(page.locator('#subtitleDelayRow')).toBeHidden();
-  await page.locator('#subtitleSelect').selectOption('3');
+  await page.locator('#subtitleTracks [data-value="3"]').click();
+  await page.locator('#subtitlesMenuButton').click();
   await expect(page.locator('#subtitleDelayRow')).toBeVisible();
   await page.locator('#subDelayPlus').click();
   await expect(page.locator('#subDelayValue')).toHaveText('0.5s');
-  await page.locator('#subtitleSelect').selectOption('-1');
+  await page.locator('#subtitleTracks [data-value="-1"]').click();
+  await page.locator('#subtitlesMenuButton').click();
   await expect(page.locator('#subtitleDelayRow')).toBeHidden();
   await page.locator('.brand').click();
   await expect(page.locator('.settings-popup:visible, #videoMenu:visible')).toHaveCount(0);
@@ -42,10 +44,10 @@ for (const [language, label] of [['en', 'Russian'], ['ru', 'русский'], ['
     await openPlayer(page, { language, tracks: 2 });
     await play(page);
       await page.locator('#audioMenuButton').click();
-    await expect(page.locator('#audioSelect')).toBeEnabled();
-    await expect(page.locator('#audioSelect option').first()).toContainText(label);
+    await expect(page.locator('#audioTracks [aria-checked="true"]')).toBeEnabled();
+    await expect(page.locator('#audioTracks .track-label').first()).toContainText(label);
     await page.locator('#languageSelect').selectOption(language === 'en' ? 'ru' : 'en');
-    await expect(page.locator('#audioSelect option').first()).toContainText(language === 'en' ? 'русский' : 'Russian');
+    await expect(page.locator('#audioTracks .track-label').first()).toContainText(language === 'en' ? 'русский' : 'Russian');
   });
 }
 
@@ -64,16 +66,25 @@ test('stream preparation keeps its size and retry preserves the seek position', 
   };
   await page.route('**/api/hls/prepare?*', failStream);
   await page.locator('#audioMenuButton').click();
-  await page.locator('#audioSelect').selectOption('1');
+  await page.locator('#audioTracks [data-value="1"]').click();
   await expect(page.locator('#warnMsg')).toBeVisible();
   expect((await page.locator('#video').boundingBox()).height).toBe(height);
   await expect(page.locator('#video')).toHaveCSS('opacity', '1');
   release();
   await expect(page.locator('#play')).toHaveText('Retry');
+  await expect(page.locator('#playerError')).toBeVisible();
+  const frame = await page.locator('.video-frame').boundingBox();
+  const retry = await page.locator('#play').boundingBox();
+  expect(retry.y).toBeGreaterThanOrEqual(frame.y);
+  expect(retry.y + retry.height).toBeLessThanOrEqual(frame.y + frame.height);
+  await expect(page.locator('#playerError details')).not.toHaveAttribute('open');
+  await page.locator('#playerError summary').click();
+  await expect(page.locator('#playerError pre')).toHaveText('Temporary stream failure');
   await page.unroute('**/api/hls/prepare?*', failStream);
   await page.locator('#play').click();
   await expect.poll(() => page.locator('#video').evaluate(v => v.currentTime)).toBe(47);
   expect(await page.evaluate(() => window.testHls.options.startPosition)).toBe(47);
+  await expect(page.locator('#playerError')).toBeHidden();
 });
 
 test('late metadata from a replaced file cannot select tracks or start the old video', async ({ page }) => {
@@ -96,7 +107,7 @@ test('late metadata from a replaced file cannot select tracks or start the old v
   await expect.poll(() => page.locator('#video').evaluate(v => v.duration)).toBe(120);
   release();
   await expect(page.locator('#selectedFile')).toContainText('Episode 1');
-  await expect(page.locator('#audioSelect option')).toHaveCount(2);
+  await expect(page.locator('#audioTracks .track-label')).toHaveCount(2);
   expect(streams.every(file => file === '2')).toBe(true);
 });
 
@@ -114,7 +125,7 @@ for (const width of [390, 1280]) {
       expect(box.x).toBeGreaterThanOrEqual(0);
       expect(box.x + box.width).toBeLessThanOrEqual(width);
       expect(box.y).toBeGreaterThanOrEqual(0);
-      expect(box.y + box.height).toBeLessThanOrEqual(name === 'video' && width === 390 ? 900 : video.y + video.height + 1);
+      expect(box.y + box.height).toBeLessThanOrEqual(width === 390 ? 900 : video.y + video.height + 1);
     }
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   });
@@ -130,7 +141,7 @@ test('seeking back to zero before a track switch does not reuse the resume time'
   await expect.poll(() => page.locator('#video').evaluate(v => v.currentTime)).toBe(42);
   await page.locator('#video').evaluate(v => { v.currentTime = 0; });
   await page.locator('#audioMenuButton').click();
-  await page.locator('#audioSelect').selectOption('1');
+  await page.locator('#audioTracks [data-value="1"]').click();
   await expect.poll(() => page.locator('#video').evaluate(v => v.duration)).toBe(120);
   expect(await page.locator('#video').evaluate(v => v.currentTime)).toBe(0);
   expect(await page.evaluate(() => window.testHls.options.startPosition)).toBe(0);

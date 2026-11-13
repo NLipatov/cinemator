@@ -12,7 +12,6 @@
     <div class="topbar-inner">
       <div class="brand">
         <span class="brand-name">cinemator</span>
-        <span class="brand-version" id="appVersion" hidden></span>
       </div>
       <div class="top-actions">
         <select id="languageSelect" aria-label="Language" data-i18n-aria-label="common.language">
@@ -21,11 +20,19 @@
           <option value="zh-Hans" lang="zh-Hans">简体中文</option>
           <option value="zh-Hant" lang="zh-Hant">繁體中文</option>
         </select>
-        <button class="auth-logout" id="logoutBtn" type="button" hidden data-i18n="auth.signOut">Sign out</button>
-        <button class="theme-toggle" id="themeToggle" type="button" title="Switch theme" data-i18n-title="common.theme" aria-label="Switch theme" data-i18n-aria-label="common.theme">
-          <span class="icon" id="icon-moon" style="display:none;">☾</span>
-          <span class="icon" id="icon-sun"  style="display:none;">☼</span>
+        <button id="appMenuButton" class="settings-toggle" type="button" popovertarget="appMenu" aria-expanded="false" aria-controls="appMenu" aria-label="Application" data-i18n-aria-label="common.application">
+          <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg>
         </button>
+        <div id="appMenu" popover="auto" aria-labelledby="appMenuTitle">
+          <h2 id="appMenuTitle" data-i18n="common.application">Application</h2>
+          <button class="theme-toggle" id="themeToggle" type="button" data-i18n-aria-label="common.theme" aria-label="Switch theme">
+            <span class="icon" id="icon-moon" style="display:none;">☾</span>
+            <span class="icon" id="icon-sun" style="display:none;">☼</span>
+            <span data-i18n="common.theme">Switch theme</span>
+          </button>
+          <button class="auth-logout" id="logoutBtn" type="button" hidden data-i18n="auth.signOut">Sign out</button>
+          <span class="brand-version" id="appVersion" hidden></span>
+        </div>
       </div>
     </div>
   </header>
@@ -46,70 +53,55 @@
               </div>
             </div>
           </div>
+          <div class="player-error" id="playerError" hidden>
+            <div class="preparation-content">
+              <div class="msg" id="playerMsg" role="alert"></div>
+              <div class="msg" id="fileMsg" role="alert"></div>
+              <div class="msg" id="trackMsg" role="alert"></div>
+              <button id="play" type="button" class="input-style" data-i18n="player.retry" hidden>Retry</button>
+            </div>
+          </div>
         </div>
-        <div class="msg" id="playerMsg" role="status" aria-live="polite"></div>
       </div>
 
       <div class="control-stack">
         <div class="step player-controls" id="step-files" style="display:none">
           <div class="player-toolbar">
-            <div id="selectedFile" class="selected-file"></div>
+            <div class="player-identity">
+              <h2 id="playerTitle" class="player-title"></h2>
+              <div id="selectedFile" class="selected-file"></div>
+            </div>
             <div class="player-settings">
-            <div id="videoNavigation" class="player-setting video-navigation" hidden>
-              <button id="previousVideo" type="button" class="settings-toggle video-skip" title="Previous video" data-i18n-title="player.previousVideo" aria-label="Previous video" data-i18n-aria-label="player.previousVideo" disabled>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>
-              </button>
-              <button id="videoMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="videoMenu" aria-haspopup="menu" hidden>
-                <span id="videoMenuLabel"></span>
-                <span aria-hidden="true">▾</span>
-              </button>
-              <button id="nextVideo" type="button" class="settings-toggle video-skip" title="Next video" data-i18n-title="player.nextVideo" aria-label="Next video" data-i18n-aria-label="player.nextVideo" disabled>
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m10 6 6 6-6 6"/></svg>
-              </button>
-            </div>
-            <div class="player-setting">
-              <button id="audioMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="audioMenu">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m11 4-6 5H2v6h3l6 5zM15 8a6 6 0 0 1 0 8M18 4a11 11 0 0 1 0 16"/></svg>
-                <span data-i18n="player.sound">Sound</span>
-              </button>
-              <div id="audioMenu" class="settings-popup" role="region" aria-labelledby="audioMenuButton" hidden>
-                <div class="track-row">
-                  <label for="audioSelect" data-i18n="player.audio">Sound</label>
-                  <select id="audioSelect" class="input-style"></select>
-                </div>
+              <div id="videoNavigation" class="player-setting video-navigation" hidden>
+                <button id="previousVideo" type="button" class="settings-toggle video-skip" title="Previous video" data-i18n-title="player.previousVideo" aria-label="Previous video" data-i18n-aria-label="player.previousVideo" disabled>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>
+                </button>
+                <button id="videoMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="videoMenu" aria-haspopup="menu" hidden>
+                  <span id="videoMenuLabel"></span>
+                  <span aria-hidden="true">▾</span>
+                </button>
+                <button id="nextVideo" type="button" class="settings-toggle video-skip" title="Next video" data-i18n-title="player.nextVideo" aria-label="Next video" data-i18n-aria-label="player.nextVideo" disabled>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m10 6 6 6-6 6"/></svg>
+                </button>
+              </div>
+              <div class="player-setting">
+                <button id="audioMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="audioMenu" aria-haspopup="menu">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m11 4-6 5H2v6h3l6 5zM15 8a6 6 0 0 1 0 8M18 4a11 11 0 0 1 0 16"/></svg>
+                  <span id="audioMenuLabel" data-i18n="player.sound">Sound</span>
+                </button>
+              </div>
+              <div class="player-setting">
+                <button id="subtitlesMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="subtitlesMenu" aria-haspopup="menu">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M5 11h5m4 0h5M5 15h8m3 0h3"/></svg>
+                  <span id="subtitlesMenuLabel" data-i18n="player.subtitles">Subtitles</span>
+                </button>
               </div>
             </div>
-            <div class="player-setting">
-              <button id="subtitlesMenuButton" type="button" class="settings-toggle" aria-expanded="false" aria-controls="subtitlesMenu">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="2" y="4" width="20" height="16" rx="3"/><path d="M5 11h5m4 0h5M5 15h8m3 0h3"/></svg>
-                <span data-i18n="player.subtitles">Subtitles</span>
-              </button>
-              <div id="subtitlesMenu" class="settings-popup" role="region" aria-labelledby="subtitlesMenuButton" hidden>
-                <div class="track-row">
-                  <label for="subtitleSelect" data-i18n="player.subtitles">Subtitles</label>
-                  <select id="subtitleSelect" class="input-style"></select>
-                </div>
-          <div class="track-row" id="subtitleDelayRow" style="display:none">
-            <span class="field-label" id="subtitleDelayLabel" data-i18n="player.subtitleDelay">Subtitle offset</span>
-            <div class="delay-controls" role="group" aria-labelledby="subtitleDelayLabel">
-              <button type="button" id="subDelayMinus" class="input-style small-btn" data-i18n="player.seconds" data-i18n-params='{"value":"-0.5"}'>-0.5s</button>
-              <div id="subDelayValue" class="delay-value" data-i18n="player.seconds" data-i18n-params='{"value":"0.0"}'>0.0s</div>
-              <button type="button" id="subDelayPlus" class="input-style small-btn" data-i18n="player.seconds" data-i18n-params='{"value":"+0.5"}'>+0.5s</button>
-            </div>
-          </div>
-              </div>
-            </div>
-            </div>
-            <button id="play" type="button" class="input-style" data-i18n="player.retry">Retry</button>
             <button id="closePlayer" type="button" class="settings-toggle close-player" title="Close player" data-i18n-title="player.close" aria-label="Close player" data-i18n-aria-label="player.close">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg>
             </button>
           </div>
-          <div class="msg" id="fileMsg" role="status" aria-live="polite"></div>
-          <div class="msg" id="trackMsg" role="status" aria-live="polite"></div>
         </div>
-
-
       </div>
     </section>
 
@@ -138,7 +130,41 @@
       <div class="msg" id="downloadsMsg"></div>
     </section>
   </main>
-  <div id="videoMenu" class="video-file-menu" role="menu" aria-label="Video" data-i18n-aria-label="player.video" hidden></div>
+  <div id="videoMenu" class="settings-popup" role="region" aria-labelledby="videoMenuTitle" hidden>
+    <div class="menu-heading">
+      <h2 id="videoMenuTitle" data-i18n="player.video">Video</h2>
+      <button type="button" class="settings-toggle menu-close" data-close-menu aria-label="Close" data-i18n-aria-label="common.close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg>
+      </button>
+    </div>
+    <div id="videoOptions" class="track-options" role="menu" aria-labelledby="videoMenuTitle"></div>
+  </div>
+  <div id="audioMenu" class="settings-popup" role="region" aria-labelledby="audioMenuTitle" hidden>
+    <div class="menu-heading">
+      <h2 id="audioMenuTitle" data-i18n="player.audio">Audio track</h2>
+      <button type="button" class="settings-toggle menu-close" data-close-menu aria-label="Close" data-i18n-aria-label="common.close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg>
+      </button>
+    </div>
+    <div id="audioTracks" class="track-options" role="menu" aria-labelledby="audioMenuTitle"></div>
+  </div>
+  <div id="subtitlesMenu" class="settings-popup" role="region" aria-labelledby="subtitlesMenuTitle" hidden>
+    <div class="menu-heading">
+      <h2 id="subtitlesMenuTitle" data-i18n="player.subtitles">Subtitles</h2>
+      <button type="button" class="settings-toggle menu-close" data-close-menu aria-label="Close" data-i18n-aria-label="common.close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="m6 6 12 12M6 18 18 6"/></svg>
+      </button>
+    </div>
+    <div id="subtitleTracks" class="track-options" role="menu" aria-labelledby="subtitlesMenuTitle"></div>
+    <div class="track-row" id="subtitleDelayRow" style="display:none">
+      <span class="field-label" id="subtitleDelayLabel" data-i18n="player.subtitleDelay">Subtitle offset</span>
+      <div class="delay-controls" role="group" aria-labelledby="subtitleDelayLabel">
+        <button type="button" id="subDelayMinus" class="input-style small-btn" data-i18n="player.seconds" data-i18n-params='{"value":"-0.5"}'>-0.5s</button>
+        <div id="subDelayValue" class="delay-value" data-i18n="player.seconds" data-i18n-params='{"value":"0.0"}'>0.0s</div>
+        <button type="button" id="subDelayPlus" class="input-style small-btn" data-i18n="player.seconds" data-i18n-params='{"value":"+0.5"}'>+0.5s</button>
+      </div>
+    </div>
+  </div>
 
   <template id="downloadRowTemplate">
     <div class="download-row">
@@ -154,6 +180,7 @@
         <span class="download-caption">
           <span class="download-title"></span>
           <span class="download-expiry"></span>
+          <span class="download-current" data-i18n="downloads.nowPlaying" hidden>Now playing</span>
         </span>
       </button>
       <button type="button" class="download-videos" data-action="choose-video" aria-haspopup="menu" aria-expanded="false" aria-controls="videoMenu" hidden></button>

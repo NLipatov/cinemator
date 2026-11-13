@@ -1,4 +1,5 @@
 export default {
+  'common.application': '應用程式',
   'common.language': '語言',
   'common.theme': '切換主題',
   'common.loading': '載入中…',
@@ -47,6 +48,10 @@ export default {
   'player.videoPosition': '影片：{index}/{count}',
   'player.previousVideo': '上一部影片',
   'player.nextVideo': '下一部影片',
+  'player.soundValue': '聲音：{value}',
+  'player.subtitlesValue': '字幕：{value}',
+  'player.off': '關閉',
+  'downloads.nowPlaying': '正在播放',
   'player.sound': '聲音',
   'player.close': '關閉播放器',
   'player.retry': '重試',
