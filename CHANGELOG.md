@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/NLipatov/cinemator/compare/0.15.0...0.16.0) (2026-11-13)
+
+
+### Features
+
+* **ui:** refine player controls and separate download cards ([#62](https://github.com/NLipatov/cinemator/issues/62)) ([0b1cd45](https://github.com/NLipatov/cinemator/commit/0b1cd45136e5fc33bf1b2c97c1e82e48eeb523ad))
+
 ## [0.15.0](https://github.com/NLipatov/cinemator/compare/0.14.0...0.15.0) (2026-11-12)
 
 
