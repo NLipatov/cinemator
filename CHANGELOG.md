@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/NLipatov/cinemator/compare/0.17.0...0.18.0) (2026-11-13)
+
+
+### Features
+
+* **ui:** refine download cards and storage controls ([#66](https://github.com/NLipatov/cinemator/issues/66)) ([b42cb84](https://github.com/NLipatov/cinemator/commit/b42cb8413e4ebb4d63a3eb2974f01e113102dc2c))
+
 ## [0.17.0](https://github.com/NLipatov/cinemator/compare/0.16.0...0.17.0) (2026-11-13)
 
 
