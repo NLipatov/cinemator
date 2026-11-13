@@ -99,6 +99,8 @@ for(const width of [390,1280]){
   await toggle.click();
   await page.keyboard.press('Tab');
   await expect(page.locator('#videoMenu')).toBeHidden();
+  await expect(row.locator('.download-storage-button')).toBeFocused();
+  await page.keyboard.press('Tab');
   await expect(row.locator('.download-more')).toBeFocused();
  });
 }

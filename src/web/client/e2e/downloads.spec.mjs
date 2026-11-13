@@ -103,19 +103,23 @@ test("a completed lookup does not erase a newer draft", async ({ page }) => {
 });
 
 const expiryDays = [26000, 60, 7, 10, 21, 5 / 24, 10 / (24 * 60), -730, null];
-for (const [language, labels] of [
+for (const [language, labels, shortLabels] of [
   ["ru", ["Удалится через 71 год", "Удалится через 2 месяца", "Удалится через 1 неделю",
     "Удалится через 1 неделю и 3 дня", "Удалится через 3 недели",
-    "Удалится через 5 ч", "Удалится через 10 мин", "Срок хранения истёк 2 года назад", "Без автоудаления"]],
+    "Удалится через 5 ч", "Удалится через 10 мин", "Срок хранения истёк 2 года назад", "Без автоудаления"],
+    ["71 г", "2 мес", "1 нед", "1 нед", "3 нед", "5 ч", "10 мин", "Истёк", "∞"]],
   ["en", ["Deletes in 71 years", "Deletes in 2 months", "Deletes in 1 week",
     "Deletes in 1 week and 3 days", "Deletes in 3 weeks",
-    "Deletes in 5h", "Deletes in 10m", "Storage period ended 2 years ago", "No automatic deletion"]],
+    "Deletes in 5h", "Deletes in 10m", "Storage period ended 2 years ago", "No automatic deletion"],
+    ["71y", "2mo", "1w", "1w", "3w", "5h", "10m", "Ended", "∞"]],
   ["zh-Hans", ["71 年后自动删除", "2 个月后自动删除", "1 周后自动删除",
     "1 周 3 天后自动删除", "3 周后自动删除",
-    "5 小时后自动删除", "10 分钟后自动删除", "保留期限已于2 年前到期", "不会自动删除"]],
+    "5 小时后自动删除", "10 分钟后自动删除", "保留期限已于2 年前到期", "不会自动删除"],
+    ["71年", "2个月", "1周", "1周", "3周", "5小时", "10分钟", "已到期", "∞"]],
   ["zh-Hant", ["71 年後自動刪除", "2 個月後自動刪除", "1 週後自動刪除",
     "1 週 3 天後自動刪除", "3 週後自動刪除",
-    "5 小時後自動刪除", "10 分鐘後自動刪除", "保留期限已於2 年前到期", "不會自動刪除"]],
+    "5 小時後自動刪除", "10 分鐘後自動刪除", "保留期限已於2 年前到期", "不會自動刪除"],
+    ["71年", "2個月", "1週", "1週", "3週", "5小時", "10分鐘", "已到期", "∞"]],
 ]) {
   test(`${language}: expiry uses human-readable units from minutes to years`, async ({ page }) => {
     const now = new Date("2026-01-01T00:00:00Z");
@@ -130,8 +134,15 @@ for (const [language, labels] of [
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
     await expect(page.locator(".download-meta-text")).toHaveText(labels);
     await expect(page.locator(".download-expiry")).toHaveText(labels);
-    await expect(page.locator(".download-expiry").first()).toBeVisible();
+    await expect(page.locator(".download-storage-label")).toHaveText(shortLabels);
+    const storage = page.locator(".download-storage-button");
+    for (let i = 0; i < labels.length; i++) {
+      await expect(storage.nth(i)).toHaveAccessibleName(new RegExp(labels[i].replaceAll(' ', '\\s+')));
+    }
     await expect(page.locator(".download-options:visible")).toHaveCount(0);
+    await storage.first().click();
+    await expect(page.locator(".download-expiry").first()).toBeVisible();
+    await expect(page.locator(".download-expiry-date").first()).toHaveAttribute("datetime", new Date(+now + expiryDays[0] * 86400000).toISOString());
   });
 }
 
